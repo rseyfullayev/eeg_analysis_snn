@@ -13,15 +13,15 @@ class SpikingResNet18Encoder(nn.Module):
             SpikingResidualBlock(64, 64, spike_model=spike_model, **neuron_params)
         )
         self.layer2 = nn.Sequential(
-            SpikingResidualBlock(64, 128, stride=2, downsample=True, spike_model=spike_model, **neuron_params),
+            SpikingResidualBlock(64, 128, stride=2, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(128, 128, spike_model=spike_model, **neuron_params)
         )
         self.layer3 = nn.Sequential(
-            SpikingResidualBlock(128, 256, stride=2, downsample=True, spike_model=spike_model, **neuron_params),
+            SpikingResidualBlock(128, 256, stride=2, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(256, 256, spike_model=spike_model, **neuron_params)
         )
         self.layer4 = nn.Sequential(
-            SpikingResidualBlock(256, 512, stride=2, downsample=True, spike_model=spike_model, **neuron_params),
+            SpikingResidualBlock(256, 512, stride=2, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(512, 512, spike_model=spike_model, **neuron_params)
         )
     def forward(self, x):
@@ -43,13 +43,13 @@ class SpikingResNet34Encoder(nn.Module):
             SpikingResidualBlock(64, 64, spike_model=spike_model, **neuron_params)
         )
         self.layer2 = nn.Sequential(
-            SpikingResidualBlock(64, 128, stride=2, downsample=True, spike_model=spike_model, **neuron_params),
+            SpikingResidualBlock(64, 128, stride=2, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(128, 128, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(128, 128, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(128, 128, spike_model=spike_model, **neuron_params)
         )
         self.layer3 = nn.Sequential(
-            SpikingResidualBlock(128, 256, stride=2, downsample=True, spike_model=spike_model, **neuron_params),
+            SpikingResidualBlock(128, 256, stride=2, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(256, 256, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(256, 256, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(256, 256, spike_model=spike_model, **neuron_params),
@@ -57,7 +57,7 @@ class SpikingResNet34Encoder(nn.Module):
             SpikingResidualBlock(256, 256, spike_model=spike_model, **neuron_params)
         )
         self.layer4 = nn.Sequential(
-            SpikingResidualBlock(256, 512, stride=2, downsample=True, spike_model=spike_model, **neuron_params),
+            SpikingResidualBlock(256, 512, stride=2, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(512, 512, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(512, 512, spike_model=spike_model, **neuron_params)
         )

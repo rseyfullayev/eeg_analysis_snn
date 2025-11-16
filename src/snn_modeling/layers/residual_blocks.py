@@ -27,11 +27,14 @@ class ConvBn(nn.Module):
 
     
 class SpikingResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, downsample=False, spike_model=snn.Leaky, **neuron_params):
+    def __init__(self, in_channels, out_channels, stride=1, spike_model=snn.Leaky, **neuron_params):
         super(SpikingResidualBlock, self).__init__()
         self.conv1 = ConvBnSpiking(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, spike_model=spike_model, **neuron_params)
         self.conv2 = ConvBn(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.downsample =  ConvBn(in_channels, out_channels, kernel_size=1, stride=stride) if downsample else None
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = ConvBn(in_channels, out_channels, kernel_size=1, stride=stride)
+        else:
+            self.downsample = nn.Identity()
         self.spike = spike_model(**neuron_params)
 
     def forward(self, x):
@@ -39,9 +42,7 @@ class SpikingResidualBlock(nn.Module):
 
         out = self.conv1(x)
         out = self.conv2(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
+        identity = self.downsample(x)
 
         out += identity
         out = self.spike(out)
