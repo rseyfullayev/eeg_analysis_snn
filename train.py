@@ -149,7 +149,7 @@ def run_training(config, model, device):
     model.train()
  
     lr = config['training'].get('learning_rate', 1e-3)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=config['training'].get('weight_decay', 1e-5))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-5)
 
     loss_fn = FullHybridLoss(
