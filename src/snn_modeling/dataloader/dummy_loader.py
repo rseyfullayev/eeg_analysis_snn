@@ -27,10 +27,10 @@ def get_dummy_batch(config, device):
 
     targets = torch.zeros(batch_size, num_classes, height, width).to(device)
     targets_c = torch.randint(0, num_classes-1, (batch_size,), dtype=torch.long).to(device)
-    blob = make_gaussian(height, sigma=config['mask']['sigma']).to(device)
+    blob = torch.rand(batch_size, num_classes, height, width).to(device) #make_gaussian(height, sigma=config['mask']['sigma']).to(device)
     blob = blob / blob.max()
-    for b in range(batch_size):
+    #for b in range(batch_size):
 
-        targets[b, targets_c[b], :, :] = blob
+        #targets[b, targets_c[b], :, :] = blob
         
     return inputs, targets, targets_c

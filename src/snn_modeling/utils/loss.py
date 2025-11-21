@@ -18,7 +18,7 @@ class DiceBCELoss(nn.Module):
     def __init__(self, smooth=0., lambda_bce=1.0):
         super(DiceBCELoss, self).__init__()
         self.bce_loss = nn.BCEWithLogitsLoss()
-        self.dice_loss = DiceLoss(mode="multilabel", smooth=smooth)
+        self.dice_loss = DiceLoss(mode="multilabel", smooth=smooth, from_logits=True)
         self.lambda_bce = lambda_bce
 
     def forward(self, inputs, targets):
