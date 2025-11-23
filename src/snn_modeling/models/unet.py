@@ -28,16 +28,29 @@ class SpikingUNet(nn.Module):
             x = (x > rand_map).float()
         elif self.encoding == 'direct':
             pass
+        T,B,C,H,W = x.shape
+
+        x = x.reshape(T*B, C, H, W)
+        x = self.encoder.stem(x)
+        _,C_stem,H_stem,W_stem = x.shape
+        x = x.reshape(T, B, C_stem, H_stem, W_stem)
 
         logit_rec = []
         for step in range(self.num_timesteps):
             x_step = x[step, :, :, :, :]
-            x_step, skips = self.encoder(x_step)
+            x_step, skips = self.encoder.forward_layers(x_step)
             x_step = self.bottleneck(x_step)
             x_step = self.decoder(x_step, skips)
-            x_step = self.classifier(x_step)
+            
             logit_rec.append(x_step)
         output_logits = torch.stack(logit_rec, dim=0)
+        
+        T,B,C,H,W = output_logits.shape
+        output_logits = output_logits.reshape(T*B, C, H, W)
+        output_logits = self.classifier(output_logits)
+        _,C_out,H_out,W_out = output_logits.shape
+        output_logits = output_logits.reshape(T, B, C_out, H_out, W_out)
+
         return output_logits
 
 class UNet(nn.Module):

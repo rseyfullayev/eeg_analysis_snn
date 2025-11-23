@@ -41,7 +41,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
     }, path)
     print(f"New Record! Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
 
-def validate(model, val_loader, criterion, device, config):
+def validate(model, val_loader, criterion, device):
 
     model.eval()
     val_loss = 0
@@ -134,7 +134,7 @@ def log_visuals(model, val_loader, device, writer, epoch, config):
         img_target = targets[idx, true_class].cpu().numpy()
         img_pred = probs[idx, true_class].cpu().numpy()
 
-        caption = f"Ep{epoch}_Sample{idx}_Class{true_class}"
+        caption_text = f"Class {true_class} | Sample {idx} | Ep {epoch}"
         
         writer.add_image(f"Vis/Input_{idx}", img_input[None, ...], epoch)
         writer.add_image(f"Vis/Target_{idx}", img_target[None, ...], epoch)
@@ -142,9 +142,9 @@ def log_visuals(model, val_loader, device, writer, epoch, config):
         
         wandb.log({
             f"Visuals/Sample_{idx}": [
-                wandb.Image(img_input, caption="Input (Avg Activity)"),
-                wandb.Image(img_target, caption=f"Target (Class {true_class})"),
-                wandb.Image(img_pred, caption=f"Prediction (Prob Map)")
+                wandb.Image(img_input, caption=f"Input (Avg Activity) - {caption_text}"),
+                wandb.Image(img_target, caption=f"Target {caption_text})"),
+                wandb.Image(img_pred, caption=f"Prediction - {caption_text}")
             ]
         }, step=epoch)
 
@@ -190,8 +190,8 @@ def run_training(config, model, device, checkpoint=None):
 
 
     optimizer = optim.AdamW([
-        {'params': base_params, 'lr': config['training']['learning_rate']},
-        {'params': time_params, 'lr': config['training']['learning_rate'] * 0.01} 
+        {'params': base_params, 'lr': lr},
+        {'params': time_params, 'lr': lr * 0.01} 
     ], weight_decay=config['training']['weight_decay'], betas=(0.9, 0.999))
 
     start_epoch = 0
@@ -200,7 +200,7 @@ def run_training(config, model, device, checkpoint=None):
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['training']['epochs'], eta_min=1e-6)
     model = model.to(device)
-
+    
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -221,14 +221,18 @@ def run_training(config, model, device, checkpoint=None):
     )
     
     epochs = config['training']['epochs']
-    
+    try:
+        print("⚡ Compiling model with torch.compile...")
+        model = torch.compile(model)
+    except Exception as e:
+        print(f"⚠️ Could not compile model: {e}. Running in standard mode.")
 
     for epoch in range(start_epoch, epochs):
         
         model.train()
         train_loss = 0.0
 
-        for batch_idx, (inputs, targets, targets_c) in enumerate(train_loader):
+        for _, (inputs, targets, targets_c) in enumerate(train_loader):
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
             inputs = inputs.permute(1, 0, 2, 3, 4)
             manual_reset(model)
@@ -243,7 +247,7 @@ def run_training(config, model, device, checkpoint=None):
             train_loss += loss.item()
 
         avg_train_loss = train_loss / len(train_loader)
-        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, config)
+        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device)
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
