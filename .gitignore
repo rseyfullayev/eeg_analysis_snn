@@ -1,3 +1,16 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
 data_process/eeg_raw
 data_process/venv
+.vscode
+venv
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints
+processed_synthetic/
+processed_real/
+logs/
+test.py
+results/
+wandb/
+saved_models/

@@ -1,0 +1,53 @@
+experiment_name: "SNN_ResNet18_RateEncoding"
+description: "Spiking ResNet-18 U-Net with standard LIF neurons and Rate encoding. (SANITY CHECK)"
+
+data:
+  dataset_path: "data/processed_real"
+  coords_path: "data/coords.csv"
+  encoding_method: "direct"
+  num_timesteps: 32
+  grid_size:  64
+  freq_bands: 5
+  num_channels: 14
+  train_split: 0.8
+  num_workers: 4
+  num_samples: 0
+
+mask:
+  type: "data_driven"
+  sigma: 5.0
+
+model:
+  type: "SpikingUNet"
+  encoder_type: "ResNet18"
+  in_channels: 5
+  num_classes: 5
+  dropout: 0.2
+
+neuron_params:
+  spike_model: "snn.Leaky" 
+  beta: 0.9
+  alpha: 0.5
+  threshold: 1.0
+  learn_alpha: false
+  learn_beta: false
+
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.05
+
+loss:
+  smooth: 0.
+  lambda_seg: 1.0
+  lambda_bce: 1.5
+  lambda_class: 0.1
+  alpha: 0.8
+  beta: 0.2
+
+logging:
+  project_name: "snn-encoding-showdown"  # The name of the project on the website
+  run_name: "Sanity_ResNet18_Latency"    # A specific name for this experiment
+  tags: ["sanity-check", "resnet18", "latency", "snn"] # Tags for filtering later
+  offline: false   # Set to true if you have no internet and want to sync later
