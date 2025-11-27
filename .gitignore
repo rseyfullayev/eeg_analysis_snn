@@ -4,7 +4,8 @@ data_process/venv
 .vscode
 venv
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .DS_Store
 .ipynb_checkpoints
 processed_synthetic/
