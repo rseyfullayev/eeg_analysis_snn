@@ -2,15 +2,15 @@ import torch
 import os
 import numpy as np
 from torch.utils.data import Dataset
-from scipy.interpolate import griddata
+from scipy.interpolate import griddata, RBFInterpolator
+
 from tqdm import tqdm 
 
 class TopoMapper:
-    def __init__(self, sensor_coords_df, grid_size=64, method='cubic'): # Using Azimuthal Equidistant Projection
+    def __init__(self, sensor_coords_df, grid_size=64, method='thin_plate_spline'): # Using Azimuthal Equidistant Projection
         self.method = method
         self.grid_size = grid_size
         theta = sensor_coords_df['theta'].values
-        labels = sensor_coords_df['labels'].values
         if np.max(np.abs(theta)) > 2 * np.pi:
             print("   Detected DEGREES in coordinates. Converting to Radians.")
             theta = np.deg2rad(theta)
@@ -25,8 +25,10 @@ class TopoMapper:
         
         self.points = np.column_stack((x, y))
         grid_x, grid_y = np.mgrid[-1:1:complex(0, grid_size), -1:1:complex(0, grid_size)] # trick to generate grid_size points without floating point issues
-        self.grid_z = (grid_x, grid_y)
-        self.mask = (grid_x**2 + grid_y**2) > 1.0
+        self.target_points = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+        self.mask_indices = (self.target_points[:, 0]**2 + self.target_points[:, 1]**2) > 1.0
+
+        self.kernel = method
 
     def transform(self, tensor):
 
@@ -35,96 +37,72 @@ class TopoMapper:
         else:
             data = tensor
 
-        bands, time_steps, _ = data.shape
-        output = np.zeros((time_steps, bands, self.grid_size, self.grid_size), dtype=np.float32)
-        for t in range(time_steps):
-            for b in range(bands):
-                values = data[b, t, :]
-                grid = griddata(self.points, values, self.grid_z, method=self.method, fill_value=0)
-                grid[self.mask] = 0.0
-                output[t, b, :, :] = grid
+        bands, time_steps, sensors  = data.shape
+        data_transposed = np.transpose(data, (2, 0, 1))
+
+        flat_data = data_transposed.reshape(sensors, -1)
+
+        interpolator = RBFInterpolator(self.points, flat_data, kernel=self.kernel)
+
+        flat_maps = interpolator(self.target_points)
+        flat_maps = flat_maps.T
+        flat_maps[:, self.mask_indices] = 0.0
+        images = flat_maps.reshape(bands, time_steps, self.grid_size, self.grid_size)
+        images = images.transpose(1, 0, 2, 3)
         
-        return torch.tensor(output)
+        return torch.tensor(images, dtype=torch.float32)
     
     def __call__(self, tensor):
         return self.transform(tensor)
 
 class SWEEPDataset(Dataset):
-    def __init__(self, config, mode='synthetic', data_folder=None, transform=None):
+    def __init__(self, config, data=None, labels=None, prototypes=None, mode='manual'):
         self.config = config
         self.mode = mode
-        self.transform = transform
-        self.num_classes = config['model'].get('num_classes', 3)
+        self.num_classes = config['model'].get('num_classes', 5)
         self.grid_size = config['data'].get('grid_size', 64)
-        self.num_samples = config['data'].get('num_samples', 1)
 
-        if self.mode == 'synthetic':
-            self._init_synthetic_data()
-        elif self.mode == 'real':
-            raise ValueError(f"Unsupported mode: {self.mode}")
-        elif self.mode == "load":
-            if data_folder is None:
-                raise ValueError("mode='load' requires 'data_folder' path.")
-            self.load_from_disk(data_folder)
+        if self.mode == 'manual':
+            self.data = data
+            self.labels = labels
+        elif self.mode == 'load':
+            self.load_from_disk(config['data']['dataset_path'])
+        if prototypes is not None:
+            self.prototypes = prototypes
         else:
-            raise ValueError(f"Unsupported mode: {self.mode}")
+            print("Generating prototypes from local data (Ensure this is Train set!)")
+            self.prototypes = self._generate_prototypes_internal()
     
-    def _init_synthetic_data(self):
-        T = self.config['data'].get('num_timesteps', 10)
-        C = self.config['data'].get('freq_bands', 5)
-        Ch = self.config['data'].get('num_channels', 14)
-        print(f"Generating Synthetic EEG: {self.num_samples} samples, {Ch} channels, {T} time steps...")
+    def _generate_prototypes_internal(self):
 
-        self.labels = torch.randint(0, self.num_classes, (self.num_samples,))
-        self.raw_data = torch.randn(self.num_samples, C, T, Ch)
+        return SWEEPDataset.compute_prototypes(self.data, self.labels, self.num_classes, self.grid_size)
 
-        for i in tqdm(range(self.num_samples), desc="Synthesizing Signals"):
-            label = self.labels[i]
-            noise_sigma = torch.rand(1).item() * 0.4 + 0.8 
-            self.raw_data[i] = torch.randn(C, T, Ch) * noise_sigma
-            target_channel = label % Ch
-            target_band = label % C
-            signal_strength = torch.rand(1).item() * self.config['mask'].get('sigma', 5.0) + 3.0
-            self.raw_data[i, target_band, :, target_channel] += signal_strength
-        d_min = self.raw_data.min()
-        d_max = self.raw_data.max()
-        self.raw_data = (self.raw_data - d_min) / (d_max - d_min)
-        if self.transform:
-            print("   Applying TopoMapper to entire dataset...")
-            transformed_list = []
-            for i in tqdm(range(self.num_samples), desc="Topographic Mapping"):
-                vid = self.transform(self.raw_data[i]) 
-                vid = torch.clamp(vid, 0.0, 1.0) 
-                transformed_list.append(vid)
+    @staticmethod
+    def compute_prototypes(data_tensor, label_tensor, num_classes, grid_size):
 
-            self.data = torch.stack(transformed_list)
-        else:
-            self.data = self.raw_data
-        self._generate_prototypes()
-        
-    def _generate_prototypes(self):
-        print("   Computing Data-Driven Prototypes...")
+        print("   Computing Data-Driven Prototypes (Train Set Only)...")
         prototypes = []
-
-        for c in range(self.num_classes):
-            class_data = self.data[self.labels == c]
+        
+        for c in range(num_classes):
+            class_indices = (label_tensor == c).nonzero(as_tuple=True)[0]
+            class_data = data_tensor[class_indices]
+            
             if len(class_data) == 0:
-                print(f"   Warning: Class {c} has no samples. Using zeros.")
-                prototype = torch.zeros(self.grid_size, self.grid_size)
+                print(f"    Warning: Class {c} missing in training set. Using zeros.")
+                prototype = torch.zeros(grid_size, grid_size)
             else:
                 prototype = class_data.mean(dim=(0, 1, 2))
-            
-                p_min = prototype.min()
-                p_max = prototype.max()
+
+                p_min, p_max = prototype.min(), prototype.max()
                 if p_max > p_min:
                     prototype = (prototype - p_min) / (p_max - p_min)
-
+            
             prototypes.append(prototype)
-
-        self.prototypes = torch.stack(prototypes)
+            
+        return torch.stack(prototypes)
     
     def __len__(self):
-        return self.num_samples
+        return len(self.data)
     
     def save_to_disk(self, folder_path):
         """Saves data, labels, and prototypes to .npy files."""

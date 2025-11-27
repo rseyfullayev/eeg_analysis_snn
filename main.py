@@ -1,39 +1,62 @@
-import yaml
 import argparse
+import yaml
+import sys
+import os
 import torch
-from src.snn_modeling.utils.model_builder import build_model
+
+from generate_dataset import run_data_setup
 from train import run_training
-from setup_data import setup_data
+from src.snn_modeling.utils.model_builder import build_model
 
+def main():
+    parser = argparse.ArgumentParser(description="SWEEP-Net Entry Point")
 
+    parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
+    parser.add_argument('--mode', type=str, default='train', help='Mode: train or test')
+    parser.add_argument('--checkpoint', type=str, help='Path to checkpoint')
 
-def main(config_path, run_setup_data=False, checkpoint_path=None):
+    parser.add_argument('--setup_data', action='store_true', help='Setup data before training')
+
+    parser.add_argument('--raw_path', type=str, help='Path to folder containing raw .txt files')
+    parser.add_argument('--coords_path', type=str, help='Path to electrodes coordinates .csv')
+    parser.add_argument('--output_path', type=str, help='Destination folder for processed .npy files')
+
+    args = parser.parse_args()
+    config_path = args.config
+
+    if not os.path.exists(args.config):
+        raise FileNotFoundError(f"Config file not found: {args.config}")
+    
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
     
-    if run_setup_data:
+    if args.setup_data:
         print("Running dataset setup...")
-        setup_data(config)
+        if not args.raw_path or not args.coords_path or not args.output_path:
+            parser.error("When using --setup_data, you MUST specify --raw_path, --coords_path, and --output_path.")
+        config['data']['raw_path'] = args.raw_path
+        config['data']['coords_path'] = args.coords_path
+        config['data']['dataset_path'] = args.output_path
+        print(f"   Raw Source: {args.raw_path}")
+        print(f"   Coordinates: {args.coords_path}")
+        print(f"   Target: {args.output_path}")
+        
+        # Execute Setup
+        run_data_setup(config)
+        
+        print("✅ Setup complete. Exiting.")
+        sys.exit(0)
     else:
         checkpoint = None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
-        if checkpoint_path is not None:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            print(f"Loaded checkpoint from {checkpoint_path}.")
+        if args.checkpoint is not None:
+            checkpoint = torch.load(args.checkpoint, map_location=device)
+            print(f"Loaded checkpoint from {args.checkpoint}.")
         
         model = build_model(config).to(device)
         run_training(config, model, device, checkpoint)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
-    parser.add_argument('--mode', type=str, default='train', help='Mode: train or test')
-    parser.add_argument('--checkpoint', type=str, help='Path to checkpoint')
-    #Check if --setup_data flag is provided, run setup_data function
-    parser.add_argument('--setup_data', action='store_true', help='Setup data before training')
-
-    args = parser.parse_args()
-    
-    main(args.config, args.setup_data, args.checkpoint)
+    main()

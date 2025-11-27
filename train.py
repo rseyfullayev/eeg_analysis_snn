@@ -6,13 +6,14 @@ from src.snn_modeling.utils.loss import FullHybridLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
 import os
 from datetime import datetime
-
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import balanced_accuracy_score
 import snntorch as snn
 import segmentation_models_pytorch as smp
 import wandb
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
+import numpy as np
 # Ignore the specific sklearn warning about missing classes
 warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
 warnings.filterwarnings("ignore", message="A single label was found in 'y_true' and 'y_pred'. For the confusion matrix to have the correct shape, use the 'labels' parameter to pass all known labels.")
@@ -101,7 +102,7 @@ def validate(model, val_loader, criterion, device):
 
     return avg_loss, accuracy, balanced_acc, dice_score, iou_score, precision, recall
 
-def log_visuals(model, val_loader, device, writer, epoch, config):
+def log_visuals(model, val_loader, device, writer, epoch):
 
     model.eval()
     
@@ -165,15 +166,48 @@ def run_training(config, model, device, checkpoint=None):
     writer = SummaryWriter(log_dir=log_dir)
     print(f"Initializing TensorBoard: {log_dir}")
 
-    full_dataset = SWEEPDataset(
+    data_path = os.path.join(config['data']['dataset_path'], "data.npy")
+    label_path = os.path.join(config['data']['dataset_path'], "labels.npy")
+    
+    # Load as Tensor
+    all_data = torch.tensor(np.load(data_path), dtype=torch.float32)
+    all_labels = torch.tensor(np.load(label_path), dtype=torch.long)
+    num_samples = len(all_labels)
+    indices = np.arange(num_samples)
+
+    train_idx, val_idx = train_test_split(
+        indices, 
+        test_size=(1 - config['data']['train_split']), 
+        random_state=42, 
+        stratify=all_labels # Good for imbalanced emotions!
+    )
+
+    train_data_slice = all_data[train_idx]
+    train_label_slice = all_labels[train_idx]
+
+    master_prototypes = SWEEPDataset.compute_prototypes(
+        train_data_slice, 
+        train_label_slice, 
+        config['model']['num_classes'],
+        config['data']['grid_size']
+    )
+
+    train_set = SWEEPDataset(
         config, 
-        mode='load', 
-        data_folder=config['data']['dataset_path']
+        data=train_data_slice, 
+        labels=train_label_slice, 
+        prototypes=master_prototypes, 
+        mode='manual'
     )
     
-    train_size = int(config['data'].get('train_split', 0.8) * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_set, val_set = random_split(full_dataset, [train_size, val_size])
+    val_set = SWEEPDataset(
+        config, 
+        data=all_data[val_idx], 
+        labels=all_labels[val_idx], 
+        prototypes=master_prototypes,
+        mode='manual'
+    )
+    
     train_loader = DataLoader(train_set, batch_size=config['training']['batch_size'], shuffle=True, num_workers=config['data'].get('num_workers', 0))
     val_loader = DataLoader(val_set, batch_size=config['training']['batch_size'], shuffle=False, num_workers=config['data'].get('num_workers', 0))
     print(f"Data Loaded: {len(train_set)} Train | {len(val_set)} Val")

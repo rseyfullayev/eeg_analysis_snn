@@ -15,3 +15,4 @@ results/
 wandb/
 saved_models/
 .idea/
+eeg_emotions_processed/

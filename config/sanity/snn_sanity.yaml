@@ -3,15 +3,17 @@ description: "Spiking ResNet-18 U-Net with standard LIF neurons and Rate encodin
 
 data:
   dataset_path: "data/processed_synthetic"
-  coords_path: "data/coords.csv"
   encoding_method: "direct"
   num_timesteps: 16
+  window_size:  256
+  sampling_rate: 256
+  step_size: 128
   grid_size:  64
   freq_bands: 5
   num_channels: 14
   train_split: 0.8
   num_workers: 4
-  num_samples: 2000
+  
 
 mask:
   type: "data_driven"
