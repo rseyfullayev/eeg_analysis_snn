@@ -39,11 +39,6 @@ class SpikingUNet(nn.Module):
 
         logit_rec = []
         for step in range(self.num_timesteps):
-            if step < 2:
-                # Access the first neuron layer of the encoder
-                # Adjust path to match your structure
-                mem_state = self.encoder.layer1[0].spike.mem 
-                print(f"Step {step} | Mem Mean: {mem_state.mean().item():.4f} | Max: {mem_state.max().item():.4f}")
             x_step = x[step, :, :, :, :]
             x_step, skips = self.encoder.forward_layers(x_step)
             x_step = self.bottleneck(x_step)
