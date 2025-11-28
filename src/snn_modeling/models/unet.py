@@ -19,14 +19,16 @@ class SpikingUNet(nn.Module):
         self.classifier = ClassifierHead(64, num_classes)
 
     def forward(self, x):
-        x = 0.25*x # Scale input to [0, 0.25] for better spike generation
+         # Scale input to [0, 0.25] for better spike generation
         if self.encoding == 'latency':
             x_static = x.mean(dim=0)
             x = spikegen.latency(x_static, num_steps=self.num_timesteps, tau=5, threshold=0.01, normalize=True, clip=True)
         elif self.encoding == 'rate': # Converges to Poisson encoding
+            x = 0.25*x
             rand_map = torch.rand_like(x) 
             x = (x > rand_map).float()
         elif self.encoding == 'direct':
+            x = 0.25*x
             pass
         T,B,C,H,W = x.shape
 
@@ -37,6 +39,11 @@ class SpikingUNet(nn.Module):
 
         logit_rec = []
         for step in range(self.num_timesteps):
+            if step < 2:
+                # Access the first neuron layer of the encoder
+                # Adjust path to match your structure
+                mem_state = self.encoder.layer1[0].spike.mem 
+                print(f"Step {step} | Mem Mean: {mem_state.mean().item():.4f} | Max: {mem_state.max().item():.4f}")
             x_step = x[step, :, :, :, :]
             x_step, skips = self.encoder.forward_layers(x_step)
             x_step = self.bottleneck(x_step)

@@ -3,7 +3,7 @@ description: "Spiking ResNet-18 U-Net with standard LIF neurons and Rate encodin
 
 data:
   dataset_path: "data/eeg_emotions_processed"
-  encoding_method: "latency"
+  encoding_method: "direct"
   num_timesteps: 32
   window_size:  256
   sampling_rate: 256

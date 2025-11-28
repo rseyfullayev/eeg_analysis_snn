@@ -88,15 +88,19 @@ class SWEEPDataset(Dataset):
             class_data = data_tensor[class_indices]
             
             if len(class_data) == 0:
-                print(f"    Warning: Class {c} missing in training set. Using zeros.")
-                prototype = torch.zeros(grid_size, grid_size)
-            else:
-                prototype = class_data.mean(dim=(0, 1, 2))
+                print("Here")
+                prototypes.append(torch.zeros(grid_size, grid_size))
+                continue
 
-                p_min, p_max = prototype.min(), prototype.max()
-                if p_max > p_min:
-                    prototype = (prototype - p_min) / (p_max - p_min)
-            
+            class_data_log = torch.log1p(class_data)
+
+            prototype = class_data_log.mean(dim=(0, 1, 2))
+            print(f"   [DEBUG Class {c}] Pre-Norm Max: {prototype.max():.4f}, Min: {prototype.min():.4f}")
+            p_min, p_max = prototype.min(), prototype.max()
+            if p_max > p_min + 1e-6:
+                prototype = (prototype - p_min) / (p_max - p_min)
+            else:
+                print(f"   [WARNING] Class {c} prototype is flat!")
             prototypes.append(prototype)
             
         return torch.stack(prototypes)
@@ -133,6 +137,7 @@ class SWEEPDataset(Dataset):
         video = self.data[idx]
         label_idx = self.labels[idx]
         video = np.maximum(video, 0.0) 
+        video = np.log1p(video)
         v_max = video.max() + 1e-7
         video = video / v_max
         target_volume = torch.zeros(self.num_classes, self.grid_size, self.grid_size)

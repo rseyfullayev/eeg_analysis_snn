@@ -15,6 +15,8 @@ import warnings
 from sklearn.exceptions import UndefinedMetricWarning
 import numpy as np
 from torch.amp import autocast, GradScaler
+
+
 # Ignore the specific sklearn warning about missing classes
 warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
 warnings.filterwarnings("ignore", message="A single label was found in 'y_true' and 'y_pred'. For the confusion matrix to have the correct shape, use the 'labels' parameter to pass all known labels.")
@@ -267,13 +269,15 @@ def run_training(config, model, device, checkpoint=None):
         model = torch.compile(model)
     except Exception as e:
         print(f"⚠️ Could not compile model: {e}. Running in standard mode.")
-
+    
+    
     for epoch in range(start_epoch, epochs):
         
         model.train()
         train_loss = 0.0
 
         for _, (inputs, targets, targets_c) in enumerate(train_loader):
+
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
             inputs = inputs.permute(1, 0, 2, 3, 4)
             manual_reset(model)
