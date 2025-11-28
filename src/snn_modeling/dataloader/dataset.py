@@ -88,14 +88,13 @@ class SWEEPDataset(Dataset):
             class_data = data_tensor[class_indices]
             
             if len(class_data) == 0:
-                print("Here")
                 prototypes.append(torch.zeros(grid_size, grid_size))
                 continue
 
             class_data_log = torch.log1p(class_data)
 
             prototype = class_data_log.mean(dim=(0, 1, 2))
-            print(f"   [DEBUG Class {c}] Pre-Norm Max: {prototype.max():.4f}, Min: {prototype.min():.4f}")
+
             p_min, p_max = prototype.min(), prototype.max()
             if p_max > p_min + 1e-6:
                 prototype = (prototype - p_min) / (p_max - p_min)
