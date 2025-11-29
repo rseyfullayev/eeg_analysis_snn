@@ -38,11 +38,11 @@ class SpikingUNet(nn.Module):
         T, B, C, H, W = x.shape
         
 
-        x_encoded, skips = self.encoder(x)
+        x_encoded, skips, skips_id = self.encoder(x)
 
         x = self.bottleneck(x_encoded)
 
-        x = self.decoder(x, skips)
+        x = self.decoder(x, skips, skips_id)
 
         x_flat = x.reshape(T * B, x.shape[2], x.shape[3], x.shape[4])
         logits = self.classifier(x_flat)

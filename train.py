@@ -17,6 +17,7 @@ from sklearn.exceptions import UndefinedMetricWarning
 import numpy as np
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
+from src.snn_modeling.utils.model_builder import manual_reset
 
 # Ignore the specific sklearn warning about missing classes
 warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
@@ -24,15 +25,7 @@ warnings.filterwarnings("ignore", message="A single label was found in 'y_true' 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-def manual_reset(model):
 
-    for module in model.modules():
-        # Check if the module is a spiking neuron
-        if isinstance(module, (snn.Leaky, snn.Synaptic, snn.Alpha)):
-            if hasattr(module, 'reset_mem'):
-                module.reset_mem()
-            if hasattr(module, 'reset_hidden'):
-                module.reset_hidden()
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sweepnet.pt"):
@@ -157,76 +150,43 @@ def monitor_network_health(model, loader, device, epoch):
     model.eval()
     print(f"\n🔍 DIAGNOSTIC (Epoch {epoch}): Checking Network Health...")
     
-    # ... (Run Inference on ONE Batch to populate states) ...
-    # (Your existing code for this part is fine)
     try:
         inputs, _, _ = next(iter(loader))
     except StopIteration: return
     inputs = inputs.to(device)
     if inputs.dim() == 5: inputs = inputs.permute(1, 0, 2, 3, 4)
+    
     manual_reset(model)
     with torch.no_grad():
-        outputs = model(inputs)
-    # -----------------------------------------------------------
+        _ = model(inputs)
 
     print(f"\n⚡ MEMBRANE POTENTIALS:")
-    print(f"{'Layer':<30} | {'Max':<10} | {'Mean':<10} | {'Status'}")
-    print("-" * 70)
+    print(f"{'Layer Name':<40} | {'Max':<10} | {'Mean':<10} | {'Status'}")
+    print("-" * 80)
 
-    # Helper to safely check a module
-    def check_layer(name, module):
-        # We need to find the FINAL spiking neuron in a block
-        target_neuron = None
-        if hasattr(module, 'lif2'): target_neuron = module.lif2 # For ResBlocks
-        elif hasattr(module, 'spike'): target_neuron = module.spike # For ConvBnSpiking
-        elif hasattr(module, 'conv2') and hasattr(module.conv2, 'spike'): target_neuron = module.conv2.spike # For Bottleneck
-        elif isinstance(module, (snn.Leaky, snn.Synaptic)): target_neuron = module
+    # RECURSIVE SEARCH
+    # We walk through the whole model and find every SNN layer
+    for name, module in model.named_modules():
+        if isinstance(module, (snn.Leaky, snn.Synaptic)):
+            if hasattr(module, 'mem'):
+                mem = module.mem
+                if isinstance(mem, list): mem = mem[-1]
+                
+                if mem.numel() == 0: continue # Skip empty
 
-        if target_neuron and hasattr(target_neuron, 'mem'):
-            mem = target_neuron.mem
-            if isinstance(mem, list): mem = mem[-1] # Get last timestep if rec is on
-            
-            # THE FIX: Check if the tensor is empty before calling .max()
-            if mem.numel() == 0:
-                print(f"{name:<30} | {'N/A':<10} | {'N/A':<10} | ❄️ Empty Tensor")
-                return
+                v_max = mem.max().item()
+                v_mean = mem.mean().item()
+                
+                status = "✅"
+                if v_max > 5.0: status = "⚠️ High"
+                if v_max > 50.0: status = "🔥 EXPLODE"
+                if v_max < 0.05: status = "❄️ Dead"
+                
+                # Shorten the name for display
+                short_name = name.replace("encoder.", "Enc.").replace("decoder.", "Dec.")
+                print(f"{short_name:<40} | {v_max:<10.4f} | {v_mean:<10.4f} | {status}")
 
-            v_max = mem.max().item()
-            v_mean = mem.mean().item()
-            
-            status = "✅"
-            if v_max > 10.0: status = "⚠️"
-            if v_max < 0.1: status = "❄️"
-            
-            print(f"{name:<30} | {v_max:<10.4f} | {v_mean:<10.4f} | {status}")
-        else:
-            print(f"{name:<30} | {'N/A':<10} | {'N/A':<10} | Neuron not found")
-
-    # --- Probe Key Checkpoints ---
-    # Encoder
-    check_layer("Encoder L1", model.encoder.layer1[0])
-    check_layer("Encoder L4 (Deepest)", model.encoder.layer4[0])
-    
-    # Bottleneck
-    check_layer("Bottleneck", model.bottleneck)
-
-    # Decoder
-    check_layer("Decoder Up1", model.decoder.up1)
-    check_layer("Decoder Up3", model.decoder.up3)
-    check_layer("Decoder Final", model.decoder.final_up) # Check the final upsampling block
-    
-    print("-" * 70)
-
-def zero_init_residuals(model):
-    print("🔧 Applying Zero-Gamma Initialization...")
-    for m in model.modules():
-        # Look for your specific block class
-        if m.__class__.__name__ == 'SpikingResidualBlock':
-            # We want to zero out the last BN in the block (usually conv2)
-            # This makes the block act like an identity function initially
-            if hasattr(m.conv2, 'bn'):
-                nn.init.constant_(m.conv2.bn.weight, 0)
-    print("✅ Zero-Init Complete.")
+    print("-" * 80)
 
 def run_training(config, model, device, checkpoint=None):
 
@@ -340,10 +300,8 @@ def run_training(config, model, device, checkpoint=None):
     )
     
     epochs = config['training']['epochs']
-
-    zero_init_residuals(model)
     monitor_network_health(model, train_loader, device, 0)
-    zero_init_residuals(model)
+
     for epoch in range(start_epoch, epochs):
         
         model.train()
@@ -395,6 +353,11 @@ def run_training(config, model, device, checkpoint=None):
         if (epoch + 1) % config['logging'].get('log_interval', 10) == 0:
             print(f"Logging Visuals for Epoch {epoch}...")
             log_visuals(model, val_loader, device, writer, epoch) 
+        
+        print("Learned Thresholds:")
+        for name, layer in model.named_modules():
+            if hasattr(layer, "threshold"):
+                print(f"{name}: {layer.threshold.item():.4f}")
 
         if val_acc > best_acc:
             best_acc = val_acc

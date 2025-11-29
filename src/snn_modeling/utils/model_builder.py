@@ -1,14 +1,23 @@
 
 import snntorch as snn
 from ..models.unet import SpikingUNet, UNet
-from ..models.encoders import ResNet18Encoder, ResNet34Encoder, SpikingResNet18Encoder, SpikingResNet34Encoder
+from ..models.encoders import ResNet18Encoder, SpikingResNet18Encoder
 import inspect
-
+import torch.nn as nn
+import torch
 SPIKE_MODEL_MAP = {
     "snn.Leaky": snn.Leaky,
     "snn.Synaptic": snn.Synaptic,
     "snn.Alpha": snn.Alpha
 }
+
+def init_snn_weights(model):
+    print("Applying SNN-specific weight initialization (Zheng et al., 2021 style)...")
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.orthogonal_(m.weight, gain=2.0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
 def get_filtered_neuron_params(neuron_class, full_config_params):
     """
@@ -26,14 +35,24 @@ def get_filtered_neuron_params(neuron_class, full_config_params):
 
     return filtered_params
 
+def manual_reset(model):
+
+    for module in model.modules():
+        # Check if the module is a spiking neuron
+        if isinstance(module, (snn.Leaky, snn.Synaptic, snn.Alpha)):
+            if hasattr(module, 'reset_mem'):
+                module.reset_mem()
+            if hasattr(module, 'reset_hidden'):
+                module.reset_hidden()
+
+
+
 def build_model(config):
     model_type = config['model']['type']
     
     if model_type == "SpikingUNet":
         if config['model']['encoder_type'] == "ResNet18":
             encoder = SpikingResNet18Encoder
-        elif config['model']['encoder_type'] == "ResNet34":
-            encoder = SpikingResNet34Encoder
         else:
             raise ValueError(f"Unknown encoder type: {config['model']['encoder_type']}")
         spike_model_class = SPIKE_MODEL_MAP[config['neuron_params']['spike_model']]
@@ -60,8 +79,6 @@ def build_model(config):
     elif model_type == "UNet":
         if config['model']['encoder_type'] == "ResNet18":
             encoder = ResNet18Encoder
-        elif config['model']['encoder_type'] == "ResNet34":
-            encoder = ResNet34Encoder
         else:
             raise ValueError(f"Unknown encoder type: {config['model']['encoder_type']}")
         spike_model_class = SPIKE_MODEL_MAP[config['neuron_params']['spike_model']]
@@ -74,5 +91,5 @@ def build_model(config):
 
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-        
+    init_snn_weights(model)    
     return model
