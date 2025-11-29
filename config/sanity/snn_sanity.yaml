@@ -31,8 +31,8 @@ neuron_params:
   spike_model: "snn.Synaptic" 
   beta: 0.9
   alpha: 0.5
-  threshold: 1.0
-  learn_threshold: false
+  threshold: 0.1
+  learn_threshold: true
   learn_alpha: true
   learn_beta: true
   spike_grad_alpha: 0.5

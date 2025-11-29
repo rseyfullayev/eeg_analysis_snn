@@ -34,39 +34,23 @@ class SpikingUNet(nn.Module):
             pass
         else:
             raise ValueError(f"Unknown encoding method: {self.encoding}")
-        target_peak = 1.5 
-
-        T,B,C,H,W = x.shape
-
-        x = x.reshape(T*B, C, H, W)
-        x = self.encoder.stem(x)
-        _,C_stem,H_stem,W_stem = x.shape
-        x = x.reshape(T, B, C_stem, H_stem, W_stem)
-        flat_x = x.view(x.shape[0], -1)
-        max_val, _ = flat_x.max(dim=1)
-        scale_factor = target_peak / (max_val + 1e-5)
-        scale_factor = scale_factor.view(-1, 1, 1, 1, 1)
-        x = x * scale_factor
-
-         # Process each time step individually through the UNet
-        logit_rec = []
-        for step in range(self.num_timesteps):
-            x_step = x[step, :, :, :, :]
-            x_step, skips = self.encoder.forward_layers(x_step)
-            x_step = self.bottleneck(x_step)
-            x_step = self.decoder(x_step, skips)
-            
-            logit_rec.append(x_step)
-        output_logits = torch.stack(logit_rec, dim=0)
         
-        T,B,C,H,W = output_logits.shape
-        output_logits = output_logits.reshape(T*B, C, H, W)
-        output_logits = self.classifier(output_logits)
-        _,C_out,H_out,W_out = output_logits.shape
-        output_logits = output_logits.reshape(T, B, C_out, H_out, W_out)
+        T, B, C, H, W = x.shape
+        
+
+        x_encoded, skips = self.encoder(x)
+
+        x = self.bottleneck(x_encoded)
+
+        x = self.decoder(x, skips)
+
+        x_flat = x.reshape(T * B, x.shape[2], x.shape[3], x.shape[4])
+        logits = self.classifier(x_flat)
+
+        output_logits = logits.reshape(T, B, logits.shape[1], logits.shape[2], logits.shape[3])
 
         return output_logits
-
+    
 class UNet(nn.Module):
     def __init__(self, encoder, in_channels, num_classes):
         super(UNet, self).__init__()

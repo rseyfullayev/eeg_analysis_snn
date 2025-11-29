@@ -7,14 +7,31 @@ class SpikingResNetDecoder(nn.Module):
     def __init__(self, spike_model=snn.Leaky, **neuron_params):
         super(SpikingResNetDecoder, self).__init__()
         
-        self.up1 = SpikingUpsampleBlock(512, 256, spike_model=spike_model, **neuron_params)
-        self.up2 = SpikingUpsampleBlock(256, 128, spike_model=spike_model, **neuron_params)
-        self.up3 = SpikingUpsampleBlock(128, 64, spike_model=spike_model, **neuron_params)
-        self.final_up = nn.Sequential(
-            nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2),
-            ConvBnSpiking(64, 64, kernel_size=3, padding=1, spike_model=spike_model, **neuron_params),
-            nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2),
-            ConvBnSpiking(64, 64, kernel_size=3, padding=1, spike_model=spike_model, **neuron_params)
+        self.up1 = SpikingUpsampleBlock(
+            in_channels=512, 
+            skip_channels=256, 
+            out_channels=256, 
+            spike_model=spike_model, **neuron_params
+        )
+        
+        self.up2 = SpikingUpsampleBlock(
+            in_channels=256, 
+            skip_channels=128, 
+            out_channels=128, 
+            spike_model=spike_model, **neuron_params
+        )
+        
+        self.up3 = SpikingUpsampleBlock(
+            in_channels=128, 
+            skip_channels=64, 
+            out_channels=64, 
+            spike_model=spike_model, **neuron_params
+        )
+
+        self.final_up = FinalUpBlock(
+            in_channels=64, 
+            out_channels=64, 
+            spike_model=spike_model, **neuron_params
         )
 
     def forward(self, x, skips):

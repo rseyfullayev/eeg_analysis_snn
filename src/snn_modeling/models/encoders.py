@@ -24,17 +24,14 @@ class SpikingResNet18Encoder(nn.Module):
             SpikingResidualBlock(256, 512, p_drop=p_drop, stride=2, spike_model=spike_model, **neuron_params),
             SpikingResidualBlock(512, 512, p_drop=p_drop, spike_model=spike_model, **neuron_params)
         )
-    def forward_layers(self, x):
-
+    def forward(self, x):
+        x = self.stem(x)
         s1 = self.layer1(x)
         s2 = self.layer2(s1)
         s3 = self.layer3(s2)
         s4 = self.layer4(s3)
-        return s4, [s1,s2,s3]
-    
-    def forward(self, x):
-        x = self.stem(x)
-        return self.forward_layers(x)
+        
+        return s4, [s1, s2, s3]
     
 class SpikingResNet34Encoder(nn.Module):
     def __init__(self, in_channels, p_drop=0.2, spike_model=snn.Leaky, **neuron_params):
