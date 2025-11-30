@@ -15,7 +15,7 @@ def init_snn_weights(model):
     print("Applying SNN-specific weight initialization (Zheng et al., 2021 style)...")
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
-            nn.init.orthogonal_(m.weight, gain=2.0)
+            nn.init.orthogonal_(m.weight, gain=1.6)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
@@ -63,7 +63,8 @@ def build_model(config):
             'learn_alpha': config['neuron_params'].get('learn_alpha', True),
             'learn_beta': config['neuron_params'].get('learn_beta', True),
             'learn_threshold': config['neuron_params'].get('learn_threshold', True),
-            'spike_grad': snn.surrogate.atan(alpha=config['neuron_params'].get('spike_grad_alpha', 0.5))
+            'spike_grad': snn.surrogate.atan(alpha=config['neuron_params'].get('spike_grad_alpha', 0.5)),
+            'reset_mechanism': 'reset'
             
         }
         actual_params = get_filtered_neuron_params(spike_model_class, snn_params)

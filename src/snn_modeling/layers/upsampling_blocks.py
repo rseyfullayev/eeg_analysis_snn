@@ -28,7 +28,7 @@ class SpikingUpsampleBlock(nn.Module):
         super(SpikingUpsampleBlock, self).__init__()
 
         self.upsample = TimeDistributedUpsample(in_channels, in_channels // 2)
-        concat_channels = (in_channels // 2) + skip_channels + id_channels
+        concat_channels = (in_channels // 2) + skip_channels #+ id_channels
 
         self.conv1 = ConvSpiking(
             concat_channels, 
@@ -48,12 +48,12 @@ class SpikingUpsampleBlock(nn.Module):
             **neuron_params
         )
 
-    def forward(self, x, x_skip, id_skip):
+    def forward(self, x, x_skip): #, id_skip):
         x = self.upsample(x)
         
         assert x.shape[-1] == x_skip.shape[-1]
 
-        x = torch.cat([x, x_skip, id_skip], dim=2) 
+        x = torch.cat([x, x_skip], dim=2) #, id_skip], dim=2) 
         x = self.conv1(x)
         x = self.conv2(x)
         return x

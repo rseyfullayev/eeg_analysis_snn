@@ -41,9 +41,9 @@ class SpikingResNetDecoder(nn.Module):
         s1, s2, s3 = skips
         id1, id2, id3 = skips_id
         
-        x = self.up1(x, s3, id3)
-        x = self.up2(x, s2, id2)
-        x = self.up3(x, s1, id1)
+        x = self.up1(x, s3) #, id3)
+        x = self.up2(x, s2) # , id2)
+        x = self.up3(x, s1) #, id1)
         
         x = self.final_up(x)
         return x

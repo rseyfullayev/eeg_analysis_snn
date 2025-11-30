@@ -268,9 +268,9 @@ def run_training(config, model, device, checkpoint=None):
 
 
     optimizer = optim.AdamW([
-        {'params': base_params, 'lr': lr},
-        {'params': time_params, 'lr': lr * 0.01},
-        {'params': threshold_params, 'lr': lr * 100} 
+        {'params': base_params, 'lr': lr, 'weight_decay': 1e-4},
+        {'params': time_params, 'lr': lr * 0.01, 'weight_decay': 0},
+        {'params': threshold_params, 'lr': lr * 100, 'weight_decay': 0} 
     ], weight_decay=config['training']['weight_decay'], betas=(0.9, 0.999))
 
     start_epoch = 0
@@ -321,6 +321,10 @@ def run_training(config, model, device, checkpoint=None):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if "threshold" in name:
+                        param.clamp_(min=0.01)
             train_loss += loss.item()
             train_loop.set_postfix(loss=loss.item())
 
