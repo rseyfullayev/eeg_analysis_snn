@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from src.snn_modeling.utils.loss import FullHybridLoss
+from src.snn_modeling.utils.loss import FullHybridLoss, FiringRateRegularizer, TopKClassificationLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
 import os
 from datetime import datetime
@@ -17,7 +17,8 @@ from sklearn.exceptions import UndefinedMetricWarning
 import numpy as np
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-from src.snn_modeling.utils.model_builder import manual_reset
+from src.snn_modeling.utils.utils import initialize_network, monitor_network_health
+from src.snn_modeling.layers.neurons import ALIF
 
 # Ignore the specific sklearn warning about missing classes
 warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
@@ -39,14 +40,13 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
     }, path)
     print(f"New Record! Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
 
-def validate(model, val_loader, criterion, device):
+def validate(model, val_loader, criterion, device, threshold=0.5):
 
     model.eval()
     val_loss = 0
     correct = 0
     total = 0
     
-
     all_preds = []
     all_targets = []
 
@@ -58,29 +58,32 @@ def validate(model, val_loader, criterion, device):
 
             inputs = inputs.permute(1, 0, 2, 3, 4)
             
-            manual_reset(model)
             
             outputs = model(inputs)
             outputs_avg = torch.mean(outputs, dim=0)
             
             loss = criterion(outputs_avg, targets, labels)
             val_loss += loss.item()
-    
-            soft_probs = torch.sigmoid(outputs_avg)
-            energy = torch.sum(soft_probs, dim=(2, 3))
-            preds = torch.argmax(energy, dim=1)
-            
+            B, C, H, W = outputs_avg.shape
+            k_percent = loss.k_percent if hasattr(loss, 'k_percent') else 0.1
+            k = max(1, int(H * W * k_percent))
+            flat_logits = outputs_avg.view(B, C, -1)
+            top_k_values, _ = torch.topk(flat_logits, k, dim=2)
+            energy_logits = torch.mean(top_k_values, dim=2)
+            preds = torch.argmax(energy_logits, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
-            
+
+            soft_probs = torch.sigmoid(outputs_avg)
+  
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.cpu().numpy())
 
-            target_masks = (targets > 0.5).long()
+            target_masks = (targets > threshold).long()
             
 
             tp, fp, fn, tn = smp.metrics.get_stats(
-                soft_probs, target_masks, mode='multilabel', threshold=0.3
+                soft_probs, target_masks, mode='multilabel', threshold=threshold
             )
             tp_tot += tp.sum().item()
             fp_tot += fp.sum().item()
@@ -99,7 +102,7 @@ def validate(model, val_loader, criterion, device):
 
     return avg_loss, accuracy, balanced_acc, dice_score, iou_score, precision, recall
 
-def log_visuals(model, val_loader, device, writer, epoch):
+def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
 
     model.eval()
     
@@ -111,12 +114,9 @@ def log_visuals(model, val_loader, device, writer, epoch):
 
     inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
     inputs_snn = inputs.permute(1, 0, 2, 3, 4)
-    
-    manual_reset(model)
-    
+
     with torch.no_grad():
         outputs = model(inputs_snn)
-
         outputs_avg = torch.mean(outputs, dim=0)
         probs = torch.sigmoid(outputs_avg)
 
@@ -126,12 +126,15 @@ def log_visuals(model, val_loader, device, writer, epoch):
         true_class = labels[idx].item()
     
         img_input = inputs[idx].mean(dim=(0, 1)).cpu().numpy()
-        
-        img_input = (img_input - img_input.min()) / (img_input.max() - img_input.min() + 1e-7)
+        min_v, max_v = img_input.min(), img_input.max()
+        if max_v - min_v > 1e-7:
+            img_input = (img_input - min_v) / (max_v - min_v)
+        else:
+            img_input = np.zeros_like(img_input)
 
         img_target = targets[idx, true_class].cpu().numpy()
         img_pred = probs[idx, true_class].cpu().numpy()
-
+        img_pred_bin = (img_pred > threshold).astype(float)
         caption_text = f"Class {true_class} | Sample {idx} | Ep {epoch}"
         
         writer.add_image(f"Vis/Input_{idx}", img_input[None, ...], epoch)
@@ -142,51 +145,51 @@ def log_visuals(model, val_loader, device, writer, epoch):
             f"Visuals/Sample_{idx}": [
                 wandb.Image(img_input, caption=f"Input (Avg Activity) - {caption_text}"),
                 wandb.Image(img_target, caption=f"Target {caption_text})"),
-                wandb.Image(img_pred, caption=f"Prediction - {caption_text}")
+                wandb.Image(img_pred, caption=f"Prediction - {caption_text}"),
+                wandb.Image(img_pred_bin, caption=f"Hard Pred (Thresh {threshold})")
             ]
         }, step=epoch)
 
-def monitor_network_health(model, loader, device, epoch):
-    model.eval()
-    print(f"\n🔍 DIAGNOSTIC (Epoch {epoch}): Checking Network Health...")
-    
-    try:
-        inputs, _, _ = next(iter(loader))
-    except StopIteration: return
-    inputs = inputs.to(device)
-    if inputs.dim() == 5: inputs = inputs.permute(1, 0, 2, 3, 4)
-    
-    manual_reset(model)
-    with torch.no_grad():
-        _ = model(inputs)
+def create_optimizer(model, config):
+    lr = config['training'].get('learning_rate', 1e-3)
+    base_params = []
+    base_params_no_decay = []
+    time_params = []
+    threshold_params = []
+    no_decay_id = set()
+    classess_names = (snn.Leaky, snn.Synaptic, snn.Alpha, 
+                      ALIF, TopKClassificationLoss, 
+                      nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, 
+                      nn.LayerNorm, nn.GroupNorm)
+    for m in model.modules():
+        if isinstance(m, classess_names):
+            for param in m.parameters(recurse=False):
+                no_decay_id.add(id(param))    
+        if hasattr(m, 'bias') and m.bias is not None:
+            no_decay_id.add(id(m.bias))
+        if hasattr(m, 'gain') and m.gain is not None:
+             no_decay_id.add(id(m.gain))
 
-    print(f"\n⚡ MEMBRANE POTENTIALS:")
-    print(f"{'Layer Name':<40} | {'Max':<10} | {'Mean':<10} | {'Status'}")
-    print("-" * 80)
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'alpha' in name or 'beta' in name or 'slope' in name:
+            time_params.append(param)
+        elif 'threshold' in name:
+            threshold_params.append(param)
+        elif id(param) in no_decay_id:
+            base_params_no_decay.append(param)
+        else:
+            base_params.append(param)
 
-    # RECURSIVE SEARCH
-    # We walk through the whole model and find every SNN layer
-    for name, module in model.named_modules():
-        if isinstance(module, (snn.Leaky, snn.Synaptic)):
-            if hasattr(module, 'mem'):
-                mem = module.mem
-                if isinstance(mem, list): mem = mem[-1]
-                
-                if mem.numel() == 0: continue # Skip empty
+    optimizer = optim.AdamW([
+        {'params': base_params, 'lr': lr, 'weight_decay': config['training'].get('weight_decay', 1e-4)},
+        {'params': base_params_no_decay, 'lr': lr, 'weight_decay': 0.0},
+        {'params': time_params, 'lr': lr * 1e-2, 'weight_decay': 0.0},
+        {'params': threshold_params, 'lr': lr * 100, 'weight_decay': 0.0}
+    ], betas=(0.9, 0.999))
 
-                v_max = mem.max().item()
-                v_mean = mem.mean().item()
-                
-                status = "✅"
-                if v_max > 5.0: status = "⚠️ High"
-                if v_max > 50.0: status = "🔥 EXPLODE"
-                if v_max < 0.05: status = "❄️ Dead"
-                
-                # Shorten the name for display
-                short_name = name.replace("encoder.", "Enc.").replace("decoder.", "Dec.")
-                print(f"{short_name:<40} | {v_max:<10.4f} | {v_mean:<10.4f} | {status}")
-
-    print("-" * 80)
+    return optimizer
 
 def run_training(config, model, device, checkpoint=None):
 
@@ -209,7 +212,7 @@ def run_training(config, model, device, checkpoint=None):
 
     data_path = os.path.join(config['data']['dataset_path'], "data.npy")
     label_path = os.path.join(config['data']['dataset_path'], "labels.npy")
-    scaler = GradScaler()
+    
     # Load as Tensor
     all_data = torch.tensor(np.load(data_path), dtype=torch.float32)
     all_labels = torch.tensor(np.load(label_path), dtype=torch.long)
@@ -225,19 +228,22 @@ def run_training(config, model, device, checkpoint=None):
 
     train_data_slice = all_data[train_idx]
     train_label_slice = all_labels[train_idx]
-
+    '''
     master_prototypes = SWEEPDataset.compute_prototypes(
         train_data_slice, 
         train_label_slice, 
         config['model']['num_classes'],
         config['data']['grid_size']
     )
-
+    '''
+    prototype_bank = SWEEPDataset.compute_prototypes(None, None, 
+                                                    config['model']['num_classes'],
+                                                    config['data']['grid_size'], device=device)
     train_set = SWEEPDataset(
         config, 
         data=train_data_slice, 
         labels=train_label_slice, 
-        prototypes=master_prototypes, 
+        prototypes=prototype_bank, #master_prototypes, 
         mode='manual'
     )
     
@@ -245,7 +251,7 @@ def run_training(config, model, device, checkpoint=None):
         config, 
         data=all_data[val_idx], 
         labels=all_labels[val_idx], 
-        prototypes=master_prototypes,
+        prototypes=prototype_bank, #master_prototypes,
         mode='manual'
     )
     
@@ -253,33 +259,31 @@ def run_training(config, model, device, checkpoint=None):
     val_loader = DataLoader(val_set, batch_size=config['training']['batch_size'], shuffle=False, num_workers=config['data'].get('num_workers', 0))
     print(f"Data Loaded: {len(train_set)} Train | {len(val_set)} Val")
 
-    lr = config['training'].get('learning_rate', 1e-3)
-    base_params = []
-    time_params = []
-    threshold_params = []
+    loss_fn = FullHybridLoss(
+        smooth = config['loss'].get('smooth', 0.0),
+        lambda_seg = config['loss'].get('lambda_seg', 1.0),
+        lambda_bce = config['loss'].get('lambda_bce', 1.0),
+        lambda_class = config['loss'].get('lambda_class', 1.0),
+        alpha = config['loss'].get('alpha', 0.5),
+        beta = config['loss'].get('beta', 0.5),
+        label_smoothing = config['loss'].get('label_smoothing', 0.0)
 
-    for name, param in model.named_parameters():
-        if 'alpha' in name or 'beta' in name or 'slope' in name:
-            time_params.append(param)
-        elif 'threshold' in name:
-            threshold_params.append(param)
-        else:
-            base_params.append(param)
+    )
+    
+    spike_tax_collector = FiringRateRegularizer(model, 
+                                                target_rate=config['loss'].get('target_rate', 0.05), 
+                                                lambda_reg=config['loss'].get('lambda_fire', 0.1))
+    
 
-
-    optimizer = optim.AdamW([
-        {'params': base_params, 'lr': lr, 'weight_decay': 1e-4},
-        {'params': time_params, 'lr': lr * 0.01, 'weight_decay': 0},
-        {'params': threshold_params, 'lr': lr * 100, 'weight_decay': 0} 
-    ], weight_decay=config['training']['weight_decay'], betas=(0.9, 0.999))
-
+    optimizer = create_optimizer(model, config)
+    scaler = GradScaler()
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['training']['epochs'], eta_min=1e-6)
+    
     start_epoch = 0
     best_acc = 0.0
     best_dice = 0.0
+    epochs = config['training']['epochs']
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['training']['epochs'], eta_min=1e-6)
-    model = model.to(device)
-    
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -289,18 +293,9 @@ def run_training(config, model, device, checkpoint=None):
         best_dice = checkpoint['dice']
         print(f"Resuming training from epoch {start_epoch}...")
 
-    loss_fn = FullHybridLoss(
-        smooth = config['loss'].get('smooth', 0.0),
-        lambda_seg = config['loss'].get('lambda_seg', 1.0),
-        lambda_bce = config['loss'].get('lambda_bce', 1.0),
-        lambda_class = config['loss'].get('lambda_class', 1.0),
-        alpha = config['loss'].get('alpha', 0.5),
-        beta = config['loss'].get('beta', 0.5),
-
-    )
+    model = model.to(device)
     
-    epochs = config['training']['epochs']
-    monitor_network_health(model, train_loader, device, 0)
+    initialize_network(model, train_loader, device)
 
     for epoch in range(start_epoch, epochs):
         
@@ -311,20 +306,17 @@ def run_training(config, model, device, checkpoint=None):
 
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
             inputs = inputs.permute(1, 0, 2, 3, 4)
-            manual_reset(model)
+
             optimizer.zero_grad()
             with autocast(device_type="cuda"):
                 outputs = model(inputs)
                 outputs_agg = torch.mean(outputs, dim=0)
-
-                loss = loss_fn(outputs_agg, targets, targets_c)
+                loss_spike_tax = spike_tax_collector.compute_tax()
+                loss = loss_fn(outputs_agg, targets, targets_c) + loss_spike_tax
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if "threshold" in name:
-                        param.clamp_(min=0.01)
+            
             train_loss += loss.item()
             train_loop.set_postfix(loss=loss.item())
 
@@ -351,18 +343,11 @@ def run_training(config, model, device, checkpoint=None):
         }
         wandb.log(log_dict, step=epoch)
         for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
-        if (epoch + 1) % config['logging'].get('log_interval', 5) == 0:
-            monitor_network_health(model, val_loader, device, epoch)
  
         if (epoch + 1) % config['logging'].get('log_interval', 10) == 0:
             print(f"Logging Visuals for Epoch {epoch}...")
             log_visuals(model, val_loader, device, writer, epoch) 
         
-        print("Learned Thresholds:")
-        for name, layer in model.named_modules():
-            if hasattr(layer, "threshold"):
-                print(f"{name}: {layer.threshold.item():.4f}")
-
         if val_acc > best_acc:
             best_acc = val_acc
             best_dice = val_dice

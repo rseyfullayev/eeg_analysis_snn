@@ -22,16 +22,16 @@ class SpikingResNet18Encoder(nn.Module):
 
     def forward(self, x):
         x = self.stem(x)
-        s1, id1 = self.layer1a(x)
-        s1, _ = self.layer1b(s1)
-        s2, _ = self.layer2a(s1)
-        s2, id2 = self.layer2b(s2)
-        s3, id3 = self.layer3a(s2)
-        s3, _ = self.layer3b(s3)
-        s4, _ = self.layer4a(s3)
-        s4, _ = self.layer4b(s4)
+        s1 = self.layer1a(x)
+        s1 = self.layer1b(s1)
+        s2 = self.layer2a(s1)
+        s2 = self.layer2b(s2)
+        s3 = self.layer3a(s2)
+        s3 = self.layer3b(s3)
+        s4 = self.layer4a(s3)
+        s4 = self.layer4b(s4)
         
-        return s4, [s1, s2, s3], [id1, id2, id3]
+        return s4, [s1, s2, s3]
     
 
 

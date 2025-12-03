@@ -3,21 +3,15 @@ import snntorch as snn
 from ..models.unet import SpikingUNet, UNet
 from ..models.encoders import ResNet18Encoder, SpikingResNet18Encoder
 import inspect
-import torch.nn as nn
-import torch
+from ..layers.neurons import ALIF
+
+
 SPIKE_MODEL_MAP = {
     "snn.Leaky": snn.Leaky,
     "snn.Synaptic": snn.Synaptic,
-    "snn.Alpha": snn.Alpha
+    "snn.Alpha": snn.Alpha,
+    "ALIF": ALIF
 }
-
-def init_snn_weights(model):
-    print("Applying SNN-specific weight initialization (Zheng et al., 2021 style)...")
-    for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            nn.init.orthogonal_(m.weight, gain=1.6)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
 def get_filtered_neuron_params(neuron_class, full_config_params):
     """
@@ -35,15 +29,6 @@ def get_filtered_neuron_params(neuron_class, full_config_params):
 
     return filtered_params
 
-def manual_reset(model):
-
-    for module in model.modules():
-        # Check if the module is a spiking neuron
-        if isinstance(module, (snn.Leaky, snn.Synaptic, snn.Alpha)):
-            if hasattr(module, 'reset_mem'):
-                module.reset_mem()
-            if hasattr(module, 'reset_hidden'):
-                module.reset_hidden()
 
 
 
@@ -60,11 +45,16 @@ def build_model(config):
             'alpha': config['neuron_params'].get('alpha', 0.5),
             'beta': config['neuron_params'].get('beta', 0.9),
             'threshold': config['neuron_params'].get('threshold', 1.),
-            'learn_alpha': config['neuron_params'].get('learn_alpha', True),
-            'learn_beta': config['neuron_params'].get('learn_beta', True),
-            'learn_threshold': config['neuron_params'].get('learn_threshold', True),
-            'spike_grad': snn.surrogate.atan(alpha=config['neuron_params'].get('spike_grad_alpha', 0.5)),
-            'reset_mechanism': 'reset'
+            'gamma_adapt': config['neuron_params'].get('gamma_adapt', 0.5),
+            'decay_adapt': config['neuron_params'].get('decay_adapt', 0.96),
+            'learn_alpha': config['neuron_params'].get('learn_alpha', False),
+            'learn_beta': config['neuron_params'].get('learn_beta', False),
+            'learn_decay': config['neuron_params'].get('learn_decay', False),
+            'learn_gamma': config['neuron_params'].get('learn_gamma', False),
+            'learn_threshold': config['neuron_params'].get('learn_threshold', False),
+            'learn_slope': config['neuron_params'].get('learn_slope', False),
+            'reset_mechanism': config['neuron_params'].get('reset_mechanism', 'zero')
+            
             
         }
         actual_params = get_filtered_neuron_params(spike_model_class, snn_params)
@@ -92,5 +82,5 @@ def build_model(config):
 
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-    init_snn_weights(model)    
+       
     return model

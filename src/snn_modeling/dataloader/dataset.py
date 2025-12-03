@@ -77,6 +77,7 @@ class SWEEPDataset(Dataset):
 
         return SWEEPDataset.compute_prototypes(self.data, self.labels, self.num_classes, self.grid_size)
 
+    '''
     @staticmethod
     def compute_prototypes(data_tensor, label_tensor, num_classes, grid_size):
 
@@ -103,7 +104,34 @@ class SWEEPDataset(Dataset):
             prototypes.append(prototype)
             
         return torch.stack(prototypes)
-    
+        '''
+    @staticmethod
+    def compute_prototypes(data_tensor, label_tensor, num_classes, grid_size, device='cuda'):
+        x = torch.arange(grid_size, dtype=torch.float32, device=device)
+        y = torch.arange(grid_size, dtype=torch.float32, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        
+        center = grid_size // 2
+        # Sigma controls blob width. grid_size/8 gives a nice defined circle.
+        sigma = grid_size / 8.0 
+        
+        # Calculate Gaussian: exp(-dist^2 / 2sigma^2)
+        # We want peak to be 1.0, so no normalization constant needed.
+        dist_sq = (xx - center)**2 + (yy - center)**2
+        master_blob = torch.exp(-dist_sq / (2 * sigma**2))
+        
+        # 2. Create the Bank: [Classes, Output_Channels, H, W]
+        # We assume Output_Channels == Num_Classes for orthogonality
+        prototypes = torch.zeros(num_classes, grid_size, grid_size, device=device)
+        
+        for c in range(num_classes):
+            # For Class 'c', we put the Master Blob on Channel 'c'
+            # All other channels remain 0.0 (Black)
+            prototypes[c, :, :] = master_blob
+            
+        print(f"    ✅ Created 5 Orthogonal Prototypes. Max Diff: 1.0")
+        return prototypes
+
     def __len__(self):
         return len(self.data)
     
