@@ -36,11 +36,9 @@ class DatasetReader(Dataset):
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
     from wavelet import WaveletModule
-    selected_emotions = [3, 5, 8, 10, 15]
 
     dataset = DatasetReader(
         folder_path="eeg_raw",
-        selected_emotions=selected_emotions
     )
 
     loader = DataLoader(dataset, batch_size=1, shuffle=True)

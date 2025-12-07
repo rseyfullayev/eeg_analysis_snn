@@ -5,19 +5,21 @@ import pywt
 import scipy.signal
 
 class WaveletModule(nn.Module):
-    def __init__(self, window_size=256, target_steps=32, fs=200):
-        super(WaveletModule, self).__init__()
-        self.window_size = window_size
-        self.target_steps = target_steps
-        self.fs = fs
-        self.wavelet_name = "cmor1.5-1.0"
-        self.bands = {
-            "delta": (1, 4),
-            "theta": (4, 8),
-            "alpha": (8, 14),
-            "beta": (14, 31),
-            "gamma": (31, 50)
-        }
+    class WaveletModule(nn.Module):
+        def __init__(self, window_size=256, target_steps=32, fs=200):
+            super().__init__()
+            self.window_size = window_size
+            self.target_steps = target_steps
+            self.fs = fs
+            self.wavelet_name = "cmor1.5-1.0"
+
+            self.bands = {
+                "delta": (1, 4),
+                "theta": (4, 8),
+                "alpha": (8, 14),
+                "beta": (14, 31),
+                "gamma": (31, 50)
+            }
 
     def create_windows(self, eeg, step_size=128):
         windows = []
@@ -26,7 +28,7 @@ class WaveletModule(nn.Module):
         if total_samples < self.window_size:
             return torch.empty(0)
         
-        assert channels == 14
+        assert channels == 62
 
         for start in range(0, total_samples - self.window_size + 1, step_size):
             end = start + self.window_size
