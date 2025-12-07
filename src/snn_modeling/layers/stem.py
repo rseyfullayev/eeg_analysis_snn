@@ -21,7 +21,7 @@ class StemLayer(nn.Module):
 class ClassifierHead(nn.Module):
     def __init__(self, in_features, num_classes):
         super(ClassifierHead, self).__init__()
-        #self.bn = TimeDistributed(nn.BatchNorm2d(in_features))
+
         self.head = TimeDistributed(nn.Conv2d(in_features, num_classes, kernel_size=1, bias=True))
     
     def forward(self, x):

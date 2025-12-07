@@ -37,11 +37,11 @@ class SpikingUNet(nn.Module):
             raise ValueError(f"Unknown encoding method: {self.encoding}")
     
         x, skips = self.encoder(x)
-        #print( f"Encoder Output Shape: {x.shape} " )
+
         x = self.bottleneck(x)
-        #print( f"Bottleneck Output Shape: {x.shape} " )
+
         x = self.decoder(x, skips)
-        #print( f"Decoder Output Shape: {x.shape} " )
+
         logits = self.classifier(x)
 
         return logits
