@@ -30,8 +30,6 @@ def get_filtered_neuron_params(neuron_class, full_config_params):
     return filtered_params
 
 
-
-
 def build_model(config):
     model_type = config['model']['type']
     

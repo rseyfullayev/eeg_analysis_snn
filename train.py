@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from src.snn_modeling.utils.loss import FullHybridLoss, FiringRateRegularizer, TopKClassificationLoss
+from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
 
 import os
@@ -18,9 +18,9 @@ from sklearn.exceptions import UndefinedMetricWarning
 import numpy as np
 
 from tqdm import tqdm
-from src.snn_modeling.utils.utils import initialize_network, monitor_network_health
+from src.snn_modeling.utils.utils import initialize_network
 from src.snn_modeling.layers.neurons import ALIF
-from src.snn_modeling.models.unet import SpikingResNetClassifier, PlainResNetClassifier
+from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.models.encoders import SpikingResNet18Encoder
 
 # Ignore the specific sklearn warning about missing classes
@@ -62,15 +62,14 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             inputs = inputs.permute(1, 0, 2, 3, 4)
             
             outputs = model(inputs)
-            outputs_avg = outputs #torch.mean(outputs, dim=0)#.squeeze(dim=(-2,-1))       
-            loss = criterion(outputs_avg, targets, labels)
+            loss = criterion(outputs, targets, labels)
 
             val_loss += loss.item()
 
-            B, C, H, W = outputs_avg.shape
+            B, C, H, W = outputs.shape
             k_percent = loss.k_percent if hasattr(loss, 'k_percent') else 0.1
             k = max(1, int(H * W * k_percent))
-            flat_logits = outputs_avg.view(B, C, -1)
+            flat_logits = outputs.view(B, C, -1)
             top_k_values, _ = torch.topk(flat_logits, k, dim=2)
             energy_logits = torch.mean(top_k_values, dim=2)
             preds = torch.argmax(energy_logits, dim=1)
@@ -81,7 +80,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             all_targets.extend(labels.cpu().numpy())
             
             if not only_classification:
-                soft_probs = torch.sigmoid(outputs_avg)
+                soft_probs = torch.sigmoid(outputs)
                 target_masks = (targets > threshold).long()
                 
 
@@ -120,8 +119,7 @@ def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
 
     with torch.no_grad():
         outputs = model(inputs_snn)
-        outputs_avg = outputs#torch.mean(outputs, dim=0)
-        probs = torch.sigmoid(outputs_avg)
+        probs = torch.sigmoid(outputs)
 
     num_samples = min(4, inputs.shape[0])
     
@@ -250,9 +248,8 @@ def training_loop(phase,
             
             inputs = inputs.permute(1, 0, 2, 3, 4)
             outputs = model(inputs)
-       
-            outputs_agg = outputs #torch.mean(outputs, dim=0)
-            loss = loss_fn(outputs_agg, targets, targets_c)
+
+            loss = loss_fn(outputs, targets, targets_c)
             
             loss.backward()
             optimizer.step()
@@ -452,6 +449,35 @@ phase_handles = {
     3: phase_three,
 }
 
+def calculate_optimal_firing_rate(dataset, num_samples=1000):
+    print("📏 Auditing Ground Truth Energy Density...")
+    
+    total_energy = 0.0
+    count = 0
+    
+    # Iterate through a subset of the data
+    for i in range(min(len(dataset), num_samples)):
+        # Get target volume: (5, 32, 32)
+        _, target_volume, _ = dataset[i]
+        
+        # We only care about the ACTIVE class channel (the one with the blob)
+        # But since the other 4 are empty (zeros), the mean over the whole volume works too.
+        # However, strictly speaking, we want the mean of the NON-ZERO map.
+        
+        # Sum of pixel values (Energy) / Total Pixels
+        # This gives us the % of the screen that is "lit up"
+        energy_density = target_volume.sum() / target_volume.numel()
+        
+        total_energy += energy_density
+        count += 1
+        
+    avg_rate = total_energy / count
+    
+    print(f"✅ Measured Average Energy Density: {avg_rate:.4f}")
+    print(f"🎯 Recommended target_rate: {avg_rate:.4f}")
+    
+    return avg_rate
+
 
 def run_training(config, model, device, phase, resume, checkpoint=None):
 
@@ -466,7 +492,6 @@ def run_training(config, model, device, phase, resume, checkpoint=None):
         config=config,
         tags=config['logging']['tags'],
         mode="disabled" if config['logging'].get('offline') else "online",
-
         settings=wandb.Settings(_disable_stats=True, _disable_meta=True) 
     )
     
@@ -477,7 +502,6 @@ def run_training(config, model, device, phase, resume, checkpoint=None):
     data_path = os.path.join(config['data']['dataset_path'], "data.npy")
     label_path = os.path.join(config['data']['dataset_path'], "labels.npy")
     
-    # Load as Tensor
     all_data = torch.tensor(np.load(data_path), dtype=torch.float32)
     all_labels = torch.tensor(np.load(label_path), dtype=torch.long)
     num_samples = len(all_labels)
@@ -510,17 +534,16 @@ def run_training(config, model, device, phase, resume, checkpoint=None):
         prototypes=prototype_bank,
         mode='manual'
     )
-    
+
+    calculate_optimal_firing_rate(train_set)
     train_loader = DataLoader(train_set, batch_size=config['training']['batch_size'], shuffle=True, num_workers=config['data'].get('num_workers', 0))
     val_loader = DataLoader(val_set, batch_size=config['training']['batch_size'], shuffle=False, num_workers=config['data'].get('num_workers', 0))
 
     print(f"Data Loaded: {len(train_set)} Train | {len(val_set)} Val")
 
     model = model.to(device)
-    
     phase_handles[phase](config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint)
    
-    
     print("--- Training Complete ---")
     wandb.finish()
     writer.close()

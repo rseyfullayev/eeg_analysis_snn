@@ -22,21 +22,22 @@ class LearnableAtan(nn.Module):
    
     def __init__(self, alpha=2.0, learnable=True):
         super().__init__()
-
-        self.alpha = nn.Parameter(torch.tensor(float(alpha)), requires_grad=learnable)
-
+        self.learnable = learnable
+        if learnable:
+            self.alpha = nn.Parameter(torch.tensor(float(alpha)), requires_grad=learnable)
+        else:
+            self.register_buffer("alpha_fixed", torch.tensor(alpha))
+        
     @staticmethod
     class _Function(torch.autograd.Function):
         @staticmethod
         def forward(ctx, input, alpha):
             ctx.save_for_backward(input, alpha)
-            # Standard Heaviside Step
             return (input > 0).float()
 
         @staticmethod
         def backward(ctx, grad_output):
             input, alpha = ctx.saved_tensors
-            # We enforce alpha > 0 physically using abs() or softplus here to be safe
             slope = alpha.abs() 
             denom = 1 + (slope * input).pow(2)
             d_input = grad_output * (slope / denom)
@@ -45,7 +46,8 @@ class LearnableAtan(nn.Module):
             return d_input, d_alpha.sum()
 
     def forward(self, x):
-        return self._Function.apply(x, self.alpha)
+        alpha = self.alpha if self.learnable else self.alpha_fixed
+        return self._Function.apply(x, alpha)
 
 class TimeDistributed(nn.Module):
     def __init__(self, module):

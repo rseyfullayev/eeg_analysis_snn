@@ -81,37 +81,8 @@ class SWEEPDataset(Dataset):
             self.prototypes = self._generate_prototypes_internal()
     
     def _generate_prototypes_internal(self):
-
         return SWEEPDataset.compute_prototypes(self.data, self.labels, self.num_classes, self.grid_size)
-
-    '''
-    @staticmethod
-    def compute_prototypes(data_tensor, label_tensor, num_classes, grid_size):
-
-        print("   Computing Data-Driven Prototypes (Train Set Only)...")
-        prototypes = []
-        
-        for c in range(num_classes):
-            class_indices = (label_tensor == c).nonzero(as_tuple=True)[0]
-            class_data = data_tensor[class_indices]
-            
-            if len(class_data) == 0:
-                prototypes.append(torch.zeros(grid_size, grid_size))
-                continue
-
-            class_data_log = torch.log1p(class_data)
-
-            prototype = class_data_log.mean(dim=(0, 1, 2))
-
-            p_min, p_max = prototype.min(), prototype.max()
-            if p_max > p_min + 1e-6:
-                prototype = (prototype - p_min) / (p_max - p_min)
-            else:
-                print(f"   [WARNING] Class {c} prototype is flat!")
-            prototypes.append(prototype)
-            
-        return torch.stack(prototypes)
-        '''
+    
     @staticmethod
     def compute_prototypes(num_classes, grid_size, device='cuda'):
         range_t = torch.linspace(-1, 1, grid_size, device=device)
@@ -166,28 +137,6 @@ class SWEEPDataset(Dataset):
         video = self.data[idx]
         label_idx = self.labels[idx]
 
-        """# 1. Log Transform
-        video = np.log1p(np.maximum(video, 0.0)*1e9)
-        
-        # 2. Masked Z-Score Normalization
-        brain_mask = video > 1e-6
-        
-        if brain_mask.sum() > 0:
-            brain_pixels = video[brain_mask]
-            mean = brain_pixels.mean()
-            std = brain_pixels.std() + 1e-7
-            
-            # Standardize
-            video = (video - mean) / std
-            
-            # Clip & Scale (-3 to 3 sigma -> 0 to 1)
-            video = np.clip(video, -3, 3)
-            video = (video + 3) / 6
-        else:
-            video[:] = 0.0
-
-        # 3. Re-Apply Mask (Clean corners)
-        video[~brain_mask] = 0.0"""
         P98_VAL = 3758.30126953125 # The Holy Number
         GAIN = 10.0  # The gain used in the tanh
         video = np.tanh(video / P98_VAL * GAIN)

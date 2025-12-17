@@ -38,7 +38,7 @@ def run_data_setup(config=None):
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    dataset_reader = DatasetReader(RAW_FOLDER)#, selected_emotions=SELECTED_EMOTIONS)
+    dataset_reader = DatasetReader(RAW_FOLDER)
     wavelet = WaveletModule(window_size=WINDOW_SIZE, fs=SAMPLING_RATE, target_steps=TARGET_STEPS)
     coords = pd.read_csv(COORDS_PATH, sep=',')
     topo = TopoMapper(coords, grid_size=config['data'].get('grid_size', 64))
@@ -54,17 +54,15 @@ def run_data_setup(config=None):
 
     for raw_eeg, emotion_id in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader), desc="Files Processed"):
         if use_sampling_limit and total_collected >= TOTAL_TARGET:
-            print("\n🛑 Total sample target reached!")
+            print("\n Total sample target reached!")
             break
 
         try:
             if not use_sampling_limit:
-                #raw_eeg, emotion_id = dataset_reader[i]
                 windows = wavelet.create_windows(raw_eeg, step_size=STEP_SIZE)
                 if len(windows) == 0: continue
                     
                 for window in windows:
-                    # Pipeline logic is duplicated, but keeps code clean
                     window = scipy.signal.detrend(window, axis=-1)
                     w_mean = np.mean(window)
                     w_std = np.std(window)
@@ -79,20 +77,17 @@ def run_data_setup(config=None):
                     video = torch.clamp(video, min=0.0)
                     all_videos.append(video.cpu().numpy())
                     all_labels.append(emotion_map[emotion_id])
-                continue # Go to next file  
+                continue
 
             if emotion_id not in emotion_map: continue
             label_idx = emotion_map[emotion_id]
-
-            # 2. Check if this class is full
             if class_counts[label_idx] >= SAMPLES_PER_CLASS:
-                continue # Skip this file, we have enough of this emotion
+                continue
 
             windows = wavelet.create_windows(raw_eeg, step_size=STEP_SIZE)
             
             if len(windows) == 0: continue
 
-            # 4. Take only what we need
             needed = SAMPLES_PER_CLASS - class_counts[label_idx]
             windows = windows[:needed]
             
@@ -128,8 +123,13 @@ def run_data_setup(config=None):
     print("Stacking data...")
     data_np = np.stack(all_videos)
     labels_np = np.array(all_labels) 
-    
+
+    all_pixels = data_np.flatten()
+    brain_pixels  = all_pixels[all_pixels > 1e-12] 
+    p98 = np.percentile(brain_pixels , 98)
+
     print(f"Final Shape: {data_np.shape}")
+    print(f"98th Percentile Value (for clipping): {p98:.6f}")
     
     print(f"Saving to {OUTPUT_FOLDER}...")
     np.save(os.path.join(OUTPUT_FOLDER, "data.npy"), data_np)
