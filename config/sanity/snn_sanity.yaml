@@ -14,8 +14,7 @@ data:
   num_channels: 62
   train_split: 0.8
   num_workers: 4
-  num_samples: 2000
-  
+
 
 mask:
   type: "data_driven"
@@ -50,12 +49,12 @@ training:
 
 loss:
   smooth: 0.0
-  lambda_seg: 1.0
+  lambda_seg: 0.0
   lambda_bce: 0.0
-  lambda_class: 2.0
-  lambda_fire: 0.1
+  lambda_class: 1.0
+  lambda_fire: 0.0
   target_rate: 0.05
-  label_smoothing: 0.1
+  label_smoothing: 0.0
   alpha: 0.7
   beta: 0.3
 

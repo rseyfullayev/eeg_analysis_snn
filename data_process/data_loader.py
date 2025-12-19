@@ -38,12 +38,11 @@ class DatasetReader(Dataset):
             files_map[path].append(item)
 
         # 2. Iterate through files
-        print(f"🔄 Optimized Iterator: Processing {len(files_map)} unique files...")
+        print(f"Optimized Iterator: Processing {len(files_map)} unique files...")
         
         for path, trials in files_map.items():
             try:
                 # LOAD ONCE
-                # Suppress warnings
                 mne.set_log_level('WARNING')
                 raw = mne.io.read_raw_cnt(path, preload=True)
                 useless_ch = ['M1', 'M2', 'VEO', 'HEO']
@@ -51,37 +50,31 @@ class DatasetReader(Dataset):
                 # Pick EEG
                 raw.pick_types(eeg=True)
                 if len(raw.ch_names) != 62:
-                    # If we still don't have 62, we need to know WHY. 
-                    # Don't just slice. Print the error.
                     print(f"⚠️ Channel Mismatch in: Has {len(raw.ch_names)} channels. Expected 62.")
                     print(f"   Channels found: {raw.ch_names}")
-                    # Fallback: Slice only if we have >62, but warn about it
+                    print(f"   File: {path}")  
                     if len(raw.ch_names) > 62:
                         raw.pick_channels(raw.ch_names[:62])
-                
-                # RESAMPLE ONCE (The heavy part)
+                    else:
+                        continue
+                    
                 if raw.info['sfreq'] != 200:
                     raw.resample(200)
+                base_filename = os.path.basename(path).replace('.cnt', '')
 
-                # Process all trials in this file
                 for trial_meta in trials:
                     start_sample = int(trial_meta['t_start'] * 200)
                     end_sample = int(trial_meta['t_end'] * 200)
-                    
-                    # Slice
+ 
                     data, _ = raw[:, start_sample:end_sample]
                     max_val = np.max(np.abs(data))
                     if max_val > 0 and max_val < 1e-2: 
                         data = data * 1e6
-                    # Tensor conversion
                     eeg_tensor = torch.tensor(data, dtype=torch.float32)
-                    #print(int(trial_meta['label']))
-                    yield eeg_tensor, int(trial_meta['label'])
-                    
-                # Python automatically cleans up 'raw' here to free RAM
-                
+                    yield eeg_tensor, int(trial_meta['label']), base_filename
+                                    
             except Exception as e:
-                print(f"❌ Error reading file {path}: {e}")
+                print(f"Error reading file {path}: {e}")
                 continue
 
     def _parse_labels(self):
@@ -116,7 +109,7 @@ class DatasetReader(Dataset):
 
 
     def _scan_files(self):
-        files = [f for f in os.listdir(self.eeg_dir) if f.endswith('.cnt')]
+        files = sorted([f for f in os.listdir(self.eeg_dir) if f.endswith('.cnt')])
         
         for f in files:
             try:
@@ -164,13 +157,12 @@ class DatasetReader(Dataset):
             # Pick EEG
             raw.pick_types(eeg=True)
             if len(raw.ch_names) != 62:
-                # If we still don't have 62, we need to know WHY. 
-                # Don't just slice. Print the error.
-                print(f"⚠️ Channel Mismatch in: Has {len(raw.ch_names)} channels. Expected 62.")
-                print(f"   Channels found: {raw.ch_names}")
-                # Fallback: Slice only if we have >62, but warn about it
+                print(f"Channel Mismatch in: Has {len(raw.ch_names)} channels. Expected 62.")
+                print(f"Channels found: {raw.ch_names}")
                 if len(raw.ch_names) > 62:
                     raw.pick_channels(raw.ch_names[:62])
+                else:
+                    return torch.zeros(62, 200), -1
             raw.pick_types(eeg=True)
         
             if raw.info['sfreq'] != 200:

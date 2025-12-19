@@ -96,7 +96,7 @@ def run_bn_warmup(model, loader, device, num_batches=10):
                 break
             inputs = inputs.to(device)
             if inputs.dim() == 5:
-                inputs = inputs.permute(1, 0, 2, 3, 4)
+                inputs = inputs.permute(2, 0, 1, 3, 4)
             
             _ = model(inputs)
     

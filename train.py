@@ -59,7 +59,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
         for inputs, targets, labels in val_loader:
             inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
 
-            inputs = inputs.permute(1, 0, 2, 3, 4)
+            inputs = inputs.permute(2, 0, 1, 3, 4)
             
             outputs = model(inputs)
             loss = criterion(outputs, targets, labels)
@@ -115,7 +115,7 @@ def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
         return 
 
     inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
-    inputs_snn = inputs.permute(1, 0, 2, 3, 4)
+    inputs_snn = inputs.permute(2, 0, 1, 3, 4)
 
     with torch.no_grad():
         outputs = model(inputs_snn)
@@ -138,15 +138,12 @@ def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
         img_pred_bin = (img_pred > threshold).astype(float)
         caption_text = f"Class {true_class} | Sample {idx} | Ep {epoch}"
         
-        #writer.add_image(f"Vis/Input_{idx}", img_input[None, ...], epoch)
         writer.add_image(f"Vis/Target_{idx}", img_target[None, ...], epoch)
         writer.add_image(f"Vis/Pred_{idx}", img_pred_bin[None, ...], epoch)
         
         wandb.log({
             f"Visuals/Sample_{idx}": [
-                #wandb.Image(img_input, caption=f"Input (Avg Activity) - {caption_text}"),
                 wandb.Image(img_target, caption=f"Target {caption_text})"),
-                #wandb.Image(img_pred, caption=f"Prediction - {caption_text}"),
                 wandb.Image(img_pred_bin, caption=f"Hard Pred (Thresh {threshold})")
             ]
         }, step=epoch)
@@ -246,7 +243,7 @@ def training_loop(phase,
             
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
             
-            inputs = inputs.permute(1, 0, 2, 3, 4)
+            inputs = inputs.permute(2, 0, 1, 3, 4)
             outputs = model(inputs)
 
             loss = loss_fn(outputs, targets, targets_c)
@@ -449,36 +446,6 @@ phase_handles = {
     3: phase_three,
 }
 
-def calculate_optimal_firing_rate(dataset, num_samples=1000):
-    print("📏 Auditing Ground Truth Energy Density...")
-    
-    total_energy = 0.0
-    count = 0
-    
-    # Iterate through a subset of the data
-    for i in range(min(len(dataset), num_samples)):
-        # Get target volume: (5, 32, 32)
-        _, target_volume, _ = dataset[i]
-        
-        # We only care about the ACTIVE class channel (the one with the blob)
-        # But since the other 4 are empty (zeros), the mean over the whole volume works too.
-        # However, strictly speaking, we want the mean of the NON-ZERO map.
-        
-        # Sum of pixel values (Energy) / Total Pixels
-        # This gives us the % of the screen that is "lit up"
-        energy_density = target_volume.sum() / target_volume.numel()
-        
-        total_energy += energy_density
-        count += 1
-        
-    avg_rate = total_energy / count
-    
-    print(f"✅ Measured Average Energy Density: {avg_rate:.4f}")
-    print(f"🎯 Recommended target_rate: {avg_rate:.4f}")
-    
-    return avg_rate
-
-
 def run_training(config, model, device, phase, resume, checkpoint=None):
 
     run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -498,44 +465,17 @@ def run_training(config, model, device, phase, resume, checkpoint=None):
     log_dir = os.path.join("results", run_name)
     writer = SummaryWriter(log_dir=log_dir)
     print(f"Initializing TensorBoard: {log_dir}")
-    
-    data_path = os.path.join(config['data']['dataset_path'], "data.npy")
-    label_path = os.path.join(config['data']['dataset_path'], "labels.npy")
-    
-    all_data = torch.tensor(np.load(data_path), dtype=torch.float32)
-    all_labels = torch.tensor(np.load(label_path), dtype=torch.long)
-    num_samples = len(all_labels)
-    indices = np.arange(num_samples)
-
-    train_idx, val_idx = train_test_split(
-        indices, 
-        test_size=(1 - config['data']['train_split']), 
-        random_state=42, 
-        stratify=all_labels # Good for imbalanced emotions!
-    )
-
-    train_data_slice = all_data[train_idx]
-    train_label_slice = all_labels[train_idx]
-    
-    prototype_bank = SWEEPDataset.compute_prototypes(config['model']['num_classes'],
-                                                    config['data']['grid_size'], device=device)
+   
     train_set = SWEEPDataset(
         config, 
-        data=train_data_slice, 
-        labels=train_label_slice, 
-        prototypes=prototype_bank,
-        mode='manual'
+        split='train'
     )
     
     val_set = SWEEPDataset(
         config, 
-        data=all_data[val_idx], 
-        labels=all_labels[val_idx], 
-        prototypes=prototype_bank,
-        mode='manual'
+        split='val'
     )
 
-    calculate_optimal_firing_rate(train_set)
     train_loader = DataLoader(train_set, batch_size=config['training']['batch_size'], shuffle=True, num_workers=config['data'].get('num_workers', 0))
     val_loader = DataLoader(val_set, batch_size=config['training']['batch_size'], shuffle=False, num_workers=config['data'].get('num_workers', 0))
 
