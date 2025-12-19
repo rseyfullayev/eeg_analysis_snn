@@ -67,7 +67,6 @@ class SWEEPDataset(Dataset):
         self.split = split
         self.num_classes = config['model'].get('num_classes', 5)
         self.grid_size = config['data'].get('grid_size', 32)
-        
         self.dataset_path = config['data']['dataset_path'] 
         self.samples_dir = os.path.join(self.dataset_path)
         index_file = os.path.join(self.dataset_path, "index.csv")
@@ -98,20 +97,19 @@ class SWEEPDataset(Dataset):
         else:
             raise ValueError(f"Unknown split '{split}'. Use 'train' or 'val'.")
         self.samples = list(zip(df_slice['filename'], df_slice['emotion_id']))
-
+        sigma = config['mask'].get('sigma', 0.25)
+        radius = config['mask'].get('radius', 0.7)
         if prototypes is not None:
             self.prototypes = prototypes
         else:
-            self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, device='cpu')
+            self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
 
     @staticmethod
-    def compute_prototypes(num_classes, grid_size, device='cpu'):
+    def compute_prototypes(num_classes, grid_size, radius, sigma, device='cpu'):
         range_t = torch.linspace(-1, 1, grid_size, device=device)
         yy, xx = torch.meshgrid(range_t, range_t, indexing='ij')
         prototypes = []
-        radius = 0.7
-        sigma = 0.25
-        
+
         for c in range(num_classes):
             angle = (2 * np.pi * c) / num_classes
             cx = radius * np.sin(angle)

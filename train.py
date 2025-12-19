@@ -446,6 +446,7 @@ phase_handles = {
     3: phase_three,
 }
 
+
 def run_training(config, model, device, phase, resume, checkpoint=None):
 
     run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -480,7 +481,7 @@ def run_training(config, model, device, phase, resume, checkpoint=None):
     val_loader = DataLoader(val_set, batch_size=config['training']['batch_size'], shuffle=False, num_workers=config['data'].get('num_workers', 0))
 
     print(f"Data Loaded: {len(train_set)} Train | {len(val_set)} Val")
-
+    
     model = model.to(device)
     phase_handles[phase](config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint)
    

@@ -2,20 +2,23 @@ experiment_name: "SNN_ResNet18_RateEncoding"
 description: "Spiking ResNet-18 U-Net with standard LIF neurons and Rate encoding. (SANITY CHECK)"
 
 data:
-  dataset_path: "data/processed_real"
-  coords_path: "data/coords.csv"
+  dataset_path: "D:\\SEED-V\\preprocessed_eeg"
+  dataset_mode: "eeg"
   encoding_method: "direct"
-  num_timesteps: 32
-  grid_size:  64
+  num_timesteps: 16
+  window_size:  200
+  sampling_rate: 200
+  step_size: 100
+  grid_size:  32
   freq_bands: 5
-  num_channels: 14
+  num_channels: 62
   train_split: 0.8
   num_workers: 4
-  num_samples: 0
 
 mask:
-  type: "data_driven"
-  sigma: 5.0
+  type: "GaussianSplat"
+  sigma: 0.25
+  radius: 0.7
 
 model:
   type: "SpikingUNet"
@@ -25,29 +28,37 @@ model:
   dropout: 0.2
 
 neuron_params:
-  spike_model: "snn.Leaky" 
+  spike_model: "ALIF" 
   beta: 0.9
-  alpha: 0.5
   threshold: 1.0
-  learn_alpha: false
-  learn_beta: false
+  decay_adapt: 0.98
+  gamma_adapt: 0.75
+  spike_grad_alpha: 2.0
 
 training:
-  epochs: 100
-  batch_size: 32
-  learning_rate: 0.0001
-  weight_decay: 0.05
+  epochs: 150
+  phase_1_epochs: 50
+  phase_2_epochs: 50
+  phase_3_epochs: 50
+  batch_size: 16
+  learning_rate: 0.0005
+  weight_decay: 0.01
+  accumulation_steps: 1
 
 loss:
-  smooth: 0.
-  lambda_seg: 1.0
-  lambda_bce: 1.5
-  lambda_class: 0.1
-  alpha: 0.8
-  beta: 0.2
+  smooth: 0.0
+  lambda_seg: 0.0
+  lambda_bce: 0.0
+  lambda_class: 1.0
+  lambda_fire: 0.0
+  target_rate: 0.02
+  label_smoothing: 0.0
+  alpha: 0.7
+  beta: 0.3
 
 logging:
-  project_name: "snn-encoding-showdown"  # The name of the project on the website
-  run_name: "Sanity_ResNet18_Latency"    # A specific name for this experiment
-  tags: ["sanity-check", "resnet18", "latency", "snn"] # Tags for filtering later
-  offline: false   # Set to true if you have no internet and want to sync later
+  project_name: "snn-encoding-showdown"
+  run_name: "ResNet18_Encoder_SNN_Decoder"
+  tags: ["resnet18", "snn"]
+  offline: false 
+  log_interval: 1

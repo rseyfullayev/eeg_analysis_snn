@@ -20,5 +20,6 @@ eeg_emotions_processed/
 eeg_emotions_processed1/
 dummy_loader.py
 debug_orientation.py
-yingyang.py
+audit_data.py
 MNIST/
+sanity/

@@ -4,6 +4,29 @@ from tqdm import tqdm
 import snntorch as snn
 from ..layers.neurons import ALIF
 
+def calculate_optimal_firing_rate(dataset, num_samples=2000):
+    print("Auditing Ground Truth Energy Density...")
+    
+    total_energy = 0.0
+    count = 0
+    
+    # Iterate through a subset of the data
+    for i in range(min(len(dataset), num_samples)):
+        _, target_volume, _ = dataset[i]
+        
+        energy_density = target_volume.sum() / target_volume.numel()
+        
+        total_energy += energy_density
+        count += 1
+        
+    avg_rate = total_energy / count
+    
+    print(f"Measured Average Energy Density: {avg_rate:.4f}")
+    print(f"Recommended target_rate: {avg_rate:.4f}")
+    
+    return avg_rate
+
+
 def monitor_network_health(model, loader, device, epoch):
     model.eval()
     print(f"\nDIAGNOSTIC (Epoch {epoch}): Checking Network Health...")
