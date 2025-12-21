@@ -62,7 +62,7 @@ class TopoMapper(nn.Module):
         return self.transform(tensor)
 
 class SWEEPDataset(Dataset):
-    def __init__(self, config, split='train', prototypes=None):
+    def __init__(self, config, split='train', norm=True, prototypes=None):
         self.config = config
         self.split = split
         self.num_classes = config['model'].get('num_classes', 5)
@@ -70,9 +70,9 @@ class SWEEPDataset(Dataset):
         self.dataset_path = config['data']['dataset_path'] 
         self.samples_dir = os.path.join(self.dataset_path)
         index_file = os.path.join(self.dataset_path, "index.csv")
-        
+        self.norm = norm
         if not os.path.exists(index_file):
-            raise FileNotFoundError(f"Index not found at {index_file}. Did you run the baker?")
+            raise FileNotFoundError(f"Index not found at {index_file}.")
             
         print(f"Loading index from {index_file}...")
         df = pd.read_csv(index_file)
@@ -134,11 +134,12 @@ class SWEEPDataset(Dataset):
             print(f"Error loading {fname}: {e}")
             return torch.zeros(5, 32, 32, 32), torch.zeros(self.num_classes, 32, 32), 0
         
-        P98_VAL = 2396.1880
+        P98_VAL = 14191.618164
         GAIN = 10.0  
         
-        video = video / P98_VAL * GAIN
-        video = torch.tanh(video) 
+        if self.norm:
+            video = video / P98_VAL * GAIN
+            video = torch.tanh(video) 
  
         target_volume = torch.zeros(self.num_classes, self.grid_size, self.grid_size)
         target_volume[label_idx] = self.prototypes[label_idx]

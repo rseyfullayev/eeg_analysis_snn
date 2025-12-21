@@ -3,10 +3,15 @@ import torch.nn as nn
 from tqdm import tqdm
 import snntorch as snn
 from ..layers.neurons import ALIF
+import numpy as np
+import os
+import pandas as pd
+from src.snn_modeling.dataloader.dataset import SWEEPDataset
+from torch.utils.data import DataLoader
 
 def calculate_optimal_firing_rate(dataset, num_samples=2000):
     print("Auditing Ground Truth Energy Density...")
-    
+
     total_energy = 0.0
     count = 0
     
@@ -138,3 +143,21 @@ def initialize_network(model, train_loader, device):
     apply_kaiming_init(model)
     run_bn_warmup(model, train_loader, device)
     initialize_head(model.classifier.head)
+
+def calculate_p98(dataset):
+
+    subset_files = dataset[:int(0.05 * len(dataset))]
+    print(f"   Sampling {len(subset_files)} random files for statistics...")
+    reservoir = []
+
+    for video, _, _ in tqdm(subset_files):
+        pixels = video.flatten().numpy()
+        active = pixels[pixels > 1e-9]
+
+        if len(active) > 0:
+            choice = np.random.choice(active, size=min(500, len(active)), replace=False)
+            reservoir.append(choice)
+
+    all_samples = np.concatenate(reservoir)
+    p98 = np.percentile(all_samples, 98)
+    print(f"Calculated 98th Percentile of Active Pixels: {p98:.6f} on reservoir of {len(all_samples)} samples.")

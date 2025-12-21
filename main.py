@@ -6,6 +6,8 @@ import torch
 from generate_dataset import run_data_setup
 from train import run_training
 from src.snn_modeling.utils.model_builder import build_model
+from src.snn_modeling.utils.utils import calculate_p98, calculate_optimal_firing_rate
+from src.snn_modeling.dataloader.dataset import SWEEPDataset
 
 def main():
     parser = argparse.ArgumentParser(description="SWEEP-Net Entry Point")
@@ -24,6 +26,8 @@ def main():
     parser.add_argument('--coords_path', type=str, help='Path to electrodes coordinates .csv')
     parser.add_argument('--output_path', type=str, help='Destination folder for processed .npy files')
 
+    parser.add_argument('--calculate_stat', action='store_true', help='Calculate Fire Rate and 98th Percentile for dataset')
+
     args = parser.parse_args()
     config_path = args.config
 
@@ -35,8 +39,20 @@ def main():
     
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
-    
-    if args.setup_data:
+
+    if args.calculate_stat:
+        dataset = SWEEPDataset(
+                config, 
+                split='train'
+                )   
+        print("Calculating Dataset Statistics...")
+
+        calculate_p98(dataset)
+        config['data']['P98'] = calculate_p98(dataset)
+        calculate_optimal_firing_rate(dataset)
+        
+
+    elif args.setup_data:
         print("Running dataset setup...")
         if not args.raw_path or not args.coords_path or not args.output_path:
             parser.error("When using --setup_data, you MUST specify --raw_path, --coords_path, and --output_path.")
