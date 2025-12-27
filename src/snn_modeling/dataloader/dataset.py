@@ -62,7 +62,7 @@ class TopoMapper(nn.Module):
         return self.transform(tensor)
 
 class SWEEPDataset(Dataset):
-    def __init__(self, config, split='train', norm=True, prototypes=None):
+    def __init__(self, config, loso, split='train', experiment=False, prototypes=None):
         self.config = config
         self.split = split
         self.num_classes = config['model'].get('num_classes', 5)
@@ -70,30 +70,32 @@ class SWEEPDataset(Dataset):
         self.dataset_path = config['data']['dataset_path'] 
         self.samples_dir = os.path.join(self.dataset_path)
         index_file = os.path.join(self.dataset_path, "index.csv")
-        self.norm = norm
+
         if not os.path.exists(index_file):
             raise FileNotFoundError(f"Index not found at {index_file}.")
             
         print(f"Loading index from {index_file}...")
         df = pd.read_csv(index_file)
     
-
         indices = np.arange(len(df))
         labels = df['emotion_id'].values
         
+        df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
+        df_val = df[df['filename'].str.split('_').str[0] == str(loso)]
+        """
         train_idx, val_idx = train_test_split(
             indices, 
             test_size=(1 - config['data'].get('train_split', 0.8)), 
             random_state=42, 
             stratify=labels # Ensures balanced classes in both sets
         )
-
+        """
         if split == 'train':
-            print(f"Selecting TRAINING set ({len(train_idx)} samples)")
-            df_slice = df.iloc[train_idx]
+            print(f"Selecting TRAINING set ({len(df_train)} samples)")
+            df_slice = df_train if not experiment else df_train[:25000]
         elif split == 'val':
-            print(f"Selecting VALIDATION set ({len(val_idx)} samples)")
-            df_slice = df.iloc[val_idx]
+            print(f"Selecting VALIDATION set ({len(df_val)} samples)")
+            df_slice = df_val if not experiment else df_val[:6400]
         else:
             raise ValueError(f"Unknown split '{split}'. Use 'train' or 'val'.")
         self.samples = list(zip(df_slice['filename'], df_slice['emotion_id']))
@@ -134,13 +136,10 @@ class SWEEPDataset(Dataset):
             print(f"Error loading {fname}: {e}")
             return torch.zeros(5, 32, 32, 32), torch.zeros(self.num_classes, 32, 32), 0
         
-        P98_VAL = 14191.618164
-        GAIN = 10.0  
-        
-        if self.norm:
-            video = video / P98_VAL * GAIN
-            video = torch.tanh(video) 
- 
+        p98_instance = torch.maximum(torch.quantile(video.abs().flatten(), 0.98), torch.tensor(1e-6))
+        video = torch.tanh(video / p98_instance * 3.0)
+
+
         target_volume = torch.zeros(self.num_classes, self.grid_size, self.grid_size)
         target_volume[label_idx] = self.prototypes[label_idx]
         

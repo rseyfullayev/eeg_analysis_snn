@@ -163,7 +163,7 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
     classess_names = (snn.Leaky, snn.Synaptic, snn.Alpha, 
                       ALIF, TopKClassificationLoss, 
                       nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, 
-                      nn.LayerNorm, nn.GroupNorm)
+                      nn.LayerNorm, nn.GroupNorm, nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)
     for m in model.modules():
         if isinstance(m, classess_names):
             for param in m.parameters(recurse=False):
@@ -447,7 +447,7 @@ phase_handles = {
 }
 
 
-def run_training(config, model, device, phase, resume, checkpoint=None):
+def run_training(config, model, device, phase, resume, loso, checkpoint=None):
 
     run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     checkpoint_dir = os.path.join("saved_models", f"phase{phase}", run_name)
@@ -469,12 +469,16 @@ def run_training(config, model, device, phase, resume, checkpoint=None):
    
     train_set = SWEEPDataset(
         config, 
-        split='train'
+        split='train',
+        experiment=True,
+        loso=loso
     )
     
     val_set = SWEEPDataset(
         config, 
-        split='val'
+        split='val',
+        experiment=True,
+        loso=loso
     )
 
     train_loader = DataLoader(train_set, batch_size=config['training']['batch_size'], shuffle=True, num_workers=config['data'].get('num_workers', 0))

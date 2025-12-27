@@ -1,4 +1,5 @@
 import torch.nn as nn
+import torch
 import snntorch as snn
 from .residual_blocks import ConvSpiking
 from .neurons import TimeDistributed
@@ -6,17 +7,22 @@ from .neurons import TimeDistributed
 class StemLayer(nn.Module):
     def __init__(self, in_channels):
         super(StemLayer, self).__init__()
-        self.conv = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn = nn.BatchNorm2d(64, eps=1e-4)
-        self.act = nn.SiLU(inplace=True) 
-        self.layer = TimeDistributed(nn.Sequential(
-            self.conv,
-            self.bn,
-            self.act
-        ))
-
+        
+        self.layer = ConvSpiking(
+            in_channels,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+            spike_model=nn.Identity,
+            use_norm=False)
+        
+        self.norm = TimeDistributed(nn.InstanceNorm2d(64, affine=True,eps=1e-6))
+        self.act = nn.SiLU()
     def forward(self, x):
-        return self.layer(x)
+
+        return self.act(self.norm(self.layer(x)))
     
 class ClassifierHead(nn.Module):
     def __init__(self, in_features, num_classes, kernel_size=1):

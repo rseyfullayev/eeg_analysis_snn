@@ -8,17 +8,17 @@ class SpikingResNet18Encoder(nn.Module):
         super(SpikingResNet18Encoder, self).__init__()
         self.stem = StemLayer(in_channels)
         
-        self.layer1a = SpikingResBlock(64, 64, p_drop=p_drop, spike_model=spike_model, **neuron_params)
-        self.layer1b = SpikingResBlock(64, 64, p_drop=p_drop, spike_model=spike_model, **neuron_params)
+        self.layer1a = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
+        self.layer1b = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
         
-        self.layer2a = SpikingResBlock(64, 128, p_drop=p_drop, stride=2, spike_model=spike_model, **neuron_params)
-        self.layer2b = SpikingResBlock(128, 128, p_drop=p_drop, spike_model=spike_model, **neuron_params)
+        self.layer2a = SpikingResBlock(64, 128, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **neuron_params)
+        self.layer2b = SpikingResBlock(128, 128, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
         
-        self.layer3a = SpikingResBlock(128, 256, p_drop=p_drop, stride=2, spike_model=spike_model, **neuron_params)
-        self.layer3b = SpikingResBlock(256, 256, p_drop=p_drop, spike_model=spike_model, **neuron_params)
+        self.layer3a = SpikingResBlock(128, 256, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **neuron_params)
+        self.layer3b = SpikingResBlock(256, 256, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
   
-        self.layer4a = SpikingResBlock(256, 512, p_drop=p_drop, stride=2, spike_model=spike_model, **neuron_params)
-        self.layer4b = SpikingResBlock(512, 512, p_drop=p_drop, spike_model=spike_model, **neuron_params)
+        self.layer4a = SpikingResBlock(256, 512, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **neuron_params)
+        self.layer4b = SpikingResBlock(512, 512, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
 
     def forward(self, x):
         x = self.stem(x)

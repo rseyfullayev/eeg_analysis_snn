@@ -6,8 +6,160 @@ from ..layers.neurons import ALIF
 import numpy as np
 import os
 import pandas as pd
-from src.snn_modeling.dataloader.dataset import SWEEPDataset
-from torch.utils.data import DataLoader
+import scipy.stats as stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def generate_topology_proof(loader, device, class_names, max_batches=100):
+    
+    print("Accumulating spatial averages per class...")
+    
+    num_classes = len(class_names)
+    # Accumulators: [Class, Height, Width]
+    # Assuming input is 32x32. Adjust if different.
+    class_sums = torch.zeros(num_classes, 32, 32).to(device)
+    class_counts = torch.zeros(num_classes).to(device)
+    
+    # Iterate through data
+    for batch_idx, (data, _, target) in enumerate(loader):
+        if batch_idx >= max_batches: break
+
+        data = data.to(device)
+        target = target.to(device)
+        
+        if data.dim() == 4: # [B, C, H, W]
+            spatial_data = data.mean(dim=1) 
+        elif data.dim() == 5: # [B, T, C, H, W]
+            spatial_data = data.mean(dim=(1, 2))
+        else:
+            spatial_data = data
+            
+        # Accumulate
+        for c in range(num_classes):
+            mask = (target == c)
+            if mask.sum() > 0:
+                class_sums[c] += spatial_data[mask].sum(dim=0)
+                class_counts[c] += mask.sum()
+                
+        if batch_idx % 50 == 0:
+            print(f"Processed batch {batch_idx}...")
+
+    # Calculate Means
+    class_means = (class_sums / class_counts.view(-1, 1, 1)).cpu().numpy()
+    
+    # --- PLOTTING THE PROOF ---
+    idx_A = 4 # Happy
+    idx_B = 2 # Fear (or Sad)
+    
+    diff_map = class_means[idx_A] - class_means[idx_B]
+    
+    # Calculate Kurtosis of the Difference Map (The "Hotspot" Proof)
+    from scipy.stats import kurtosis
+    k_score = kurtosis(diff_map.flatten())
+    print(f"Excess Kurtosis of Difference Map: {k_score:.4f}")
+    
+    plt.figure(figsize=(10, 4))
+    
+    plt.subplot(1, 3, 1)
+    sns.heatmap(class_means[idx_A], cmap='viridis', cbar=False)
+    plt.title(f"Mean {class_names[idx_A]}")
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    sns.heatmap(class_means[idx_B], cmap='viridis', cbar=False)
+    plt.title(f"Mean {class_names[idx_B]}")
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    # Use diverging colormap to show Positive vs Negative activation
+    sns.heatmap(diff_map, cmap='seismic', center=0) 
+    plt.title(f"Difference ({class_names[idx_A]} - {class_names[idx_B]})\nKurtosis={k_score:.2f}")
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('evidence/topology_proof.png', dpi=300)
+    print("Saved topology_proof.png")
+
+
+
+
+def analyze_distribution(dataloader, num_batches=20, max_samples=100000):
+    
+    # Accumulate data
+    collected_samples = []
+    
+    print(f"Collecting samples from {num_batches} batches...")
+    for i, (data, _, _) in enumerate(dataloader):
+        if i >= num_batches:
+            break
+        
+        flat_data = data.flatten().cpu().numpy()
+
+        if len(flat_data) > max_samples:
+            flat_data = np.random.choice(flat_data, max_samples, replace=False)
+            
+        collected_samples.append(flat_data)
+
+    full_distribution = np.concatenate(collected_samples)
+    
+    print(f"Analyzing {len(full_distribution)} data points...")
+
+    # 1. Calculate Statistics
+    mu = np.mean(full_distribution)
+    sigma = np.std(full_distribution)
+    
+    # Fisher=True means Normal distribution has Kurtosis = 0
+    kurtosis_val = stats.kurtosis(full_distribution, fisher=True)
+    skewness_val = stats.skew(full_distribution)
+
+    print(f"\n--- Statistical Audit ---")
+    print(f"Mean: {mu:.4f}")
+    print(f"Std Dev: {sigma:.4f}")
+    print(f"Skewness: {skewness_val:.4f}")
+    print(f"Excess Kurtosis: {kurtosis_val:.4f}")
+    
+    if kurtosis_val > 1.0:
+        print(">> RESULT: Distribution is Leptokurtic (Heavy Tailed).")
+    else:
+        print(">> RESULT: Distribution is Mesokurtic/Platykurtic.")
+
+    # 2. Generate Plots for Paper
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Plot A: Log-Scale Histogram (The best proof of fat tails)
+    axes[0].hist(full_distribution, bins=100, density=True, alpha=0.7, color='blue', label='Topological Data')
+    
+    # Overlay Normal Distribution for comparison
+    x = np.linspace(mu - 4*sigma, mu + 4*sigma, 100)
+    p = stats.norm.pdf(x, mu, sigma)
+    axes[0].plot(x, p, 'k', linewidth=2, label='Normal Dist')
+    
+    axes[0].set_yscale('log') # <--- CRITICAL: Reveals the tails
+    axes[0].set_title('Log-Probability Density (Fat Tails)')
+    axes[0].legend()
+    axes[0].grid(True, which="both", ls="-", alpha=0.2)
+
+    # Plot B: Q-Q Plot
+    # We downsample for Q-Q plot to avoid lag
+    qq_sample = np.random.choice(full_distribution, size=5000, replace=False)
+    stats.probplot(qq_sample, dist="norm", plot=axes[1])
+    axes[1].set_title('Q-Q Plot (Normality Check)')
+    
+    plt.tight_layout()
+    plt.savefig('evidence/distribution_evidence.png', dpi=300)
+    print("\nEvidence saved to 'distribution_evidence.png'")
 
 def calculate_optimal_firing_rate(dataset, num_samples=2000):
     print("Auditing Ground Truth Energy Density...")
@@ -102,7 +254,7 @@ def apply_kaiming_init(model):
                 nn.init.constant_(m.bias, 0)
             count += 1
             
-        elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+        elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.GroupNorm, nn.InstanceNorm2d, nn.InstanceNorm3d)):
 
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1)
@@ -110,6 +262,16 @@ def apply_kaiming_init(model):
                 nn.init.constant_(m.bias, 0)
                 
     print(f"   Initialized {count} Convolutional layers.")
+    count = 0
+    for m in model.modules():
+        if "GatedSkip" in m.__class__.__name__:
+            # Target: m.gate -> .module -> [0] (Conv2d)
+            if hasattr(m, 'gate') and hasattr(m.gate, 'module'):
+                nn.init.constant_(m.gate.module[0].bias, 2.0)
+                count += 1
+    print(f"   Initialized {count} Open Gates.")
+                
+    
 
 def run_bn_warmup(model, loader, device, num_batches=10):
 
@@ -146,11 +308,12 @@ def initialize_network(model, train_loader, device):
 
 def calculate_p98(dataset):
 
-    subset_files = dataset[:int(0.05 * len(dataset))]
-    print(f"   Sampling {len(subset_files)} random files for statistics...")
+    sz = int(0.05 * len(dataset))
+    print(f"   Sampling {sz} random files for statistics...")
     reservoir = []
 
-    for video, _, _ in tqdm(subset_files):
+    for i in tqdm(range(sz), desc="Calculating P98"):
+        video, _, _ = dataset[i]
         pixels = video.flatten().numpy()
         active = pixels[pixels > 1e-9]
 

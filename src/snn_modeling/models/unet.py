@@ -14,7 +14,7 @@ class SpikingUNet(nn.Module):
             snn_params['init_hidden'] = True
         self.encoding = config['data'].get('encoding_method', 'direct')
         self.num_timesteps = config['data'].get('num_timesteps', 10)
-        self.encoder = encoder(in_channels, p_drop=config['model'].get('dropout', 0.2), spike_model=nn.SiLU)#spike_model, **snn_params)
+        self.encoder = encoder(in_channels, p_drop=config['model'].get('dropout', 0.2), spike_model=nn.SiLU)
         self.bottleneck = BottleneckBlock(512, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
         self.decoder = SpikingResNetDecoder(spike_model=spike_model, **snn_params)
         self.classifier = ClassifierHead(64, num_classes)
@@ -32,12 +32,12 @@ class SpikingUNet(nn.Module):
             pass
         else:
             raise ValueError(f"Unknown encoding method: {self.encoding}")
-    
+        
         x, skips = self.encoder(x)
         x = self.bottleneck(x)
         x = self.decoder(x, skips)
         logits = self.classifier(x)
-
+        
         return logits.mean(dim=0) 
     
 class UNet(nn.Module):

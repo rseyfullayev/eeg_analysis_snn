@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import snntorch as snn
-
 class LearnableAtan(nn.Module):
     """
         A PyTorch-native Learnable Arctan Surrogate.

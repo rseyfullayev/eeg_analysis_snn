@@ -14,8 +14,6 @@ data:
   num_channels: 62
   train_split: 0.8
   num_workers: 4
-  P98: 14191.618164
-  G
 
 mask:
   type: "GaussianSplat"
@@ -43,7 +41,7 @@ training:
   phase_2_epochs: 50
   phase_3_epochs: 50
   batch_size: 16
-  learning_rate: 0.0005
+  learning_rate: 0.001
   weight_decay: 0.01
   accumulation_steps: 1
 

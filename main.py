@@ -6,14 +6,18 @@ import torch
 from generate_dataset import run_data_setup
 from train import run_training
 from src.snn_modeling.utils.model_builder import build_model
-from src.snn_modeling.utils.utils import calculate_p98, calculate_optimal_firing_rate
+from src.snn_modeling.utils.utils import calculate_p98, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
 
+from torch.utils.data import DataLoader
+
 def main():
+    seed_everything(42)
     parser = argparse.ArgumentParser(description="SWEEP-Net Entry Point")
 
     parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
     parser.add_argument('--mode', type=str, default='train', help='Mode: train or test')
+    parser.add_argument('--loso', type=int, help='The integer ID of the subject to hold out for testing (1-16).')
 
     parser.add_argument('--phase', type=int, help='Specify training phase (1, 2, 3, or 4)')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
@@ -26,7 +30,7 @@ def main():
     parser.add_argument('--coords_path', type=str, help='Path to electrodes coordinates .csv')
     parser.add_argument('--output_path', type=str, help='Destination folder for processed .npy files')
 
-    parser.add_argument('--calculate_stat', action='store_true', help='Calculate Fire Rate and 98th Percentile for dataset')
+    parser.add_argument('--calculate_stat', action='store_true', help='Calculate Fire Rate and Draw Distribution of dataset')
 
     args = parser.parse_args()
     config_path = args.config
@@ -37,19 +41,24 @@ def main():
     if args.resume and args.checkpoint is None:
         parser.error("When using --resume, you MUST specify --checkpoint.")
     
+    
+    
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
 
     if args.calculate_stat:
         dataset = SWEEPDataset(
                 config, 
-                split='train'
+                split='train',
+                loso=0, 
                 )   
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
         print("Calculating Dataset Statistics...")
 
-        calculate_p98(dataset)
-        config['data']['P98'] = calculate_p98(dataset)
+        analyze_distribution(dataloader)
         calculate_optimal_firing_rate(dataset)
+        generate_topology_proof(dataloader, torch.device("cuda"), class_names=[0,1,2,3,4])
+
         
 
     elif args.setup_data:
@@ -76,8 +85,14 @@ def main():
             checkpoint = torch.load(args.checkpoint, map_location=device)
             print(f"Loaded checkpoint from {args.checkpoint}.")
         
+        if not args.phase:
+            parser.error("You MUST specify --phase for training/testing.")
+        
+        if not args.loso:
+            parser.error("You MUST specify --loso for training/testing.")
+        
         model = build_model(config).to(device)
-        run_training(config, model, device, phase=args.phase, resume=args.resume, checkpoint=checkpoint)
+        run_training(config, model, device, phase=args.phase, resume=args.resume, loso=args.loso, checkpoint=checkpoint)
 
 if __name__ == "__main__":
     main()

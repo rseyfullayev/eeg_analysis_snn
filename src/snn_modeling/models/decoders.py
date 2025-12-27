@@ -42,8 +42,8 @@ class SpikingResNetDecoder(nn.Module):
         x = self.up1(x, s3)
         x = self.up2(x, s2)
         x = self.up3(x, s1)
-        
         x = self.final_up(x)
+
         return x
 
 class ResNetDecoder(nn.Module):
