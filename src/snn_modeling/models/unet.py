@@ -64,8 +64,8 @@ class SpikingResNetClassifier(nn.Module):
 
     def forward(self, x):
         features, _ = self.encoder(x)
-        T, B, C, H, W = x.shape
+        T, B, C, H, W = features.shape
         out = self.classifier(features)
-        proj = self.supcon_head(features)
-        embedding = F.normalize(proj.view(T * B, -1), dim=1).view(T, B, -1, H, W)
+        proj = self.supcon_head(features.view(T * B, C, H, W))
+        embedding = F.normalize(proj.view(T * B, -1), dim=1)
         return out.mean(dim=0), embedding  # Mean over time dimension

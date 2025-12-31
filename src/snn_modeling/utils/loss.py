@@ -63,34 +63,94 @@ class TopKClassificationLoss(nn.Module):
 
         return loss
 
+class ContrastiveLoss(nn.Module):
+    
+    def __init__(self):
+        super(ContrastiveLoss, self).__init__()
+
+    def forward(self, features, labels):
+        # features: (N, D) where N is batch size and D is feature dimension. Normalized.
+        # labels: (N,) with integer class labels
+
+        device = features.device
+        
+        # 2. Cosine Similarity
+        similarity_matrix = torch.matmul(features, features.T)
+        
+        # 3. Arctanh warping
+        # Clamp to avoid infinity at exactly 1.0 or -1.0
+        # arctanh(x) = 0.5 * log((1+x)/(1-x))
+
+        eps = 1e-6
+        sim_clamped = torch.clamp(similarity_matrix, -1 + eps, 1 - eps)
+        logits = 0.5 * torch.log((1 + sim_clamped) / (1 - sim_clamped))
+        
+        
+        # Create Mask
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(device)
+        
+        # Remove self-contrast
+        logits_mask = torch.scatter(
+            torch.ones_like(mask), 
+            1, 
+            torch.arange(mask.shape[0]).view(-1, 1).to(device), 
+            0
+        )
+        mask = mask * logits_mask
+        
+        # Numerical Stability for LogSumExp
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
+        
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+        
+        # Mean Log-Likelihood
+        mask_sum = mask.sum(1)
+        mask_sum = torch.where(mask_sum == 0, torch.ones_like(mask_sum), mask_sum)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
+        
+        loss = - mean_log_prob_pos.mean()
+        return loss
+
 
 class FullHybridLoss(nn.Module):
-    def __init__(self, smooth=0., lambda_seg=1., lambda_bce=1., lambda_class=0.1, alpha=0.5, beta=0.5, label_smooth=0.):
+    def __init__(self,
+                 time_steps=16,
+                 smooth=0., 
+                 lambda_seg=1., 
+                 lambda_con=1., 
+                 lambda_class=0.1, 
+                 alpha=0.5, 
+                 beta=0.5):
         super().__init__()
 
-        self.bce_loss = nn.BCEWithLogitsLoss(reduction='mean')
+        self.con_loss = ContrastiveLoss()
         self.dice_loss = TverskyLoss(mode="multilabel", smooth=smooth, from_logits=True, alpha=alpha, beta=beta)
         self.class_loss = TopKClassificationLoss()
         self.lambda_class = lambda_class
         self.lambda_seg = lambda_seg
-        self.lambda_bce = lambda_bce
-        self.label_smooth = label_smooth
+        self.lambda_con = lambda_con
+        self.time_steps = time_steps
     
     def add_fire_rate_loss(self, model, lambda_fire=0.1, target_rate=0.05):
         self.fire_loss = FiringRateRegularizer(model, target_rate=target_rate, lambda_reg=lambda_fire)
 
     def forward(self, inputs, targets_mask, targets_class):
-        segmentation_loss, classification_loss, bce_loss = 0, 0, 0
+        segmentation_loss, classification_loss, con_loss = 0, 0, 0
+        if type(inputs) is tuple:
+            inputs, embedding = inputs
+
         if self.lambda_seg > 0:
             segmentation_loss = self.dice_loss(inputs, targets_mask)
         if self.lambda_class > 0:
             classification_loss = self.class_loss(inputs, targets_class)
-        with torch.no_grad():
-            smooth_targets = targets_mask * (1 - self.label_smooth) + 0.5 * self.label_smooth
-        if self.lambda_bce > 0:
-            bce_loss = self.bce_loss(inputs, smooth_targets)
+        if self.lambda_con > 0:
+            con_loss = self.con_loss(embedding, targets_class.repeat_interleave(self.time_steps))
+        
 
-        total_loss = self.lambda_seg * segmentation_loss + self.lambda_class * classification_loss + self.lambda_bce * bce_loss
+        total_loss = self.lambda_seg * segmentation_loss + self.lambda_class * classification_loss + self.lambda_con * con_loss
         
         if hasattr(self, 'fire_loss'):
             tax_loss = self.fire_loss.compute_tax()

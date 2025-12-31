@@ -310,11 +310,11 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     loss_fn = FullHybridLoss(
         smooth = 0.,
         lambda_seg = config['loss'].get('lambda_seg', 1.0),
-        lambda_bce = 0.,
+        lambda_con = config['loss'].get('lambda_con', 0.5),
         lambda_class = config['loss'].get('lambda_class', 1.0),
         alpha = 0.,
         beta = 0.,
-        label_smooth = 0.
+        time_steps=config['data'].get('num_timesteps', 16),
     )
 
     loss_fn.to(device)
@@ -345,11 +345,11 @@ def phase_two(config, model, device, train_loader, val_loader, writer, checkpoin
     loss_fn = FullHybridLoss(
         smooth = 0.0,
         lambda_seg = config['loss'].get('lambda_seg', 1.0),
-        lambda_bce = 0.0,
+        lambda_con = 0.0,
         lambda_class = config['loss'].get('lambda_class', 1.0),
         alpha = config['loss'].get('alpha', 0.5),
         beta = config['loss'].get('beta', 0.5),
-        label_smooth = 0.0
+        time_steps=config['data'].get('num_timesteps', 16),
     )
 
     loss_fn.to(device)
@@ -388,11 +388,11 @@ def phase_three(config, model, device, train_loader, val_loader, writer, checkpo
     loss_fn = FullHybridLoss(
         smooth = 0.0,
         lambda_seg = config['loss'].get('lambda_seg', 1.0),
-        lambda_bce = 0.0,
+        lambda_con = 0.0,
         lambda_class = config['loss'].get('lambda_class', 1.0),
         alpha = config['loss'].get('alpha', 0.5),
         beta = config['loss'].get('beta', 0.5),
-        label_smooth = 0.0
+        time_steps=config['data'].get('num_timesteps', 16),
     )
 
     loss_fn.add_fire_rate_loss(model, 

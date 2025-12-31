@@ -40,7 +40,7 @@ training:
   phase_1_epochs: 50
   phase_2_epochs: 50
   phase_3_epochs: 50
-  batch_size: 64
+  batch_size: 32
   learning_rate: 0.001
   weight_decay: 0.01
   accumulation_steps: 1
@@ -48,17 +48,16 @@ training:
 loss:
   smooth: 0.0
   lambda_seg: 0.0
-  lambda_bce: 0.0
+  lambda_con: 0.5
   lambda_class: 1.0
   lambda_fire: 0.0
   target_rate: 0.02
-  label_smoothing: 0.0
   alpha: 0.7
   beta: 0.3
 
 logging:
   project_name: "snn-encoding-showdown"
   run_name: "ResNet18_Encoder_SNN_Decoder"
-  tags: ["resnet18", "snn"]
+  tags: ["resnet18", "snn", "contrastive"]
   offline: false 
   log_interval: 1
