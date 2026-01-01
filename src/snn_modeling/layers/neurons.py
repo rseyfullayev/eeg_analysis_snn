@@ -157,8 +157,9 @@ class ALIF(nn.Module):
                 spike = self.spike_grad(mem - effective_thresh)
                 spikes.append(spike)
 
-                # Membrane Potential Reset (HARD RESET)
-                mem = mem * (1 - spike)
+                # Membrane Potential Reset (SOFT RESET)
+                # mem = mem * (1 - spike)
+                mem = mem - (spike * effective_thresh)
                 
                 # Update Adaptive Threshold
                 # If spike occurs, increase threshold. Decay over time.
