@@ -69,7 +69,7 @@ class TimeDistributed(nn.Module):
 
 class ALIF(nn.Module):
     """
-    Adaptive LIF with Membrane Potential Batch Normalization.
+    Adaptive LIF with Batch Normalization.
     
     - Integrates inputs over time (Leaky).
     - Normalizes Input (BN) to prevent explosion.
