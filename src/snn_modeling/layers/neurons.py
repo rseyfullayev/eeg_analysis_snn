@@ -81,7 +81,7 @@ class ALIF(nn.Module):
                  spike_grad=None, return_mem=False,
                  learn_beta=False, learn_threshold=False, 
                  learn_decay=False, learn_gamma=False,
-                 learn_slope=False):
+                 learn_slope=False, recurrent=False, kernel_size=3):
         
         super(ALIF, self).__init__()
         self.learn_beta = learn_beta
@@ -112,6 +112,12 @@ class ALIF(nn.Module):
         self.bn = nn.BatchNorm3d(num_channels, eps=1e-4) if batch_norm else nn.Identity()
         self.return_mem = return_mem
         self.spike_grad = LearnableAtan(alpha=2.0, learnable=learn_slope)
+
+        self.recurrent = recurrent
+        if recurrent:
+            padding = kernel_size // 2
+            self.recurrent_conv = nn.Conv2d(num_channels, num_channels, kernel_size=kernel_size, padding=padding)
+
     
     def forward(self, x):
         T, B, C, H, W = x.shape
@@ -126,15 +132,20 @@ class ALIF(nn.Module):
 
         spikes = []
         mems = []
+        spike_prev = torch.zeros(B, C, H, W, device=x.device)
 
         x = x.permute(1, 2, 0, 3, 4)
         x = self.bn(x)
         x = x.permute(2, 0, 1, 3, 4)
 
         for t in range(T):
+            # Recurrent Contribution
+            input_t = x[t]
+            if self.recurrent:
+                input_t += self.recurrent_conv(spike_prev)
             # Leaky Integration
-            # Standart Accumulation: mem[t] = beta * mem[t-1] + x[t]
-            mem = beta * mem + x[t]
+            # Standart Accumulation: mem[t] = beta * mem[t-1] + input_t
+            mem = beta * mem + input_t
             if self.return_mem:
                 mems.append(mem)
             
@@ -153,6 +164,8 @@ class ALIF(nn.Module):
                 # If spike occurs, increase threshold. Decay over time.
                 adapt_thresh = (decay_adapt * adapt_thresh) + (gamma_adapt * spike)
 
+            spike_prev = spike
+            
         self.mem = mem.detach() 
 
         if self.return_mem:
