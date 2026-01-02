@@ -24,9 +24,12 @@ mask:
 model:
   type: "SpikingUNet"
   encoder_type: "ResNet18"
+  reccurent_decoder: true
+  vit_integration: true
   in_channels: 5
   num_classes: 5
   dropout: 0.2
+  vit_dropout: 0.3
 
 neuron_params:
   spike_model: "ALIF" 
@@ -38,11 +41,11 @@ neuron_params:
 
 training:
   epochs: 150
-  phase_1_epochs: 50
-  phase_2_epochs: 50
+  phase_1_epochs: 150
+  phase_2_epochs: 100
   phase_3_epochs: 50
-  batch_size: 16
-  learning_rate: 0.001
+  batch_size: 32
+  learning_rate: 0.0003
   weight_decay: 0.01
   accumulation_steps: 1
 
@@ -59,6 +62,6 @@ loss:
 logging:
   project_name: "snn-encoding-showdown"
   run_name: "ResNet18_Encoder_SNN_Decoder"
-  tags: ["resnet18", "snn", "contrastive"]
+  tags: ["resnet18", "snn", "vit"]
   offline: false 
   log_interval: 1

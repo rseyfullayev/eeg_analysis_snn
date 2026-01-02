@@ -4,7 +4,7 @@ from ..layers.residual_blocks import *
 from ..layers.upsampling_blocks import *
 
 class SpikingResNetDecoder(nn.Module):
-    def __init__(self, spike_model=snn.Leaky, **neuron_params):
+    def __init__(self, reccurent=True, spike_model=snn.Leaky, **neuron_params):
         super(SpikingResNetDecoder, self).__init__()
         
         self.up1 = SpikingUpsampleBlock(
@@ -13,10 +13,10 @@ class SpikingResNetDecoder(nn.Module):
             out_channels=256, 
             spike_model=spike_model, **neuron_params
         )
-        
+        self.reccurent = reccurent
         second_layer_params = neuron_params
         if spike_model.__name__ == 'ALIF':
-            second_layer_params['recurrent'] = True
+            second_layer_params['recurrent'] = reccurent
 
         self.up2 = SpikingUpsampleBlock(
             in_channels=256, 

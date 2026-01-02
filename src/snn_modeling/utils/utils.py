@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import snntorch as snn
-from ..layers.neurons import ALIF
+from ..layers.neurons import ALIF, SwiGLU
 import numpy as np
 import os
 import pandas as pd
@@ -300,11 +300,33 @@ def initialize_head(head_layer):
     if head_layer.module.bias is not None:
         nn.init.constant_(head_layer.module.bias, 0)
 
+def initialize_vit(vit_layer):
+    print("Initializing ViT Heads...")
+    if isinstance(vit_layer.mlp, SwiGLU):
+        nn.init.zeros_(vit_layer.mlp.out.weight)
+        if vit_layer.mlp.out.bias is not None:
+            nn.init.zeros_(vit_layer.mlp.out.bias)
+    else:
+        nn.init.zeros_(vit_layer.mlp[-1].weight)
+        nn.init.zeros_(vit_layer.mlp[-1].bias)
+
+    nn.init.zeros_(vit_layer.attn.out_proj.weight)
+    nn.init.zeros_(vit_layer.attn.out_proj.bias)
+
+def initialize_reconv(reconv_layer):
+    print("Initializing ReConv Layer...")
+    nn.init.zeros_(reconv_layer.module.weight)
+
 def initialize_network(model, train_loader, device):
 
     apply_kaiming_init(model)
     run_bn_warmup(model, train_loader, device)
     initialize_head(model.classifier.head)
+    if model.encoder.vit:
+        initialize_vit(model.encoder.temporal_vit)
+    if model.decoder.reccurent:
+        initialize_reconv(model.decoder.up1.conv1.spike.recurrent_conv)
+        initialize_reconv(model.decoder.up1.conv2.spike.recurrent_conv)
 
 def calculate_p98(dataset):
 

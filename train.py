@@ -68,7 +68,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             loss = criterion(outputs, targets, labels)
 
             val_loss += loss.item()
-            outputs, _ = outputs
+
             B, C, H, W = outputs.shape
             k_percent = loss.k_percent if hasattr(loss, 'k_percent') else 0.1
             k = max(1, int(H * W * k_percent))
@@ -256,6 +256,7 @@ def training_loop(phase,
             loss = loss_fn(outputs, targets, targets_c)
             
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
         
@@ -313,7 +314,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         num_classes=config['model'].get('num_classes', 5)
     ).to(device)
 
-    #initialize_network(enc_class, train_loader, device)
+    initialize_network(enc_class, train_loader, device)
     loss_fn = FullHybridLoss(
         smooth = 0.,
         lambda_seg = config['loss'].get('lambda_seg', 1.0),
@@ -492,15 +493,17 @@ def run_training(config, model, device, phase, resume, loso, checkpoint=None):
                               batch_size=config['training']['batch_size'],
                               shuffle=True, 
                               num_workers=config['data'].get('num_workers', 0),
-                              prefetch_factor=2,
-                              persistent_workers=True)
+                              prefetch_factor=4,
+                              persistent_workers=True,
+                              pin_memory=True)
     
     val_loader = DataLoader(val_set, 
                             batch_size=config['training']['batch_size'], 
                             shuffle=False, 
                             num_workers=config['data'].get('num_workers', 0),
-                            prefetch_factor=2,
-                            persistent_workers=True)
+                            prefetch_factor=4,
+                            persistent_workers=True,
+                            pin_memory=True)
 
     print(f"Data Loaded: {len(train_set)} Train | {len(val_set)} Val")
     

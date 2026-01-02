@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch
 import snntorch as snn
 from .residual_blocks import ConvSpiking
-from .neurons import TimeDistributed
+from .neurons import TimeDistributed, SwiGLU
 import torch.nn.functional as F
 
 class StemLayer(nn.Module):
@@ -62,3 +62,29 @@ class ProjectionHead(nn.Module):
         proj = self.supcon_head(features.view(T * B, C, H, W)) + 1e-6 
         embedding = F.normalize(proj.view(T * B, -1), dim=1)
         return embedding
+    
+class TemporalViTBlock(nn.Module):
+    def __init__(self, in_channels,
+                 num_heads=8,
+                 p_drop=0.1):
+        super(TemporalViTBlock, self).__init__()
+        self.in_channels = in_channels
+        self.norm1 = nn.LayerNorm(in_channels)
+        self.attn = nn.MultiheadAttention(embed_dim=in_channels,
+                                          num_heads=num_heads,
+                                          dropout=p_drop)
+        self.norm2 = nn.LayerNorm(in_channels)
+        self.mlp = SwiGLU(in_channels, p_drop=p_drop)
+        self.dropout = nn.Dropout(p_drop)
+        
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        x_flat = x.mean(dim=[3,4])  # Average pool over spatial dimensions
+        src = self.norm1(x_flat)
+        attn_output, _ = self.attn(src, src, src)
+        x_flat = x_flat + self.dropout(attn_output)
+        src = self.norm2(x_flat)
+        mlp_output = self.mlp(src)
+        x_flat = x_flat + mlp_output
+        context = x_flat.view(T, B, C, 1, 1)
+        return x + context
