@@ -324,7 +324,7 @@ def initialize_network(model, train_loader, device):
     initialize_head(model.classifier.head)
     if model.encoder.vit:
         initialize_vit(model.encoder.temporal_vit)
-    if model.decoder.reccurent:
+    if hasattr(model, 'decoder') and model.decoder.reccurent:
         initialize_reconv(model.decoder.up1.conv1.spike.recurrent_conv)
         initialize_reconv(model.decoder.up1.conv2.spike.recurrent_conv)
 
