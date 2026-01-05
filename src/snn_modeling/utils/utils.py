@@ -10,6 +10,7 @@ import scipy.stats as stats
 import matplotlib.pyplot as plt
 import seaborn as sns
 import random
+import torch
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -346,3 +347,70 @@ def calculate_p98(dataset):
     all_samples = np.concatenate(reservoir)
     p98 = np.percentile(all_samples, 98)
     print(f"Calculated 98th Percentile of Active Pixels: {p98:.6f} on reservoir of {len(all_samples)} samples.")
+
+
+
+def find_representative_subject(model, config, device, samples_per_subject=200):
+    print("--- Searching for the Golden Subject ---")
+    model.eval()
+    model.to(device)
+    
+    df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
+    
+    all_subjects = df['filename'].str.split('_').str[0].unique()
+    
+    subject_centroids = {}
+    global_features = []
+    
+    for subj_id in tqdm(all_subjects, desc="Scanning Subjects"):
+        df_subj = df[df['filename'].str.startswith(f"{subj_id}_")]
+        
+        if len(df_subj) > samples_per_subject:
+            df_subj = df_subj.sample(samples_per_subject, random_state=42)
+            
+        
+        feats_accum = []
+        
+        with torch.no_grad():
+            for fname in df_subj['filename']:
+                path = os.path.join(config['data']['dataset_path'], fname)
+                try:
+                    data = torch.load(path).float()
+                    p98 = torch.quantile(data.abs(), 0.98)
+                    data = torch.tanh(data / (p98 + 1e-6) * 3.0)   
+                    data = data.unsqueeze(0).to(device).permute(2,0,1,3,4)  # [T, 1, C, H, W]
+
+                    features, _ = model.encoder(data) # output: [T, 1, 512, 4, 4]
+                    
+                    # Global Mean Pool -> [1, 512] vector
+                    flat_feat = features.mean(dim=[0, 3, 4])
+                    feats_accum.append(flat_feat.cpu().numpy())
+                    
+                except Exception as e:
+                    pass
+
+        if len(feats_accum) > 0:
+            # Calculate Subject Centroid (Mean Vector)
+            subj_mean = np.mean(np.concatenate(feats_accum), axis=0)
+            subject_centroids[subj_id] = subj_mean
+            global_features.append(subj_mean)
+
+    # 3. Calculate Global Centroid (The Average Human)
+    global_centroid = np.mean(global_features, axis=0)
+    
+    # 4. Rank Subjects by Distance to Global Centroid
+    print("\n--- RESULTS: Distance from Average Brain ---")
+    distances = {}
+    for subj_id, centroid in subject_centroids.items():
+        # Euclidean Distance
+        dist = np.linalg.norm(centroid - global_centroid)
+        distances[subj_id] = dist
+
+    sorted_subjs = sorted(distances.items(), key=lambda x: x[1])
+    
+    for rank, (subj, dist) in enumerate(sorted_subjs):
+        label = " (GOLDEN)" if rank == 0 else ""
+        label = " (OUTLIER)" if rank == len(sorted_subjs)-1 else label
+        print(f"Rank {rank+1}: Subject {subj} | Dist: {dist:.4f}{label}")
+
+    return sorted_subjs[0][0]

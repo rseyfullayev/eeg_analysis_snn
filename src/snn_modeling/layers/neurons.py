@@ -192,7 +192,7 @@ class ALIF(nn.Module):
                 # If spike occurs, increase threshold. Decay over time.
                 adapt_thresh = (decay_adapt * adapt_thresh) + (gamma_adapt * spike)
 
-            spike_prev = spike
+                spike_prev = spike
 
         self.mem = mem.detach() 
 

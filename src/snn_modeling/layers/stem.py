@@ -88,3 +88,25 @@ class TemporalViTBlock(nn.Module):
         x_flat = x_flat + mlp_output
         context = x_flat.view(T, B, C, 1, 1)
         return x + context
+    
+class TemporalGCBlock(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super(TemporalGCBlock, self).__init__()
+        self.conv_mask = nn.Conv1d(in_channels, 1, kernel_size=1)
+        self.softmax = nn.Softmax(dim=2)
+        self.transform = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels // reduction, kernel_size=1),
+            nn.LayerNorm([in_channels // reduction, 1]),
+            nn.SiLU(inplace=True),
+            nn.Conv1d(in_channels // reduction, in_channels, kernel_size=1)
+        )
+    
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        x_flat = x.mean(dim=[3,4])  # Average pool over spatial dimensions
+        x_ctx = x_flat.permute(1, 2, 0) # B x C x T
+        mask = self.conv_mask(x_ctx)
+        attn = self.softmax(mask)
+        context = torch.matmul(x_ctx, attn.permute(0, 2, 1))
+        context = self.transform(context).permute(2,0,1).view(1,B,C,1,1)
+        return x + context

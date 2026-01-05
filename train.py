@@ -345,6 +345,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         print(f"Resuming training from epoch {start_epoch}...")
 
     training_loop(1, start_epoch, epochs, best_acc, best_dice, enc_class, device, train_loader, val_loader, loss_fn, optimizer, scheduler, writer, checkpoint_dir)
+   
     
     
 def phase_two(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint):
@@ -457,7 +458,7 @@ phase_handles = {
 
 def run_training(config, model, device, phase, resume, loso, checkpoint=None):
 
-    run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{loso}"
     checkpoint_dir = os.path.join("saved_models", f"phase{phase}", run_name)
     
     
@@ -509,7 +510,7 @@ def run_training(config, model, device, phase, resume, loso, checkpoint=None):
     
     model = model.to(device)
     phase_handles[phase](config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint)
-   
+    
     print("--- Training Complete ---")
     wandb.finish()
     writer.close()

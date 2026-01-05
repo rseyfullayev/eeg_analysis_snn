@@ -1,10 +1,10 @@
 import torch.nn as nn
 import snntorch as snn
 from ..layers.residual_blocks import SpikingResBlock
-from ..layers.stem import StemLayer, TemporalViTBlock
+from ..layers.stem import StemLayer, TemporalViTBlock, TemporalGCBlock
 
 class SpikingResNet18Encoder(nn.Module):
-    def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=True, spike_model=snn.Leaky, **neuron_params):
+    def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=False, gc=False, spike_model=snn.Leaky, **neuron_params):
         super(SpikingResNet18Encoder, self).__init__()
 
         self.vit = vit
@@ -23,9 +23,11 @@ class SpikingResNet18Encoder(nn.Module):
         self.layer4b = SpikingResBlock(512, 512, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
 
         if vit:
-            self.temporal_vit = TemporalViTBlock(512, num_heads=8, p_drop=vit_p_drop)
+            self.temporal = TemporalViTBlock(512, num_heads=8, p_drop=vit_p_drop)
+        elif gc:
+            self.temporal = TemporalGCBlock(512)
         else:
-            self.temporal_vit = nn.Identity()
+            self.temporal = nn.Identity()
 
     def forward(self, x):
         x = self.stem(x)
@@ -37,7 +39,7 @@ class SpikingResNet18Encoder(nn.Module):
         s3 = self.layer3b(s3)
         s4 = self.layer4a(s3)
         s4 = self.layer4b(s4)
-        s4 = self.temporal_vit(s4)
+        s4 = self.temporal(s4)
         return s4, [s1, s2, s3]
     
 

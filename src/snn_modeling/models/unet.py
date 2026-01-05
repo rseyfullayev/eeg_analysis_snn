@@ -19,6 +19,7 @@ class SpikingUNet(nn.Module):
                                p_drop=config['model'].get('dropout', 0.2), 
                                vit_p_drop=config['model'].get('vit_dropout', 0.25),
                                vit=config['model'].get('vit_integration', False),
+                                gc=config['model'].get('gc_integration', False),
                                spike_model=nn.SiLU)
         self.bottleneck = BottleneckBlock(512, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
         self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('recurrent', False), spike_model=spike_model, **snn_params)

@@ -5,8 +5,9 @@ import torch
 
 from generate_dataset import run_data_setup
 from train import run_training
+from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.utils.model_builder import build_model
-from src.snn_modeling.utils.utils import calculate_p98, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof
+from src.snn_modeling.utils.utils import calculate_p98, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
 
 from torch.utils.data import DataLoader
@@ -31,6 +32,7 @@ def main():
     parser.add_argument('--output_path', type=str, help='Destination folder for processed .npy files')
 
     parser.add_argument('--calculate_stat', action='store_true', help='Calculate Fire Rate and Draw Distribution of dataset')
+    parser.add_argument('--find_repr', action='store_true', help='Find the most representative subject in the dataset')
 
     args = parser.parse_args()
     config_path = args.config
@@ -85,13 +87,26 @@ def main():
             checkpoint = torch.load(args.checkpoint, map_location=device)
             print(f"Loaded checkpoint from {args.checkpoint}.")
         
+        model = build_model(config).to(device)
+
+        if args.find_repr:
+            enc_class = SpikingResNetClassifier(
+            encoder_backbone = model.encoder,
+            num_classes=config['model'].get('num_classes', 5)
+            ).to(device)
+            
+            enc_class.load_state_dict(checkpoint['model_state_dict'])
+            find_representative_subject(enc_class, config, device, samples_per_subject=500)
+            
+            exit(0)
+        
         if not args.phase:
             parser.error("You MUST specify --phase for training/testing.")
         
         if not args.loso:
             parser.error("You MUST specify --loso for training/testing.")
         
-        model = build_model(config).to(device)
+        
         run_training(config, model, device, phase=args.phase, resume=args.resume, loso=args.loso, checkpoint=checkpoint)
 
 if __name__ == "__main__":
