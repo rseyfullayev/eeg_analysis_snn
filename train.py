@@ -19,6 +19,7 @@ import numpy as np
 
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
+from src.snn_modeling.utils.augmentations import TemporalMix, GaussianNoise, FrequencyDropout, VideoRandomErasing, DyTNorm
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.models.encoders import SpikingResNet18Encoder
@@ -55,13 +56,16 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
 
     tp_tot, fp_tot, fn_tot, tn_tot = 0, 0, 0, 0
 
+    val_aug = nn.Sequential(
+        DyTNorm(gain=3.0)
+    )
+
     with torch.no_grad():
         for inputs, targets, labels in val_loader:
             inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
             B,C,T,H,W = inputs.shape
             flat = inputs.view(B, -1).abs()
-            p98 = torch.quantile(flat, 0.98, dim=1, keepdim=True).view(B, 1, 1, 1, 1)
-            inputs = torch.tanh(inputs / (p98 + 1e-6) * 3.0)
+            inputs = val_aug(inputs)
             inputs = inputs.permute(2, 0, 1, 3, 4)
             
             outputs = model(inputs)
@@ -219,6 +223,8 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
     return optimizer
 
 
+
+
 def training_loop(phase, 
                   start_epoch, 
                   epochs, 
@@ -234,7 +240,14 @@ def training_loop(phase,
                   writer, 
                   checkpoint_dir,
                   freeze_bn=False):
-
+    
+    train_aug = nn.Sequential(
+        DyTNorm(gain=3.0),
+        GaussianNoise(std=0.02),
+        VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
+        
+    )
+    temp_mix = TemporalMix()
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -246,13 +259,15 @@ def training_loop(phase,
         for batch_idx, (inputs, targets, targets_c) in enumerate(train_loop):
             
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
+            with torch.no_grad():
+                inputs = train_aug(inputs)
+                inputs, targets_c = temp_mix(inputs, targets_c)
             B,C,T,H,W = inputs.shape
             flat = inputs.view(B, -1).abs()
             p98 = torch.quantile(flat, 0.98, dim=1, keepdim=True).view(B, 1, 1, 1, 1)
             inputs = torch.tanh(inputs / (p98 + 1e-6) * 3.0)
             inputs = inputs.permute(2, 0, 1, 3, 4)
             outputs = model(inputs)
-
             loss = loss_fn(outputs, targets, targets_c)
             
             loss.backward()
@@ -305,6 +320,8 @@ def training_loop(phase,
         elif val_acc == best_acc and val_dice > best_dice:
             best_dice = val_dice
             save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
+
+
 
 
 def phase_one(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
