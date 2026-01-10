@@ -7,6 +7,7 @@ from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
 import time
 import os
+import gc
 from datetime import datetime
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import balanced_accuracy_score
@@ -101,6 +102,15 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
 
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.cpu().numpy())
+            
+            # Cleanup tensors to free memory
+            del inputs, targets, labels, outputs, loss, preds
+            if not only_classification:
+                del soft_probs, target_masks, tp, fp, fn, tn
+                
+    # Clear CUDA cache after validation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
                 
             
     avg_loss = val_loss / len(val_loader)
@@ -158,6 +168,11 @@ def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
                 wandb.Image(img_pred_bin, caption=f"Hard Pred (Thresh {threshold})")
             ]
         }, step=epoch)
+    
+    # Cleanup tensors
+    del inputs, targets, labels, outputs, probs
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def freeze_bn_stats(module):
         if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm3d):
@@ -280,10 +295,18 @@ def training_loop(phase,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # More memory efficient than zero_grad()
         
             train_loss += loss.item()
             train_loop.set_postfix(loss=loss.item())
+            
+            # Explicit cleanup to prevent memory accumulation
+            del inputs, targets, targets_c, outputs, loss
+
+        # Periodic memory cleanup after each epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
         avg_train_loss = train_loss / len(train_loader)
           

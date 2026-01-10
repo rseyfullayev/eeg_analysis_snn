@@ -290,6 +290,11 @@ def run_bn_warmup(model, loader, device, num_batches=10):
                 inputs = inputs.permute(2, 0, 1, 3, 4)
             
             _ = model(inputs)
+            del inputs  # Free memory after each batch
+    
+    # Clear CUDA cache after warmup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     print("Input BN Statistics Calibrated.")
 

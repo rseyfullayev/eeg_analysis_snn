@@ -107,7 +107,8 @@ class SWEEPDataset(Dataset):
             for fname, _ in self.samples:
                 file_path = os.path.join(self.samples_dir, fname)
                 try:
-                    video = torch.load(file_path).float().clone()
+                    # Use weights_only=True for security and load as contiguous for better memory layout
+                    video = torch.load(file_path, weights_only=True).float().contiguous()
                     self.cache[fname] = video
                 except Exception as e:
                     print(f"Error loading {fname}: {e}")
@@ -146,16 +147,13 @@ class SWEEPDataset(Dataset):
         
         file_path = os.path.join(self.samples_dir, fname)
         if self.preload:
-            video = self.cache[fname].float() 
+            video = self.cache[fname].clone()  # Clone to avoid modifying cached data
         else:
             try:
-                video = torch.load(file_path) 
+                video = torch.load(file_path, weights_only=True).float()
             except Exception as e:
                 print(f"Error loading {fname}: {e}")
                 return torch.zeros(5, 32, 32, 32), torch.zeros(self.num_classes, 32, 32), 0
-        
-        #p98_instance = torch.maximum(torch.quantile(video.abs().flatten(), 0.98), torch.tensor(1e-6))
-        #video = torch.tanh(video / p98_instance * 3.0)
 
 
         target_volume = torch.zeros(self.num_classes, self.grid_size, self.grid_size)

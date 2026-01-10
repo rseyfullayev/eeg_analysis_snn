@@ -194,9 +194,15 @@ class ALIF(nn.Module):
 
                 spike_prev = spike
 
-        self.mem = mem.detach() 
+        # Detach final membrane state to prevent graph retention
+        self.mem = mem.detach()
 
         if self.return_mem:
-            return torch.stack(mems, dim=0)
+            # Stack and return; clear local list
+            result = torch.stack(mems, dim=0)
+            mems.clear()
+            return result
         else:
-            return torch.stack(spikes, dim=0)
+            result = torch.stack(spikes, dim=0)
+            spikes.clear()
+            return result

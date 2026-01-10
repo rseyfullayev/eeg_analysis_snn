@@ -16,8 +16,9 @@ class FiringRateRegularizer:
     def _register_hooks(self, model):
         def get_activation(name):
             def hook(model, input, output):
-                if isinstance(output, torch.Tensor) and output.requires_grad:
-                     self.layer_outputs[name] = output
+                if isinstance(output, torch.Tensor):
+                    # Detach to prevent holding computation graph in memory
+                    self.layer_outputs[name] = output.detach()
             return hook
 
         for name, layer in model.named_modules():
@@ -32,7 +33,8 @@ class FiringRateRegularizer:
             firing_rate = torch.mean(spikes) 
             reg_loss += (firing_rate - self.target_rate) ** 2
 
-        self.layer_outputs = {}
+        # Clear stored outputs to free memory
+        self.layer_outputs.clear()
         
         return self.lambda_reg * reg_loss
 
