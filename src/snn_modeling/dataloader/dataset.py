@@ -62,7 +62,7 @@ class TopoMapper(nn.Module):
         return self.transform(tensor)
 
 class SWEEPDataset(Dataset):
-    def __init__(self, config, loso, split='train', experiment=False, prototypes=None):
+    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None):
         self.config = config
         self.split = split
         self.num_classes = config['model'].get('num_classes', 5)
@@ -83,10 +83,13 @@ class SWEEPDataset(Dataset):
     
         indices = np.arange(len(df))
         labels = df['emotion_id'].values
-        
-        df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
-        df_val = df[df['filename'].str.split('_').str[0] == str(loso)]
-     
+        if subj is not None:
+            df = df[df['filename'].str.split('_').str[0] == str(subj)]
+            df_train, df_val = train_test_split(df, test_size=0.2, random_state=42, stratify=df['emotion_id'])
+        else:
+            df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
+            df_val = df[df['filename'].str.split('_').str[0] == str(loso)]
+    
 
         if split == 'train':
             print(f"Selecting TRAINING set ({len(df_train)} samples)")

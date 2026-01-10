@@ -64,5 +64,7 @@ class SpikingResNetClassifier(nn.Module):
 
     def forward(self, x):
         features, _ = self.encoder(x)
+        features = features.mean(dim=[3,4]).unsqueeze(3).unsqueeze(4) # Global Average Pooling
+
         out = self.classifier(features)
-        return out.mean(dim=0) # Mean over time dimension
+        return out.mean(dim=[0,3,4]) # Mean over time dimension

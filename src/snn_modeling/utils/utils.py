@@ -414,3 +414,87 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
         print(f"Rank {rank+1}: Subject {subj} | Dist: {dist:.4f}{label}")
 
     return sorted_subjs[0][0]
+
+
+def run_bio_audit(config, device='cpu', samples=300):
+    print("--- STARTING BIOLOGICAL AUDIT (MODEL-FREE) ---")
+
+    df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
+    all_subjects = sorted(df['filename'].str.split('_').str[0].unique(), key=int)
+
+    subject_maps = {}
+
+    print("Computing Spatial Archetypes...")
+    for subj in tqdm(all_subjects):
+        subject_maps[subj] = {}
+        for emotion in range(5):
+            subset = df[(df['filename'].str.startswith(f"{subj}_")) & (df['emotion_id'] == emotion)]
+            
+            if len(subset) > samples:
+                subset = subset.sample(samples, random_state=42)
+            
+            accum_map = None
+            count = 0
+            
+            for fname in subset['filename']:
+                path = os.path.join(config['data']['dataset_path'], fname)
+                try:
+                    data = torch.load(path).float().permute(1,0,2,3).numpy() 
+       
+                    spatial_snapshot = np.mean(data, axis=0)
+                    
+                    if accum_map is None:
+                        accum_map = spatial_snapshot
+                    else:
+                        accum_map += spatial_snapshot
+                    count += 1
+                except: pass
+            
+            if count > 0:
+                subject_maps[subj][emotion] = accum_map / count
+            else:
+                subject_maps[subj][emotion] = np.zeros((5, 32, 32))
+
+    print("Calculating Compatibility Matrix...")
+    num_subs = len(all_subjects)
+    compat_matrix = np.zeros((num_subs, num_subs))
+    
+    for i, subj_a in enumerate(all_subjects):
+        for j, subj_b in enumerate(all_subjects):
+            if i == j:
+                compat_matrix[i, j] = 1.0
+                continue
+            
+            corrs = []
+            for emotion in range(5):
+                map_a = subject_maps[subj_a][emotion].flatten()
+                map_b = subject_maps[subj_b][emotion].flatten()
+                
+                if np.std(map_a) > 0 and np.std(map_b) > 0:
+                    corr = np.corrcoef(map_a, map_b)[0, 1]
+                    corrs.append(corr)
+
+            compat_matrix[i, j] = np.mean(corrs) if corrs else 0
+
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(compat_matrix, 
+                xticklabels=all_subjects, 
+                yticklabels=all_subjects, 
+                cmap="RdBu_r",
+                center=0, vmin=-0.5, vmax=1.0)
+    plt.title("Biological Compatibility (Spatial Topology Correlation)")
+    plt.savefig("./evidence/bio_compatibility.png")
+
+    print("\n--- Ranked by Avg Correlation ---")
+    scores = np.mean(compat_matrix, axis=1)
+    
+    ranked_indices = np.argsort(scores)[::-1]
+    
+    for rank, idx in enumerate(ranked_indices):
+        subj = all_subjects[idx]
+        print(f"Rank {rank+1}: Subject {subj} | Score: {scores[idx]:.4f}")
+
+    best = all_subjects[ranked_indices[0]]
+    worst = all_subjects[ranked_indices[-1]]
+    print(f"Best: {best}")
+    print(f"Outlier: {worst}")

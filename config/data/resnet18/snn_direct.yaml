@@ -26,7 +26,7 @@ model:
   encoder_type: "ResNet18"
   reccurent_decoder: true
   vit_integration: false
-  gc_integration: true
+  gc_integration: false
   in_channels: 5
   num_classes: 5
   dropout: 0.2
@@ -46,7 +46,7 @@ training:
   phase_2_epochs: 100
   phase_3_epochs: 50
   batch_size: 32
-  learning_rate: 0.0003
+  learning_rate: 0.001
   weight_decay: 0.01
   accumulation_steps: 1
 

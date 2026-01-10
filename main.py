@@ -7,7 +7,7 @@ from generate_dataset import run_data_setup
 from train import run_training
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.utils.model_builder import build_model
-from src.snn_modeling.utils.utils import calculate_p98, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject
+from src.snn_modeling.utils.utils import run_bio_audit, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
 
 from torch.utils.data import DataLoader
@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
     parser.add_argument('--mode', type=str, default='train', help='Mode: train or test')
     parser.add_argument('--loso', type=int, help='The integer ID of the subject to hold out for testing (1-16).')
+    parser.add_argument('--subj', type=int, help='The integer ID of the subject (1-16).')
 
     parser.add_argument('--phase', type=int, help='Specify training phase (1, 2, 3, or 4)')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
@@ -33,6 +34,7 @@ def main():
 
     parser.add_argument('--calculate_stat', action='store_true', help='Calculate Fire Rate and Draw Distribution of dataset')
     parser.add_argument('--find_repr', action='store_true', help='Find the most representative subject in the dataset')
+    parser.add_argument('--audit_bio', action='store_true', help='Run Biological Audit (Model-Free)')
 
     args = parser.parse_args()
     config_path = args.config
@@ -43,12 +45,18 @@ def main():
     if args.resume and args.checkpoint is None:
         parser.error("When using --resume, you MUST specify --checkpoint.")
     
+    if args.loso and args.subj:
+        parser.error("You CANNOT specify both --loso and --subj at the same time.")
     
     
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
 
-    if args.calculate_stat:
+
+    if args.audit_bio:
+        run_bio_audit(config, device=torch.device('cuda'), samples=300)
+
+    elif args.calculate_stat:
         dataset = SWEEPDataset(
                 config, 
                 split='train',
@@ -103,11 +111,11 @@ def main():
         if not args.phase:
             parser.error("You MUST specify --phase for training/testing.")
         
-        if not args.loso:
-            parser.error("You MUST specify --loso for training/testing.")
+        if not args.loso and not args.subj:
+            parser.error("You MUST specify --loso or --subj for training/testing.")
         
         
-        run_training(config, model, device, phase=args.phase, resume=args.resume, loso=args.loso, checkpoint=checkpoint)
+        run_training(config, model, device, phase=args.phase, resume=args.resume, loso=args.loso, subj=args.subj, checkpoint=checkpoint)
 
 if __name__ == "__main__":
     main()

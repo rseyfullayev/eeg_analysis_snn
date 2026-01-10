@@ -64,29 +64,22 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
         for inputs, targets, labels in val_loader:
             inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
             B,C,T,H,W = inputs.shape
-            flat = inputs.view(B, -1).abs()
             inputs = val_aug(inputs)
             inputs = inputs.permute(2, 0, 1, 3, 4)
             
             outputs = model(inputs)
-            loss = criterion(outputs, targets, labels)
+            if only_classification:
+                loss = criterion(outputs, labels)
+                energy_logits = outputs
 
-            val_loss += loss.item()
-
-            B, C, H, W = outputs.shape
-            k_percent = loss.k_percent if hasattr(loss, 'k_percent') else 0.1
-            k = max(1, int(H * W * k_percent))
-            flat_logits = outputs.view(B, C, -1)
-            top_k_values, _ = torch.topk(flat_logits, k, dim=2)
-            energy_logits = torch.mean(top_k_values, dim=2)
-            preds = torch.argmax(energy_logits, dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(labels.cpu().numpy())
-            
-            if not only_classification:
+            else:
+                loss = criterion(outputs, targets, labels)
+                B, C, H, W = outputs.shape
+                k_percent = loss.k_percent if hasattr(loss, 'k_percent') else 0.1
+                k = max(1, int(H * W * k_percent))
+                flat_logits = outputs.view(B, C, -1)
+                top_k_values, _ = torch.topk(flat_logits, k, dim=2)
+                energy_logits = torch.mean(top_k_values, dim=2)
                 soft_probs = torch.sigmoid(outputs)
                 target_masks = (targets > threshold).long()
                 
@@ -98,6 +91,17 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
                 fp_tot += fp.sum().item()
                 fn_tot += fn.sum().item()
                 tn_tot += tn.sum().item()
+
+            val_loss += loss.item()
+
+            
+            preds = torch.argmax(energy_logits, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(labels.cpu().numpy())
+                
             
     avg_loss = val_loss / len(val_loader)
     accuracy = correct / total
@@ -243,8 +247,8 @@ def training_loop(phase,
     
     train_aug = nn.Sequential(
         DyTNorm(gain=3.0),
-        GaussianNoise(std=0.02),
-        VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
+        #GaussianNoise(std=0.01),
+        #VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
         
     )
     temp_mix = TemporalMix()
@@ -268,7 +272,10 @@ def training_loop(phase,
             inputs = torch.tanh(inputs / (p98 + 1e-6) * 3.0)
             inputs = inputs.permute(2, 0, 1, 3, 4)
             outputs = model(inputs)
-            loss = loss_fn(outputs, targets, targets_c)
+            if phase == 1:
+                loss = loss_fn(outputs, targets_c)
+            else:
+                loss = loss_fn(outputs, targets, targets_c)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -332,7 +339,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     ).to(device)
 
     initialize_network(enc_class, train_loader, device)
-    loss_fn = FullHybridLoss(
+    """loss_fn = FullHybridLoss(
         smooth = 0.,
         lambda_seg = config['loss'].get('lambda_seg', 1.0),
         lambda_con = config['loss'].get('lambda_con', 0.0),
@@ -340,7 +347,9 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         alpha = 0.,
         beta = 0.,
         time_steps=config['data'].get('num_timesteps', 16),
-    )
+    )"""
+
+    loss_fn = nn.CrossEntropyLoss()
 
     loss_fn.to(device)
 
@@ -473,9 +482,12 @@ phase_handles = {
 }
 
 
-def run_training(config, model, device, phase, resume, loso, checkpoint=None):
+def run_training(config, model, device, phase, resume, loso=None, subj=None, checkpoint=None):
 
-    run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{loso}"
+    if loso:
+        run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_loso{loso}"
+    else:
+        run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_subj{subj}"
     checkpoint_dir = os.path.join("saved_models", f"phase{phase}", run_name)
     
     
@@ -497,14 +509,16 @@ def run_training(config, model, device, phase, resume, loso, checkpoint=None):
         config, 
         split='train',
         experiment=True,
-        loso=loso
+        loso=loso,
+        subj=subj
     )
     
     val_set = SWEEPDataset(
         config, 
         split='val',
         experiment=True,
-        loso=loso
+        loso=loso,
+        subj=subj
     )
 
     train_loader = DataLoader(train_set, 
