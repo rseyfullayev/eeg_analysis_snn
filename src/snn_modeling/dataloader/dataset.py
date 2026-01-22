@@ -65,7 +65,7 @@ class SWEEPDataset(Dataset):
     def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None):
         self.config = config
         self.split = split
-        self.num_classes = config['model'].get('num_classes', 5)
+        self.num_classes = config['data'].get('n_emotions', 5)
         self.grid_size = config['data'].get('grid_size', 32)
         self.dataset_path = config['data']['dataset_path'] 
         self.samples_dir = os.path.join(self.dataset_path)
@@ -107,8 +107,11 @@ class SWEEPDataset(Dataset):
             for fname, _ in self.samples:
                 file_path = os.path.join(self.samples_dir, fname)
                 try:
-                    # Use weights_only=True for security and load as contiguous for better memory layout
-                    video = torch.load(file_path, weights_only=True).float().contiguous()
+                    # Use weights_only=True for security, map_location='cpu' to avoid GPU memory
+                    # Use half precision to reduce RAM by 50% if acceptable
+                    video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+                    # Share memory for multiprocessing efficiency
+                    video.share_memory_()
                     self.cache[fname] = video
                 except Exception as e:
                     print(f"Error loading {fname}: {e}")
@@ -147,16 +150,16 @@ class SWEEPDataset(Dataset):
         
         file_path = os.path.join(self.samples_dir, fname)
         if self.preload:
-            video = self.cache[fname].clone()  # Clone to avoid modifying cached data
+            video = self.cache[fname]  # No clone needed - data is not modified in-place
         else:
             try:
-                video = torch.load(file_path, weights_only=True).float()
+                video = torch.load(file_path, weights_only=True, map_location='cpu').float()
             except Exception as e:
                 print(f"Error loading {fname}: {e}")
-                return torch.zeros(5, 32, 32, 32), torch.zeros(self.num_classes, 32, 32), 0
+                return torch.zeros(5, 32, 32, 32), torch.zeros(32, 32), 0
 
 
-        target_volume = torch.zeros(self.num_classes, self.grid_size, self.grid_size)
-        target_volume[label_idx] = self.prototypes[label_idx]
+        target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
+        target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
         
-        return video, target_volume, label_idx
+        return video, target_map, label_idx

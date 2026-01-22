@@ -60,43 +60,42 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     val_aug = nn.Sequential(
         DyTNorm(gain=3.0)
     )
-
+    val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
     with torch.no_grad():
-        for inputs, targets, labels in val_loader:
-            inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
+        for batch_idx, (inputs, targets, labels) in enumerate(val_loop):
+            inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
             B,C,T,H,W = inputs.shape
             inputs = val_aug(inputs)
             inputs = inputs.permute(2, 0, 1, 3, 4)
             
             outputs = model(inputs)
             if only_classification:
-                loss = criterion(outputs, labels)
-                energy_logits = outputs
+                energy_logits = outputs #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
+                loss = criterion(energy_logits, labels)
 
             else:
                 loss = criterion(outputs, targets, labels)
                 B, C, H, W = outputs.shape
-                k_percent = loss.k_percent if hasattr(loss, 'k_percent') else 0.1
-                k = max(1, int(H * W * k_percent))
-                flat_logits = outputs.view(B, C, -1)
-                top_k_values, _ = torch.topk(flat_logits, k, dim=2)
-                energy_logits = torch.mean(top_k_values, dim=2)
-                soft_probs = torch.sigmoid(outputs)
-                target_masks = (targets > threshold).long()
                 
-
+                probs = torch.softmax(outputs, dim=1)
+                energy_logits = probs[:, 1:, :, :].sum(dim=(2, 3))
+                preds_map = torch.argmax(probs, dim=1)
                 tp, fp, fn, tn = smp.metrics.get_stats(
-                    soft_probs, target_masks, mode='multilabel', threshold=threshold
+                    preds_map,
+                    targets, 
+                    mode='multiclass', 
+                    num_classes=6
                 )
-                tp_tot += tp.sum().item()
-                fp_tot += fp.sum().item()
-                fn_tot += fn.sum().item()
-                tn_tot += tn.sum().item()
+                tp_tot += tp[:, 1:].sum().item()
+                fp_tot += fp[:, 1:].sum().item()
+                fn_tot += fn[:, 1:].sum().item()
+                tn_tot += tn[:, 1:].sum().item()
+
 
             val_loss += loss.item()
-
+            val_loop.set_postfix(loss=loss.item())
             
-            preds = torch.argmax(energy_logits, dim=1)
+            preds = energy_logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
@@ -104,9 +103,9 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             all_targets.extend(labels.cpu().numpy())
             
             # Cleanup tensors to free memory
-            del inputs, targets, labels, outputs, loss, preds
+            del inputs, labels, outputs, loss, preds
             if not only_classification:
-                del soft_probs, target_masks, tp, fp, fn, tn
+                del preds_map, targets, tp, fp, fn, tn
                 
     # Clear CUDA cache after validation
     if torch.cuda.is_available():
@@ -206,7 +205,7 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'alpha' in name or 'beta' in name or 'slope' in name or 'decay' in name or 'gamma' in name:
+        if 'alpha' in name or 'beta' in name or 'slope' in name or 'decay' in name or 'gamma' in name or 'recurrent' in name:
             time_params.append(param)
             print(f"Special LR for Time Param: {name}")
         elif 'threshold' in name:
@@ -234,9 +233,9 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
     optimizer = optim.AdamW([
         {'params': base_params, 'lr': lr, 'weight_decay': config['training'].get('weight_decay', 1e-4)},
         {'params': encoder_params, 'lr': lr * 1e-2, 'weight_decay': config['training'].get('weight_decay', 1e-4)},
-        {'params': base_params_no_decay, 'lr': lr * 1e-1, 'weight_decay': 0.0},
-        {'params': time_params, 'lr': lr * 1e-2, 'weight_decay': 0.0},
-        {'params': threshold_params, 'lr': lr * 100, 'weight_decay': 0.0}
+        {'params': base_params_no_decay, 'lr': lr, 'weight_decay': 0.0},
+        {'params': time_params, 'lr': lr * 0.5, 'weight_decay': 0.0},
+        {'params': threshold_params, 'lr': lr * 1.0, 'weight_decay': 0.0}
     ], betas=(0.9, 0.999))
 
     return optimizer
@@ -275,33 +274,36 @@ def training_loop(phase,
             model.encoder.apply(freeze_bn_stats)
         train_loss = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
-        for batch_idx, (inputs, targets, targets_c) in enumerate(train_loop):
+        for batch_idx, (inputs,  targets, targets_c) in enumerate(train_loop):
             
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
-            with torch.no_grad():
-                inputs = train_aug(inputs)
-                inputs, targets_c = temp_mix(inputs, targets_c)
+            if phase == 1:
+                with torch.no_grad():
+                    inputs = train_aug(inputs)
+                    inputs, targets_c = temp_mix(inputs, targets_c)
             B,C,T,H,W = inputs.shape
-            flat = inputs.view(B, -1).abs()
-            p98 = torch.quantile(flat, 0.98, dim=1, keepdim=True).view(B, 1, 1, 1, 1)
-            inputs = torch.tanh(inputs / (p98 + 1e-6) * 3.0)
+    
             inputs = inputs.permute(2, 0, 1, 3, 4)
             outputs = model(inputs)
             if phase == 1:
-                loss = loss_fn(outputs, targets_c)
+                loss = loss_fn(outputs, targets_c.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
             else:
                 loss = loss_fn(outputs, targets, targets_c)
-            
+           
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            optimizer.zero_grad(set_to_none=True)  # More memory efficient than zero_grad()
-        
+            optimizer.zero_grad(set_to_none=True)
+            if phase > 1:
+                with torch.no_grad():
+                    for name, param in model.decoder.named_parameters():
+                        if 'threshold' in name:
+                            param.clamp_(0.1, 3.0)
             train_loss += loss.item()
             train_loop.set_postfix(loss=loss.item())
             
             # Explicit cleanup to prevent memory accumulation
-            del inputs, targets, targets_c, outputs, loss
+            del inputs, targets_c, outputs, loss
 
         # Periodic memory cleanup after each epoch
         if torch.cuda.is_available():
@@ -310,7 +312,7 @@ def training_loop(phase,
 
         avg_train_loss = train_loss / len(train_loader)
           
-        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=(phase == 1))
+        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
@@ -409,6 +411,7 @@ def phase_two(config, model, device, train_loader, val_loader, writer, checkpoin
         beta = config['loss'].get('beta', 0.5),
         time_steps=config['data'].get('num_timesteps', 16),
     )
+    loss_fn.class_loss.masks = train_loader.dataset.prototypes
 
     loss_fn.to(device)
     if not resume:
@@ -527,37 +530,49 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     log_dir = os.path.join("results", run_name)
     writer = SummaryWriter(log_dir=log_dir)
     print(f"Initializing TensorBoard: {log_dir}")
-   
+
+    masks = torch.load(os.path.join(config['data']['dataset_path'],'masks.pt')).to(device)
+    density = masks.sum() / masks.numel()
+    print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
+
+
+
     train_set = SWEEPDataset(
         config, 
         split='train',
-        experiment=True,
+        #experiment=True,
         loso=loso,
-        subj=subj
+        subj=subj,
+        prototypes=masks
     )
     
     val_set = SWEEPDataset(
         config, 
         split='val',
-        experiment=True,
+        #experiment=True,
         loso=loso,
-        subj=subj
+        subj=subj,
+        prototypes=masks
     )
 
+    num_workers = config['data'].get('num_workers', 0)
+    prefetch = config['data'].get('prefetch_factor', 2) if num_workers > 0 else None
+    persist = num_workers > 0  # Only use persistent_workers if num_workers > 0
+    
     train_loader = DataLoader(train_set, 
                               batch_size=config['training']['batch_size'],
                               shuffle=True, 
-                              num_workers=config['data'].get('num_workers', 0),
-                              prefetch_factor=4,
-                              persistent_workers=True,
+                              num_workers=num_workers,
+                              prefetch_factor=prefetch,
+                              persistent_workers=persist,
                               pin_memory=True)
     
     val_loader = DataLoader(val_set, 
                             batch_size=config['training']['batch_size'], 
                             shuffle=False, 
-                            num_workers=config['data'].get('num_workers', 0),
-                            prefetch_factor=4,
-                            persistent_workers=True,
+                            num_workers=num_workers,
+                            prefetch_factor=prefetch,
+                            persistent_workers=persist,
                             pin_memory=True)
 
     print(f"Data Loaded: {len(train_set)} Train | {len(val_set)} Val")

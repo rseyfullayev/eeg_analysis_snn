@@ -13,8 +13,10 @@ data:
   freq_bands: 5
   num_channels: 62
   train_split: 0.8
-  num_workers: 4
+  num_workers: 2
+  prefetch_factor: 2
   preload_ram: false
+  n_emotions: 5
 
 mask:
   type: "GaussianSplat"
@@ -24,45 +26,51 @@ mask:
 model:
   type: "SpikingUNet"
   encoder_type: "ResNet18"
-  reccurent_decoder: true
+  reccurent_decoder: false
   vit_integration: false
-  gc_integration: false
+  gc_integration: true
   in_channels: 5
-  num_classes: 5
+  num_classes: 6
   dropout: 0.2
   vit_dropout: 0.3
 
 neuron_params:
   spike_model: "ALIF" 
-  beta: 0.9
-  threshold: 1.0
-  decay_adapt: 0.98
-  gamma_adapt: 0.75
+  beta: 0.8825
+  threshold: 1.2305
+  decay_adapt: 0.8825
+  gamma_adapt: 0.2461
   spike_grad_alpha: 2.0
+  learn_slope: false
+  learn_threshold: false
+  learn_beta: false
+  learn_gamma: false
+  learn_decay: false
+  
 
 training:
   epochs: 150
-  phase_1_epochs: 150
+  phase_1_epochs: 50
   phase_2_epochs: 100
   phase_3_epochs: 50
-  batch_size: 32
+  batch_size: 16
   learning_rate: 0.001
   weight_decay: 0.01
   accumulation_steps: 1
 
 loss:
   smooth: 0.0
-  lambda_seg: 0.0
+  lambda_seg: 1.0
   lambda_con: 0.0
   lambda_class: 1.0
-  lambda_fire: 0.0
-  target_rate: 0.02
-  alpha: 0.7
-  beta: 0.3
+  lambda_fire: 20.0
+  target_rate: 0.1
+  alpha: 0.3
+  beta: 0.7
 
 logging:
   project_name: "snn-encoding-showdown"
   run_name: "ResNet18_Encoder_SNN_Decoder"
-  tags: ["resnet18", "snn", "gc"]
+  tags: ["resnet18", "snn", "gc", "fcn", "tsm"]
   offline: false 
   log_interval: 1

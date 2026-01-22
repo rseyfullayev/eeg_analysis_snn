@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import snntorch as snn
-from ..layers.neurons import ALIF, SwiGLU
+from ..layers.neurons import ALIF, SwiGLU, TemporalOrderFix
 import numpy as np
 import os
 import pandas as pd
@@ -11,6 +11,127 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import random
 import torch
+import torchvision.transforms.functional as F
+
+def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, target_burst=5, timesteps=16):
+    print("Calibrating Neuron Parameters...")
+    
+    encoder.eval()
+    encoder.to(device)
+    
+    dummy_bn = TemporalOrderFix(nn.BatchNorm3d(512).to(device))
+    dummy_bn.train() 
+    all_voltages = []
+    
+    with torch.no_grad():
+        for i, (inputs, _, _) in enumerate(tqdm(loader, total=num_batches, desc="Calibrating")):
+            if i >= num_batches:
+                break
+            inputs = inputs.to(device)
+            if inputs.dim() == 5:
+                inputs = inputs.permute(2, 0, 1, 3, 4)  # [T, B, C, H, W]
+
+            features, _ = encoder(inputs) # [T, B, C, H, W]
+            norm_feats = dummy_bn(features)
+            all_voltages.append(norm_feats.cpu().numpy().flatten())
+
+    all_voltages = np.concatenate(all_voltages)
+    thresh = max(np.percentile(all_voltages, (1.0 - target_rate)*100), 0.01)
+    beta = np.exp(-2./timesteps) # e^-1/(timesteps/2)
+    gamma_adapt  = thresh / target_burst
+    decay_adapt = np.exp(-2./timesteps) # e^-1/(timesteps/2)
+
+    print(f"Calibrated Threshold: {thresh:.4f}, Beta: {beta:.4f}, Decay Adapt: {decay_adapt:.4f}, Gamma Adapt: {gamma_adapt:.4f}")
+
+            
+
+
+def generate_masks(config, subject_id=3):
+    print(f"--- GENERATING DIFFERENTIAL MASKS FOR SUBJECT {subject_id} ---")
+    
+    df = pd.read_csv(os.path.join(config['data']['dataset_path'], "index.csv"))
+    # Filter for Subject 3
+    df = df[df['filename'].str.startswith(f"{subject_id}_")]
+    
+    if len(df) == 0:
+        raise ValueError(f"No data found for Subject {subject_id}")
+
+    class_sums = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
+    class_counts = torch.zeros(5)
+    
+    print("Accumulating Spatial Topologies...")
+    for _, row in tqdm(df.iterrows(), total=len(df)):
+        fpath = os.path.join(config['data']['dataset_path'], row['filename'])
+        emotion_idx = row['emotion_id']
+
+        try:
+            data = torch.load(fpath)
+            
+            spatial_map = data.mean(dim=[0,1]) # Temporal and Channel Mean
+            
+            # Accumulate
+            class_sums[emotion_idx] += spatial_map
+            class_counts[emotion_idx] += 1
+            
+        except Exception as e:
+            print(f"Error loading {fpath}: {e}")
+            continue
+
+    class_means = torch.zeros_like(class_sums)
+    for i in range(5):
+        if class_counts[i] > 0:
+            class_means[i] = class_sums[i] / class_counts[i]
+
+    # 2. Compute Global Mean (The "Common Mode" Background)
+    global_mean = class_means.mean(dim=0)
+
+    # 3. Compute Differential Masks
+    differential_masks = torch.zeros_like(class_means)
+    
+    print("\nComputing Differentials (One-vs-Rest)...")
+    for i in range(5):
+        diff = class_means[i] - global_mean
+        diff = torch.relu(diff)
+        
+        if diff.max() > 0:
+            diff = diff / diff.max()
+        
+        diff_smooth = F.gaussian_blur(diff.unsqueeze(0), kernel_size=5, sigma=1.5).squeeze(0)
+        
+        if diff_smooth.max() > 0:
+            diff_smooth = diff_smooth / diff_smooth.max()
+            
+        differential_masks[i] = diff_smooth
+
+    # --- VISUALIZATION ---
+    print("Plotting results...")
+    emotions = ['Disgust', 'Fear', 'Sad', 'Neutral', 'Happy'] # Verify your order!
+    
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    
+    # Row 1: Raw Averages (Likely look identical/messy)
+    for i in range(5):
+        im = axes[0, i].imshow(class_means[i].numpy(), cmap='jet')
+        axes[0, i].set_title(f"Raw Mean: {emotions[i]}")
+        axes[0, i].axis('off')
+        plt.colorbar(im, ax=axes[0, i], fraction=0.046)
+
+    # Row 2: Idiosyncratic Masks (Should look distinct)
+    for i in range(5):
+        im = axes[1, i].imshow(differential_masks[i].numpy(), cmap='hot')
+        axes[1, i].set_title(f"Differential: {emotions[i]}")
+        axes[1, i].axis('off')
+        plt.colorbar(im, ax=axes[1, i], fraction=0.046)
+    
+    plt.suptitle(f"Subject {subject_id}: Deriving Biologically Grounded Segmentation Masks", fontsize=16)
+    plt.tight_layout()
+    plt.savefig("subject3_biological_masks.png")
+    print("Saved visualization to subject3_biological_masks.png")
+
+    # Save the Tensor for the DataLoader
+    torch.save(differential_masks, "evidence/subject3_masks.pt")
+    print("Saved masks to subject3_masks.pt")
+
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -321,7 +442,7 @@ def initialize_vit(vit_layer):
 
 def initialize_reconv(reconv_layer):
     print("Initializing ReConv Layer...")
-    nn.init.zeros_(reconv_layer.module.weight)
+    nn.init.zeros_(reconv_layer.weight)
 
 def initialize_network(model, train_loader, device):
 
@@ -330,9 +451,12 @@ def initialize_network(model, train_loader, device):
     initialize_head(model.classifier.head)
     if model.encoder.vit:
         initialize_vit(model.encoder.temporal)
-    if hasattr(model, 'decoder') and model.decoder.reccurent:
-        initialize_reconv(model.decoder.up1.conv1.spike.recurrent_conv)
-        initialize_reconv(model.decoder.up1.conv2.spike.recurrent_conv)
+    """if hasattr(model, 'decoder') and model.decoder.recurrent:
+        initialize_reconv(model.decoder.up2.conv1.spike.recurrent_conv)
+        initialize_reconv(model.decoder.up2.conv2.spike.recurrent_conv)
+        #initialize_reconv(model.decoder.up3.conv1.spike.recurrent_conv)
+        #initialize_reconv(model.decoder.up3.conv2.spike.recurrent_conv)"""
+
 
 def calculate_p98(dataset):
 

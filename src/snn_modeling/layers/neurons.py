@@ -1,6 +1,28 @@
 import torch
 import torch.nn as nn
 
+class TemporalShift(nn.Module):
+    def __init__(self, n_div=8):
+        super(TemporalShift, self).__init__()
+        self.fold_div = n_div
+
+    def forward(self, x):
+        # x is [B*T, C, H, W]
+        T, B, C, H , W = x.size()
+        fold = C // self.fold_div
+        
+        out = torch.zeros_like(x)
+        
+        # 1. Bidirectional Shift
+        # Shift Left (Future -> Present)
+        out[:-1, :, :fold] = x[1:, :, :fold] 
+        # Shift Right (Past -> Present)
+        out[1:, :, fold:2*fold] = x[:-1, :, fold:2*fold]
+        # Center (Static)
+        out[:, :, 2*fold:] = x[:, :, 2*fold:]
+
+        return out
+
 class SwiGLU(nn.Module):
     """
     SwiGLU Activation Function.
@@ -93,6 +115,23 @@ class TimeDistributed(nn.Module):
     def __name__(self):
         return self.module.__name__
 
+class TemporalOrderFix(nn.Module):
+    def __init__(self, module):
+        super(TemporalOrderFix, self).__init__()
+        self.module = module
+
+    def forward(self, x):
+        if x.dim() == 5:
+            x_permuted = x.permute(1, 2, 0, 3, 4)  # B, C, T, H, W
+            x_permuted = self.module(x_permuted)
+            x_permuted = x_permuted.permute(2, 0, 1, 3, 4)  # T, B, C, H, W
+            return x_permuted
+        else:
+            return self.module(x)
+    
+    def __name__(self):
+        return self.module.__name__
+
 
 class ALIF(nn.Module):
     """
@@ -136,14 +175,16 @@ class ALIF(nn.Module):
         else:
             self.register_buffer("gamma_fixed", torch.tensor(gamma_adapt))
 
-        self.bn = nn.BatchNorm3d(num_channels, eps=1e-4) if batch_norm else nn.Identity()
+        self.bn = TemporalOrderFix(nn.BatchNorm3d(num_channels, eps=1e-4)) if batch_norm else nn.Identity()
+        self.mem_ = nn.Sequential(TemporalOrderFix(nn.BatchNorm3d(num_channels, eps=1e-4)), 
+                                  nn.SiLU())
         self.return_mem = return_mem
         self.spike_grad = LearnableAtan(alpha=2.0, learnable=learn_slope)
 
         self.recurrent = recurrent
         if recurrent:
             padding = kernel_size // 2
-            self.recurrent_conv = nn.Conv2d(num_channels, num_channels, kernel_size=kernel_size, padding=padding, bias=False)
+            self.recurrent_conv = nn.utils.spectral_norm(nn.Conv2d(num_channels, num_channels, kernel_size=kernel_size, padding=padding, bias=False))
 
     
     def forward(self, x):
@@ -161,9 +202,7 @@ class ALIF(nn.Module):
         mems = []
         spike_prev = torch.zeros(B, C, H, W, device=x.device)
 
-        x = x.permute(1, 2, 0, 3, 4)
         x = self.bn(x)
-        x = x.permute(2, 0, 1, 3, 4)
 
         for t in range(T):
             # Recurrent Contribution
@@ -199,7 +238,7 @@ class ALIF(nn.Module):
 
         if self.return_mem:
             # Stack and return; clear local list
-            result = torch.stack(mems, dim=0)
+            result = self.mem_(torch.stack(mems, dim=0))
             mems.clear()
             return result
         else:

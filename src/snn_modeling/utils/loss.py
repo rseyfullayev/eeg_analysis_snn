@@ -1,42 +1,43 @@
 import torch
 import torch.nn as nn
-from segmentation_models_pytorch.losses import TverskyLoss
+from segmentation_models_pytorch.losses import TverskyLoss, FocalLoss
 import torch.nn.functional as F
 
 class FiringRateRegularizer:
     def __init__(self, model, target_rate=0.05, lambda_reg=0.1):
-
         self.target_rate = target_rate
         self.lambda_reg = lambda_reg
         self.layer_outputs = {}
         self.hooks = []
-        
         self._register_hooks(model)
 
     def _register_hooks(self, model):
         def get_activation(name):
             def hook(model, input, output):
+                # DO NOT DETACH. We need the gradient history.
                 if isinstance(output, torch.Tensor):
-                    # Detach to prevent holding computation graph in memory
-                    self.layer_outputs[name] = output.detach()
+                    self.layer_outputs[name] = output
+ 
             return hook
 
         for name, layer in model.named_modules():
             if "ALIF" in str(type(layer)): 
                 if hasattr(layer, 'return_mem') and layer.return_mem:
-                    continue 
+                    continue
                 self.hooks.append(layer.register_forward_hook(get_activation(name)))
 
     def compute_tax(self):
         reg_loss = 0
+        count = 0
         for _, spikes in self.layer_outputs.items():
             firing_rate = torch.mean(spikes) 
             reg_loss += (firing_rate - self.target_rate) ** 2
+            count += 1
 
-        # Clear stored outputs to free memory
-        self.layer_outputs.clear()
+        self.layer_outputs = {} 
         
-        return self.lambda_reg * reg_loss
+        if count == 0: return torch.tensor(0.0, device=spikes.device)
+        return self.lambda_reg * (reg_loss / count)
 
     def remove_hooks(self):
         for h in self.hooks:
@@ -64,6 +65,35 @@ class TopKClassificationLoss(nn.Module):
         loss = self.cross_entropy(peak_logits_scaled, targets_class)
 
         return loss
+    
+class GSPLoss(nn.Module):
+    def __init__(self, num_classes=5, device='cuda'):
+        super(GSPLoss, self).__init__()
+        self.num_classes = num_classes
+        self._masks = None
+        self.ce = nn.CrossEntropyLoss()
+        self.device = device
+        self.scale = nn.Parameter(torch.tensor(0.1)) 
+
+    
+    @property
+    def masks(self):
+        return self._masks
+    
+    @masks.setter
+    def masks(self, value):
+        self._masks = value.unsqueeze(0).to(self.device)
+    
+    def forward(self, inputs, targets_class):
+        B, _, H, W = inputs.shape
+        msk_act = inputs * self.masks
+        gsp = msk_act.sum(dim=(2, 3))
+        safe_scale = F.softplus(self.scale)
+        logits = gsp * safe_scale
+        loss = self.ce(logits, targets_class)
+        return loss
+    
+     
 
 class ContrastiveLoss(nn.Module):
 
@@ -144,9 +174,16 @@ class FullHybridLoss(nn.Module):
                  beta=0.5):
         super().__init__()
 
-        self.con_loss = ContrastiveLoss()
-        self.dice_loss = TverskyLoss(mode="multilabel", smooth=smooth, from_logits=True, alpha=alpha, beta=beta)
-        self.class_loss = TopKClassificationLoss()
+        self.con_loss =  nn.BCEWithLogitsLoss() #ContrastiveLoss()
+        self.dice_loss = TverskyLoss(mode="multiclass", 
+                                     smooth=smooth, 
+                                     from_logits=True, 
+                                     alpha=alpha, 
+                                     beta=beta,
+                                     ignore_index=0)
+        self.class_loss = FocalLoss(mode="multiclass", 
+                                    alpha=0.25, 
+                                    gamma=2.) #GSPLoss() #TopKClassificationLoss()
         self.lambda_class = lambda_class
         self.lambda_seg = lambda_seg
         self.lambda_con = lambda_con
@@ -163,9 +200,10 @@ class FullHybridLoss(nn.Module):
         if self.lambda_seg > 0:
             segmentation_loss = self.dice_loss(inputs, targets_mask)
         if self.lambda_class > 0:
-            classification_loss = self.class_loss(inputs, targets_class)
+            classification_loss = self.class_loss(inputs, targets_mask) #targets_class)
         if self.lambda_con > 0:
-            con_loss = self.con_loss(embedding, targets_class.repeat_interleave(self.time_steps))
+            #con_loss = self.con_loss(embedding, targets_class.repeat_interleave(self.time_steps))
+            con_loss = self.con_loss(inputs, targets_mask)
         
 
         total_loss = self.lambda_seg * segmentation_loss + self.lambda_class * classification_loss + self.lambda_con * con_loss

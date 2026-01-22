@@ -4,36 +4,40 @@ from ..layers.residual_blocks import *
 from ..layers.upsampling_blocks import *
 
 class SpikingResNetDecoder(nn.Module):
-    def __init__(self, reccurent=True, spike_model=snn.Leaky, **neuron_params):
+    def __init__(self, recurrent=True, spike_model=snn.Leaky, **neuron_params):
         super(SpikingResNetDecoder, self).__init__()
-        
+        self.recurrent = recurrent
+
+        # up1: no recurrent
         self.up1 = SpikingUpsampleBlock(
             in_channels=512, 
             skip_channels=256,
             out_channels=256, 
             spike_model=spike_model, **neuron_params
         )
-        self.reccurent = reccurent
-        second_layer_params = neuron_params
+        
+        # up2 and up3: with recurrent for ALIF
+        recurrent_params = neuron_params.copy()
         if spike_model.__name__ == 'ALIF':
-            second_layer_params['recurrent'] = reccurent
-
+            recurrent_params['recurrent'] = recurrent
+        
         self.up2 = SpikingUpsampleBlock(
             in_channels=256, 
             skip_channels=128, 
             out_channels=128, 
-            spike_model=spike_model, **second_layer_params
+            spike_model=spike_model, **recurrent_params
         )
 
-        last_layer = neuron_params
+        # up3: with recurrent and return_mem for ALIF
+        last_layer_params = recurrent_params.copy()
         if spike_model.__name__ == 'ALIF':
-            last_layer['return_mem'] = True
+            last_layer_params['return_mem'] = True
         
         self.up3 = SpikingUpsampleBlock(
             in_channels=128, 
             skip_channels=64, 
             out_channels=64, 
-            spike_model=spike_model, **last_layer
+            spike_model=spike_model, **last_layer_params
         )
 
         self.final_up = FinalUpBlock(

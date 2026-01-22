@@ -22,7 +22,7 @@ class SpikingUNet(nn.Module):
                                 gc=config['model'].get('gc_integration', False),
                                spike_model=nn.SiLU)
         self.bottleneck = BottleneckBlock(512, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
-        self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('recurrent', False), spike_model=spike_model, **snn_params)
+        self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('reccurent_decoder', False), spike_model=spike_model, **snn_params)
         self.classifier = ClassifierHead(64, num_classes)
 
     def forward(self, x):
@@ -64,7 +64,9 @@ class SpikingResNetClassifier(nn.Module):
 
     def forward(self, x):
         features, _ = self.encoder(x)
-        features = features.mean(dim=[3,4]).unsqueeze(3).unsqueeze(4) # Global Average Pooling
+        #features = features.mean(dim=[3,4]).unsqueeze(3).unsqueeze(4) # Global Average Pooling
 
         out = self.classifier(features)
-        return out.mean(dim=[0,3,4]) # Mean over time dimension
+        T,B,C,H,W = out.shape
+        out = out.view(T*B, C, H, W)
+        return out #.mean(dim=0) # Mean over time dimension
