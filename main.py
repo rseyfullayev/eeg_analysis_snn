@@ -2,6 +2,7 @@ import argparse
 import yaml
 import os
 import torch
+import torch.nn as nn
 
 from generate_dataset import run_data_setup
 from train import run_training, validate
@@ -140,8 +141,10 @@ def main():
                                             encoder_backbone = model.encoder,
                                             num_classes=config['model'].get('num_classes', 5)
                                             ).to(device)
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
+        if checkpoint is not None:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            print("No checkpoint provided; using untrained model.")
 
         if not args.phase:
             parser.error("You MUST specify --phase for validation.")
@@ -167,6 +170,7 @@ def main():
                             persistent_workers=True,
                             pin_memory=True)
         print(f"Validation set size: {len(val_set)} samples.")
+
         loss_fn = FullHybridLoss(
         smooth = 0.0,
         lambda_seg = config['loss'].get('lambda_seg', 1.0),
@@ -176,7 +180,10 @@ def main():
         beta = config['loss'].get('beta', 0.5),
         time_steps=config['data'].get('num_timesteps', 16),
         )
+
         loss_fn.class_loss.masks = val_loader.dataset.prototypes
+
+        if args.phase == 1: loss_fn = nn.CrossEntropyLoss()
 
         val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=args.phase==1)
         if args.phase == 1:

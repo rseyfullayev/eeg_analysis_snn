@@ -18,9 +18,13 @@ class SpikingResNet18Encoder(nn.Module):
         
         self.layer3a = SpikingResBlock(128, 256, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **neuron_params)
         self.layer3b = SpikingResBlock(256, 256, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
+
+        last_layer_params = neuron_params.copy()
+        if spike_model.__name__ == 'ALIF':
+            last_layer_params['return_mem'] = True
   
-        self.layer4a = SpikingResBlock(256, 512, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **neuron_params)
-        self.layer4b = SpikingResBlock(512, 512, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
+        self.layer4a = SpikingResBlock(256, 512, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **last_layer_params)
+        self.layer4b = SpikingResBlock(512, 512, p_drop=p_drop, use_norm = True, spike_model=spike_model, **last_layer_params)
 
         if vit:
             self.temporal = TemporalViTBlock(512, num_heads=8, p_drop=vit_p_drop)

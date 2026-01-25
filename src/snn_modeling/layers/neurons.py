@@ -176,8 +176,9 @@ class ALIF(nn.Module):
             self.register_buffer("gamma_fixed", torch.tensor(gamma_adapt))
 
         self.bn = TemporalOrderFix(nn.BatchNorm3d(num_channels, eps=1e-4)) if batch_norm else nn.Identity()
-        self.mem_ = nn.Sequential(TemporalOrderFix(nn.BatchNorm3d(num_channels, eps=1e-4)), 
-                                  nn.SiLU())
+        if return_mem:
+            self.mem_ = nn.Sequential(TemporalOrderFix(nn.BatchNorm3d(num_channels, eps=1e-4)), 
+                                      nn.SiLU())
         self.return_mem = return_mem
         self.spike_grad = LearnableAtan(alpha=2.0, learnable=learn_slope)
 

@@ -90,7 +90,7 @@ def run_data_setup(config=None):
                 video_batch = topo(feats)
                 video_batch = torch.clamp(video_batch, min=0.0)
                 if video_batch.ndim != 5:
-                    print(f"❌ CRITICAL ERROR: Output shape is {video_batch.shape}. Expected 5D (B, 5, 32, 32, 32).")
+                    print(f"   CRITICAL ERROR: Output shape is {video_batch.shape}. Expected 5D (B, 5, 32, 32, 32).")
                     print(f"   Wavelet Output was: {feats.shape}")
                     break
                 if not res_full:

@@ -3,6 +3,7 @@ import torch.nn as nn
 import snntorch as snn
 from .decoders import ResNetDecoder, SpikingResNetDecoder
 from ..layers.stem import BottleneckBlock, ClassifierHead
+from ..layers.neurons import ALIF
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
 
@@ -15,12 +16,17 @@ class SpikingUNet(nn.Module):
             snn_params['init_hidden'] = True
         self.encoding = config['data'].get('encoding_method', 'direct')
         self.num_timesteps = config['data'].get('num_timesteps', 10)
-        self.encoder = encoder(in_channels,
-                               p_drop=config['model'].get('dropout', 0.2), 
-                               vit_p_drop=config['model'].get('vit_dropout', 0.25),
-                               vit=config['model'].get('vit_integration', False),
-                                gc=config['model'].get('gc_integration', False),
-                               spike_model=nn.SiLU)
+        encoder_mode = config['model'].get('encoder_mode', 'silu')
+        encoder_spike_model = ALIF if encoder_mode == 'snn' else nn.SiLU
+        self.encoder = encoder(
+            in_channels,
+            p_drop=config['model'].get('dropout', 0.2), 
+            vit_p_drop=config['model'].get('vit_dropout', 0.25),
+            vit=config['model'].get('vit_integration', False),
+            gc=config['model'].get('gc_integration', False),
+            spike_model=encoder_spike_model,
+            **(snn_params if encoder_mode == 'snn' else {})
+        )
         self.bottleneck = BottleneckBlock(512, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
         self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('reccurent_decoder', False), spike_model=spike_model, **snn_params)
         self.classifier = ClassifierHead(64, num_classes)

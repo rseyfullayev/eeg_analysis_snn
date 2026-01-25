@@ -29,6 +29,7 @@ model:
   reccurent_decoder: false
   vit_integration: false
   gc_integration: true
+  encoder_mode: "snn"
   in_channels: 5
   num_classes: 6
   dropout: 0.2
@@ -36,14 +37,14 @@ model:
 
 neuron_params:
   spike_model: "ALIF" 
-  beta: 0.8825
-  threshold: 1.2305
-  decay_adapt: 0.8825
-  gamma_adapt: 0.2461
+  beta: 0.9
+  threshold: 0.5
+  decay_adapt: 0.9
+  gamma_adapt: 0.2
   spike_grad_alpha: 2.0
   learn_slope: false
-  learn_threshold: false
-  learn_beta: false
+  learn_threshold: true
+  learn_beta: true
   learn_gamma: false
   learn_decay: false
   
@@ -60,7 +61,7 @@ training:
 
 loss:
   smooth: 0.0
-  lambda_seg: 1.0
+  lambda_seg: 0.0
   lambda_con: 0.0
   lambda_class: 1.0
   lambda_fire: 20.0
