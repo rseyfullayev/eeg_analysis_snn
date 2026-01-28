@@ -1,25 +1,37 @@
 import torch.nn as nn
 import snntorch as snn
-from ..layers.residual_blocks import SpikingResBlock
-from ..layers.stem import StemLayer, TemporalViTBlock, TemporalGCBlock
+from ..layers.residual_blocks import SpikingResBlock, ConvSpiking
+from ..layers.stem import TemporalViTBlock, TemporalGCBlock
 
 class SpikingResNet18Encoder(nn.Module):
     def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=False, gc=False, spike_model=snn.Leaky, **neuron_params):
         super(SpikingResNet18Encoder, self).__init__()
 
         self.vit = vit
-        self.stem = StemLayer(in_channels)
+        self.stem = ConvSpiking(
+            in_channels,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+            spike_model=nn.SiLU,
+            use_norm=True)
         
-        self.layer1a = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
-        self.layer1b = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
-        
-        self.layer2a = SpikingResBlock(64, 128, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **neuron_params)
-        self.layer2b = SpikingResBlock(128, 128, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
-        
-        self.layer3a = SpikingResBlock(128, 256, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **neuron_params)
-        self.layer3b = SpikingResBlock(256, 256, p_drop=p_drop, use_norm = True, spike_model=spike_model, **neuron_params)
+        no_norm_layer_params = neuron_params.copy()
+        if spike_model.__name__ == 'ALIF':
+            no_norm_layer_params['batch_norm'] = False
 
-        last_layer_params = neuron_params.copy()
+        self.layer1a = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
+        self.layer1b = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
+        
+        self.layer2a = SpikingResBlock(64, 128, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **no_norm_layer_params)
+        self.layer2b = SpikingResBlock(128, 128, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
+        
+        self.layer3a = SpikingResBlock(128, 256, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **no_norm_layer_params)
+        self.layer3b = SpikingResBlock(256, 256, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
+
+        last_layer_params = no_norm_layer_params.copy()
         if spike_model.__name__ == 'ALIF':
             last_layer_params['return_mem'] = True
   

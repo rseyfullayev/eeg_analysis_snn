@@ -1,6 +1,6 @@
 import torch.nn as nn
 import snntorch as snn
-from .neurons import TimeDistributed, TemporalShift
+from .neurons import TimeDistributed, TemporalShift, TemporalOrderFix
 class ConvSpiking(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=False, spike_model=snn.Leaky, use_norm = False, **neuron_params):
         super(ConvSpiking, self).__init__()
@@ -9,7 +9,7 @@ class ConvSpiking(nn.Module):
         if spike_model.__name__ == 'ALIF':
             layer_params['num_channels'] = out_channels
 
-        self.norm = TimeDistributed(nn.InstanceNorm2d(out_channels, affine=True)) if use_norm else nn.Identity()
+        self.norm = TemporalOrderFix(nn.InstanceNorm3d(out_channels, affine=True)) if use_norm else nn.Identity()
 
         self.spike = spike_model(**layer_params)
 
