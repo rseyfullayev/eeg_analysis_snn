@@ -1,5 +1,5 @@
-experiment_name: "SNN_ResNet18_RateEncoding"
-description: "Spiking ResNet-18 U-Net with standard LIF neurons and Rate encoding. (SANITY CHECK)"
+experiment_name: "ResNet18_Encoder"
+description: "SWEEP-Net"
 
 data:
   dataset_path: "D:\\SEED-V\\preprocessed_eeg"
