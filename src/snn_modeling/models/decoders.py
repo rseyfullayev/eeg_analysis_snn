@@ -32,6 +32,7 @@ class SpikingResNetDecoder(nn.Module):
         last_layer_params = recurrent_params.copy()
         if spike_model.__name__ == 'ALIF':
             last_layer_params['return_mem'] = True
+            last_layer_params['norm_mem'] = nn.BatchNorm3d
         
         self.up3 = SpikingUpsampleBlock(
             in_channels=128, 

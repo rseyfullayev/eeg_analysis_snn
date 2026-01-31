@@ -2,7 +2,7 @@ experiment_name: "ResNet18_Encoder_SNN"
 description: "SWEEP-Net"
 
 data:
-  dataset_path: "D:\\SEED-V\\preprocessed_eeg"
+  dataset_path: "/media/temporaryuser3/STORAGE/SEED-V/preprocessed_eeg"
   dataset_mode: "eeg"
   encoding_method: "direct"
   num_timesteps: 16
@@ -54,7 +54,7 @@ training:
   phase_1_epochs: 50
   phase_2_epochs: 50
   phase_3_epochs: 50
-  batch_size: 16
+  batch_size: 64
   learning_rate: 0.001
   weight_decay: 0.01
   accumulation_steps: 1
