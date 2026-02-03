@@ -514,7 +514,7 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_loso{loso}"
     else:
         run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_subj{subj}"
-    checkpoint_dir = os.path.join("saved_models", f"phase{phase}", run_name)
+    checkpoint_dir = os.path.join(config['data'].get('save_path', ''), "saved_models", f"phase{phase}", run_name)
     
     
     os.makedirs(checkpoint_dir, exist_ok=True)
