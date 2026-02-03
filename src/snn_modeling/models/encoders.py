@@ -55,7 +55,7 @@ class SpikingResNet18Encoder(nn.Module):
         s3 = self.layer3b(s3)
         #s4 = self.layer4a(s3)
         #s4 = self.layer4b(s4)
-        s4 = self.temporal(s4)
+        #s4 = self.temporal(s4)
         return s3, [s1, s2] #s4, [s1, s2, s3]
     
 
