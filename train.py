@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
-import time
+import re
 import os
 import gc
 from datetime import datetime
@@ -45,52 +45,56 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
     }, path)
     print(f"New Record! Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
 
-def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
 
+def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
     model.eval()
     val_loss = 0
-    correct = 0
-    total = 0
+    correct = 0 
+    total = 0 
     
     all_preds = []
     all_targets = []
-
     tp_tot, fp_tot, fn_tot, tn_tot = 0, 0, 0, 0
 
-    val_aug = nn.Sequential(
-        DyTNorm(gain=3.0)
-    )
+    vote_storage = []
+    fname_pattern = re.compile(r"^(.*)_s(\d+)_lbl(\d+)\.pt$")
+
+    val_aug = nn.Sequential(DyTNorm(gain=3.0)) 
+    
     val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
+    
     with torch.no_grad():
-        for batch_idx, (inputs, targets, labels) in enumerate(val_loop):
-            inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
-            B,C,T,H,W = inputs.shape
+        for batch_idx, (inputs, targets, labels, filename) in enumerate(val_loop):
+            inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
+            
+            # Data Prep
             inputs = val_aug(inputs)
-            inputs = inputs.permute(2, 0, 1, 3, 4)
+            B, C, T, H, W = inputs.shape
+            inputs = inputs.permute(2, 0, 1, 3, 4) # [T, B, C, H, W]
             
             outputs = model(inputs)
+            
+            # --- BRANCH 1: CLASSIFICATION ONLY ---
             if only_classification:
-                _,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
+                _,C,H,W = outputs.shape
                 loss = criterion(outputs, labels.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
-                energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0,3,4])
+                energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0, 3, 4])
+
             else:
                 loss = criterion(outputs, targets, labels)
-                B, C, H, W = outputs.shape
                 
-                probs = torch.softmax(outputs, dim=1)
-                energy_logits = probs[:, 1:, :, :].sum(dim=(2, 3))
-                preds_map = torch.argmax(probs, dim=1)
-                tp, fp, fn, tn = smp.metrics.get_stats(
-                    preds_map,
-                    targets, 
-                    mode='multiclass', 
-                    num_classes=6
-                )
-                tp_tot += tp[:, 1:].sum().item()
+                # Segmentation Metrics
+                probs_map = torch.softmax(outputs, dim=1)
+                preds_map = torch.argmax(probs_map, dim=1)
+                
+                # Calculate metrics using SMP
+                tp, fp, fn, tn = smp.metrics.get_stats(preds_map, targets, mode='multiclass', num_classes=6)
+                tp_tot += tp[:, 1:].sum().item() # Ignore background class 0
                 fp_tot += fp[:, 1:].sum().item()
                 fn_tot += fn[:, 1:].sum().item()
                 tn_tot += tn[:, 1:].sum().item()
 
+                energy_logits = probs_map[:, 1:, :, :].sum(dim=(2, 3))
 
             val_loss += loss.item()
             val_loop.set_postfix(loss=loss.item())
@@ -101,19 +105,60 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
 
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.cpu().numpy())
+
+            batch_probs = torch.softmax(energy_logits, dim=1).cpu().numpy()
+            batch_labels = labels.cpu().numpy()
             
-            # Cleanup tensors to free memory
-            del inputs, labels, outputs, loss, preds
-            if not only_classification:
-                del preds_map, targets, tp, fp, fn, tn
+            for i in range(len(filename)):
+                fname_str = filename[i]
+                match = fname_pattern.match(fname_str)
+                if match:
+                    vote_storage.append({
+                        'session': match.group(1), 
+                        's_idx': int(match.group(2)),
+                        'true_label': batch_labels[i],
+                        'probs': batch_probs[i]
+                    })
+
+            del inputs, labels, outputs, loss, preds, energy_logits
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    vote_storage.sort(key=lambda x: x['s_idx'])
+    
+    trial_correct = 0
+    trial_total = 0
+    
+    if len(vote_storage) > 0:
+        curr_probs = []
+        curr_label = vote_storage[0]['true_label']
+        curr_session = vote_storage[0]['session']
+        
+        for item in vote_storage:
+            if (item['true_label'] != curr_label) or (item['session'] != curr_session):
+                if curr_probs:
+                    avg_probs = np.mean(curr_probs, axis=0)
+                    final_pred = np.argmax(avg_probs)
+                    if final_pred == curr_label:
+                        trial_correct += 1
+                    trial_total += 1
                 
-    # Clear CUDA cache after validation
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-                
+                curr_probs = []
+                curr_label = item['true_label']
+                curr_session = item['session']
             
+            curr_probs.append(item['probs'])
+        
+        if curr_probs:
+            avg_probs = np.mean(curr_probs, axis=0)
+            final_pred = np.argmax(avg_probs)
+            if final_pred == curr_label:
+                trial_correct += 1
+            trial_total += 1
+            
+    trial_acc = trial_correct / (trial_total + 1e-7)
+
     avg_loss = val_loss / len(val_loader)
-    accuracy = correct / total
+    window_acc = correct / total
     balanced_acc = balanced_accuracy_score(all_targets, all_preds)
     
     eps = 1e-7
@@ -122,7 +167,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     precision = tp_tot / (tp_tot + fp_tot + eps)
     recall = tp_tot / (tp_tot + fn_tot + eps)
 
-    return avg_loss, accuracy, balanced_acc, dice_score, iou_score, precision, recall
+    return avg_loss, window_acc, trial_acc, balanced_acc, dice_score, iou_score, precision, recall
 
 def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
 
@@ -261,7 +306,7 @@ def training_loop(phase,
     
     train_aug = nn.Sequential(
         DyTNorm(gain=3.0),
-        #GaussianNoise(std=0.01),
+        GaussianNoise(std=0.05),
         #VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
         
     )

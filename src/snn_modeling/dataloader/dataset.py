@@ -227,4 +227,4 @@ class SWEEPDataset(Dataset):
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
         target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
         
-        return video, target_map, label_idx
+        return video, target_map, label_idx, fname
