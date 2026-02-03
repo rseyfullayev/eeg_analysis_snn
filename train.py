@@ -319,7 +319,7 @@ def training_loop(phase,
             model.encoder.apply(freeze_bn_stats)
         train_loss = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
-        for batch_idx, (inputs,  targets, targets_c) in enumerate(train_loop):
+        for batch_idx, (inputs,  targets, targets_c, _) in enumerate(train_loop):
             
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
             if phase == 1:
