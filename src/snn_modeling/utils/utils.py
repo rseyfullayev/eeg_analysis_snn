@@ -403,7 +403,7 @@ def run_bn_warmup(model, loader, device, num_batches=10):
     model.to(device)
     
     with torch.no_grad():
-        for i, (inputs, ...) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
+        for i, (inputs, _, _, _) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
             if i >= num_batches:
                 break
             inputs = inputs.to(device)
