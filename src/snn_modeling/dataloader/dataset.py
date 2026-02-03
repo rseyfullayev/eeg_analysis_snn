@@ -37,6 +37,9 @@ class TopoMapper(nn.Module):
         self.mask_indices = (self.target_points[:, 0]**2 + self.target_points[:, 1]**2) > 1.0
         dists = torch.cdist(self.target_points, self.points)
         weights = torch.exp(-(dists.pow(2)) / (2 * (self.sigma ** 2)))
+        weight_sums = weights.sum(dim=1, keepdim=True)
+        weight_sums = torch.clamp(weight_sums, min=1e-8)
+        weights = weights / weight_sums
         weights[self.mask_indices, :] = 0.0
         self.register_buffer('weights', weights)
 
