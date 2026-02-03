@@ -89,7 +89,7 @@ class SWEEPDataset(Dataset):
 
             df = df[df['filename'].str.split('_').str[0] == str(subj)]
             #df_train, df_val = train_test_split(df, test_size=0.2, random_state=42, stratify=df['emotion_id'])
-            df_train, df_val = self.get_stratified_sampling(test_size=1.0 - self.train_size)
+            df_train, df_val = self.get_stratified_sampling(df, test_size=1.0 - self.train_size)
 
         else:
             df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
@@ -130,20 +130,22 @@ class SWEEPDataset(Dataset):
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
     
-    def get_stratified_sampling(self, test_size=0.2):
-        files = [f for f in os.listdir(self.dataset_path) if f.endswith('.pt') and not f.startswith('masks')]
+    def get_stratified_sampling(self, df, test_size=0.2):
+        files = df['filename']
+        #print(files)
         parsed_data = []
         
-        pattern = re.compile(r'(\d+)_(\d+)_s(\d+)_lbl(\d+).pt')
+        pattern = re.compile(r'^(.*)_s(\d+)_lbl(\d+).pt')
         
         for f in files:
             match = pattern.match(f)
             if match:
-                subj_id, sess_id, s_idx, label = (int(match.group(i)) for i in range(1, 5))
+                key = match.group(1)
+                s_idx = int(match.group(2))
+                label = int(match.group(3))
                 parsed_data.append({
                 'fname': f,
-                'subj_id': subj_id,
-                'sess_id': sess_id,
+                'session_id': key,
                 's_idx': s_idx,
                 'label': label
             })

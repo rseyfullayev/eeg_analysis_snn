@@ -280,7 +280,7 @@ def training_loop(phase,
             if phase == 1:
                 with torch.no_grad():
                     inputs = train_aug(inputs)
-                    inputs, targets_c = temp_mix(inputs, targets_c)
+                    #inputs, targets_c = temp_mix(inputs, targets_c)
             B,C,T,H,W = inputs.shape
     
             inputs = inputs.permute(2, 0, 1, 3, 4)
@@ -374,7 +374,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         time_steps=config['data'].get('num_timesteps', 16),
     )"""
 
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     loss_fn.to(device)
 
@@ -538,7 +538,7 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
 
 
     train_set = SWEEPDataset(
-        config, 
+        config,
         split='train',
         #experiment=True,
         loso=loso,

@@ -29,7 +29,7 @@ model:
   encoder_type: "ResNet18"
   reccurent_decoder: false
   vit_integration: false
-  gc_integration: true
+  gc_integration: false
   encoder_mode: "cnn"
   in_channels: 5
   num_classes: 5
