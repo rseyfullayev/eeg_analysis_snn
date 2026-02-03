@@ -2,9 +2,9 @@ import torch.nn as nn
 import snntorch as snn
 from .neurons import TimeDistributed, TemporalShift, TemporalOrderFix
 class ConvSpiking(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=False, spike_model=snn.Leaky, use_norm = False, **neuron_params):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, groups=1, bias=False, spike_model=snn.Leaky, use_norm = False, **neuron_params):
         super(ConvSpiking, self).__init__()
-        self.conv = TimeDistributed(nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias))
+        self.conv = TimeDistributed(nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias, groups=groups))
         layer_params = neuron_params.copy()
         if spike_model.__name__ == 'ALIF':
             layer_params['num_channels'] = out_channels
@@ -23,6 +23,8 @@ class SpikingResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1, p_drop=0.2, spike_model=snn.Leaky, use_norm = False, **neuron_params):
         super(SpikingResBlock, self).__init__()
 
+        groups = in_channels if in_channels == out_channels else 1
+
         self.block1 = ConvSpiking(
             in_channels, 
             out_channels, 
@@ -31,6 +33,7 @@ class SpikingResBlock(nn.Module):
             padding=1, 
             bias=False, 
             spike_model=spike_model, 
+            groups=groups,
             use_norm=use_norm,
             **neuron_params
         )

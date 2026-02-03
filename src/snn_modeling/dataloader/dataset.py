@@ -1,6 +1,6 @@
 import torch
 import os
-import re
+import json
 import numpy as np
 from torch.utils.data import Dataset
 import torch.nn as nn
@@ -78,21 +78,28 @@ class SWEEPDataset(Dataset):
         self.cache = {}
 
         index_file = os.path.join(self.dataset_path, "index.csv")
-
+        stats_path = os.path.join(self.dataset_path, "stats.json")
 
         if not os.path.exists(index_file):
             raise FileNotFoundError(f"Index not found at {index_file}.")
             
         print(f"Loading index from {index_file}...")
         df = pd.read_csv(index_file)
-    
+
+        with open(stats_path, 'r') as f:
+            self.stats_lookup = json.load(f)
+
         indices = np.arange(len(df))
         labels = df['emotion_id'].values
         if subj is not None:
 
             df = df[df['filename'].str.split('_').str[0] == str(subj)]
             #df_train, df_val = train_test_split(df, test_size=0.2, random_state=42, stratify=df['emotion_id'])
-            df_train, df_val = self.get_stratified_sampling(df, test_size=1.0 - self.train_size)
+            splitter = GroupShuffleSplit(n_splits=1, test_size=1.0 - self.train_size, random_state=42)
+            train_idx, val_idx = next(splitter.split(df, groups=df['group_id']))
+
+            df_train = df.iloc[train_idx]
+            df_val = df.iloc[val_idx]
 
         else:
             df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
@@ -108,7 +115,7 @@ class SWEEPDataset(Dataset):
         else:
             raise ValueError(f"Unknown split '{split}'. Use 'train' or 'val'.")
         
-        self.samples = list(zip(df_slice['filename'], df_slice['emotion_id']))
+        self.samples = list(zip(df_slice['filename'], df_slice['emotion_id'], df_slice['stats_key']))
 
         if self.preload:
             print("Preloading data into RAM...")
@@ -133,65 +140,6 @@ class SWEEPDataset(Dataset):
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
     
-    def get_stratified_sampling(self, df, test_size=0.2):
-        files = df['filename']
-        #print(files)
-        parsed_data = []
-        
-        pattern = re.compile(r'^(.*)_s(\d+)_lbl(\d+).pt')
-        
-        for f in files:
-            match = pattern.match(f)
-            if match:
-                key = match.group(1)
-                s_idx = int(match.group(2))
-                label = int(match.group(3))
-                parsed_data.append({
-                'fname': f,
-                'session_id': key,
-                's_idx': s_idx,
-                'label': label
-            })
-        
-        parsed_data.sort(key=lambda x: x['s_idx'])
-
-        if not parsed_data:
-                raise ValueError("No matching files found! Check regex.")
-        
-        groups = []
-        cur_group_id = 0
-        prev_session = parsed_data[0]['session_id']
-        prev_label = parsed_data[0]['label']
-
-        for i in range(len(parsed_data)):
-            if (parsed_data[i]['session_id'] != prev_session) or (parsed_data[i]['label'] != prev_label):
-                cur_group_id += 1
-                prev_session = parsed_data[i]['session_id']
-                prev_label = parsed_data[i]['label']
-            groups.append(cur_group_id)
-        
-        print(f"Total groups formed for stratification: {cur_group_id + 1}")
-
-        X = [d['fname'] for d in parsed_data]
-        y = [d['label'] for d in parsed_data]
-        groups = np.array(groups)
-        
-        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
-
-        train_idx, val_idx = next(gss.split(X, y, groups))
-        print(f"Train samples: {len(train_idx)}, Validation samples: {len(val_idx)}")
-
-        df_train = pd.DataFrame({
-            'filename': [X[i] for i in train_idx],
-            'emotion_id': [y[i] for i in train_idx]
-        })
-
-        df_val = pd.DataFrame({
-            'filename': [X[i] for i in val_idx],
-            'emotion_id': [y[i] for i in val_idx]
-        })
-
-        return df_train, df_val
 
     @staticmethod
     def compute_prototypes(num_classes, grid_size, radius, sigma, device='cpu'):
@@ -214,7 +162,7 @@ class SWEEPDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        fname, label_idx = self.samples[idx]
+        fname, label_idx, stats_key = self.samples[idx]
         
         file_path = os.path.join(self.samples_dir, fname)
         if self.preload:
