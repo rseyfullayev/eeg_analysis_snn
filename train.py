@@ -77,8 +77,8 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             # --- BRANCH 1: CLASSIFICATION ONLY ---
             if only_classification:
                 _,C,H,W = outputs.shape
-                loss = criterion(outputs, labels.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
-                energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0, 3, 4])
+                loss = criterion(outputs, labels)#.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
+                energy_logits = outputs#.view(T,B,C,H,W).mean(dim=[0, 3, 4])
 
             else:
                 loss = criterion(outputs, targets, labels)
@@ -307,6 +307,7 @@ def training_loop(phase,
     train_aug = nn.Sequential(
         DyTNorm(gain=3.0),
         GaussianNoise(std=0.05),
+        FrequencyDropout(p=0.2),
         #VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
         
     )
@@ -331,7 +332,7 @@ def training_loop(phase,
             inputs = inputs.permute(2, 0, 1, 3, 4)
             outputs = model(inputs)
             if phase == 1:
-                loss = loss_fn(outputs, targets_c.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
+                loss = loss_fn(outputs, targets_c) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
             else:
                 loss = loss_fn(outputs, targets, targets_c)
            

@@ -65,7 +65,7 @@ class SpikingResNetClassifier(nn.Module):
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
-        self.classifier = ClassifierHead(512, num_classes)
+        self.classifier = ClassifierHead(128, num_classes)
         
 
     def forward(self, x):
@@ -74,5 +74,5 @@ class SpikingResNetClassifier(nn.Module):
 
         out = self.classifier(features)
         T,B,C,H,W = out.shape
-        out = out.view(T*B, C, H, W)
+        out = out.mean(dim=[0,3,4])
         return out #.mean(dim=0) # Mean over time dimension

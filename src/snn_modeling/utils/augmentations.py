@@ -52,17 +52,16 @@ class FrequencyDropout(nn.Module):
     """
     def __init__(self, p=0.2):
         super().__init__()
-        self.p = p
+        self.drop = nn.Dropout3d(p=p)
 
     def forward(self, x):
         if not self.training: return x
+        x = x.permute(0,2,1,3,4)  # B,T,C,H,W -> B,C,T,H,W
+        x = self.drop(x)
+        x = x.permute(0,2,1,3,4)  # B,C,T,H,W -> B,T,C,H,W
+        return x
         
-        B, T, C, H, W = x.shape
-        # We drop the same band for the whole video duration (consistency)
-        mask = torch.bernoulli(torch.ones((B, 1, C, 1, 1), device=x.device) * (1 - self.p))
         
-        # Scale by 1/(1-p) to maintain energy magnitude (Inverted Dropout)
-        return x * mask * (1.0 / (1 - self.p))
 
 class VideoRandomErasing(nn.Module):
     """

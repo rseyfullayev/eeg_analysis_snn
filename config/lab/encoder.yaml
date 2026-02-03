@@ -33,7 +33,7 @@ model:
   encoder_mode: "cnn"
   in_channels: 5
   num_classes: 5
-  dropout: 0.2
+  dropout: 0.5
   vit_dropout: 0.3
 
 neuron_params:
