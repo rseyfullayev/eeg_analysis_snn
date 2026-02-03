@@ -1,10 +1,11 @@
 import torch
 import os
+import re
 import numpy as np
 from torch.utils.data import Dataset
 import torch.nn as nn
 import pandas as pd     
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 
 class TopoMapper(nn.Module):
     def __init__(self, sensor_coords_df, grid_size=64, sigma=0.2, device='cuda'): # Using Azimuthal Equidistant Projection
@@ -69,7 +70,8 @@ class SWEEPDataset(Dataset):
         self.grid_size = config['data'].get('grid_size', 32)
         self.dataset_path = config['data']['dataset_path'] 
         self.samples_dir = os.path.join(self.dataset_path)
-        self.preload = config['data'].get('preload_ram', False) 
+        self.preload = config['data'].get('preload_ram', False)
+        self.train_size = config['data'].get('train_size', 0.8)
         self.cache = {}
 
         index_file = os.path.join(self.dataset_path, "index.csv")
@@ -84,8 +86,11 @@ class SWEEPDataset(Dataset):
         indices = np.arange(len(df))
         labels = df['emotion_id'].values
         if subj is not None:
+
             df = df[df['filename'].str.split('_').str[0] == str(subj)]
-            df_train, df_val = train_test_split(df, test_size=0.2, random_state=42, stratify=df['emotion_id'])
+            #df_train, df_val = train_test_split(df, test_size=0.2, random_state=42, stratify=df['emotion_id'])
+            df_train, df_val = self.get_stratified_sampling(test_size=1.0 - self.train_size)
+
         else:
             df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
             df_val = df[df['filename'].str.split('_').str[0] == str(loso)]
@@ -124,6 +129,64 @@ class SWEEPDataset(Dataset):
             self.prototypes = prototypes
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
+    
+    def get_stratified_sampling(self, test_size=0.2):
+        files = [f for f in os.listdir(self.dataset_path) if f.endswith('.pt') and not f.startswith('masks')]
+        parsed_data = []
+        
+        pattern = re.compile(r'(\d+)_(\d+)_s(\d+)_lbl(\d+).pt')
+        
+        for f in files:
+            match = pattern.match(f)
+            if match:
+                subj_id, sess_id, s_idx, label = (int(match.group(i)) for i in range(1, 5))
+                parsed_data.append({
+                'fname': f,
+                'subj_id': subj_id,
+                'sess_id': sess_id,
+                's_idx': s_idx,
+                'label': label
+            })
+        
+        parsed_data.sort(key=lambda x: x['s_idx'])
+
+        if not parsed_data:
+                raise ValueError("No matching files found! Check regex.")
+        
+        groups = []
+        cur_group_id = 0
+        prev_session = parsed_data[0]['session_id']
+        prev_label = parsed_data[0]['label']
+
+        for i in range(len(parsed_data)):
+            if (parsed_data[i]['session_id'] != prev_session) or (parsed_data[i]['label'] != prev_label):
+                cur_group_id += 1
+                prev_session = parsed_data[i]['session_id']
+                prev_label = parsed_data[i]['label']
+            groups.append(cur_group_id)
+        
+        print(f"Total groups formed for stratification: {cur_group_id + 1}")
+
+        X = [d['fname'] for d in parsed_data]
+        y = [d['label'] for d in parsed_data]
+        groups = np.array(groups)
+        
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
+
+        train_idx, val_idx = next(gss.split(X, y, groups))
+        print(f"Train samples: {len(train_idx)}, Validation samples: {len(val_idx)}")
+
+        df_train = pd.DataFrame({
+            'filename': [X[i] for i in train_idx],
+            'emotion_id': [y[i] for i in train_idx]
+        })
+
+        df_val = pd.DataFrame({
+            'filename': [X[i] for i in val_idx],
+            'emotion_id': [y[i] for i in val_idx]
+        })
+
+        return df_train, df_val
 
     @staticmethod
     def compute_prototypes(num_classes, grid_size, radius, sigma, device='cpu'):
