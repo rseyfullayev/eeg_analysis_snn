@@ -357,18 +357,18 @@ def training_loop(phase,
 
         avg_train_loss = train_loss / len(train_loader)
           
-        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
+        val_loss, val_acc, val_trial_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
         if phase == 1:
             print(f"Phase {phase} Epoch {epoch} | LR: {current_lr:.2e} | "
                   f"Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val Acc: {val_acc:.4f}")
+                  f"Val Acc: {val_acc:.4f} | Val Trial Acc: {val_trial_acc:.4f}")
         else:
             print(f"Phase {phase} Epoch {epoch} | LR: {current_lr:.2e} | "
                   f"Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val Acc: {val_acc:.4f} | Dice: {val_dice:.4f} | "
+                  f"Val Acc: {val_acc:.4f} | Val Trial Acc: {val_trial_acc:.4f} Dice: {val_dice:.4f} | "
                   f"Val Pre: {val_pre:.4f} | Val Rec: {val_rec:.4f}")
         
         log_dict = {
