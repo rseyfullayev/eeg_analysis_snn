@@ -115,7 +115,7 @@ def run_data_setup(config=None):
 
                 # Topo & Save
                 video_batch = topo(feats)
-                video_batch = torch.clamp(video_batch, min=0.0, max=50.0) 
+                video_batch = torch.clamp(video_batch, min=0.0, max=50.0)  # 10^50 is impossible thus clipping
 
                 video_batch = video_batch.cpu()
                 for k in range(video_batch.shape[0]):
