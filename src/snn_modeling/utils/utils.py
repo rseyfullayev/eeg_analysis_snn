@@ -43,89 +43,99 @@ def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, t
 
     print(f"Calibrated Threshold: {thresh:.4f}, Beta: {beta:.4f}, Decay Adapt: {decay_adapt:.4f}, Gamma Adapt: {gamma_adapt:.4f}")
 
-            
-
-
-def generate_masks(config, subject_id=3):
-    print(f"--- GENERATING MASKS FOR SUBJECT {subject_id} ---")
+ 
+def generate_masks(config, subject_id):
+    print(f"--- GENERATING MASKS USING MAHALANOBIS (STATISTICAL SALIENCE) FOR SUBJECT {subject_id} ---")
     
+    # 1. Load Index
     df = pd.read_csv(os.path.join(config['data']['dataset_path'], "index.csv"))
     df = df[df['filename'].str.startswith(f"{subject_id}_")]
     
     if len(df) == 0: raise ValueError(f"No data found for Subject {subject_id}")
 
-    # Accumulate [Bands, H, W] instead of just [H, W]
+    # 2. Welford's Online Algorithm for Mean/Std Calculation
+    # We need accurate pixel-wise STD to punish noisy bands.
+    n = 0
+    mean = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
+    m2 = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size']) # Sum of squares of differences
+    
+    # We also need to accumulate class-specific sums
     class_sums = torch.zeros(5, 5, config['data']['grid_size'], config['data']['grid_size'])
     class_counts = torch.zeros(5)
-    
-    print("Accumulating Spectral Topologies...")
+
+    print("Scanning Dataset for Statistics...")
+    # NOTE: To save time, you can sample 20% of data, but full scan is better for GT.
     for _, row in tqdm(df.iterrows(), total=len(df)):
         fpath = os.path.join(config['data']['dataset_path'], row['filename'])
-        emotion_idx = row['emotion_id']
         try:
-            data = torch.load(fpath) # [5, Time, 32, 32]
+            # Load [5, T, 32, 32] -> Mean over Time -> [5, 32, 32]
+            # We treat the *Trial Average* as the data point.
+            x = torch.load(fpath).mean(dim=1)
             
-            # COLLAPSE TIME ONLY (Keep Bands)
-            spectral_map = data.mean(dim=1) # -> [5, 32, 32]
+            # Update Global Stats (Welford)
+            n += 1
+            delta = x - mean
+            mean += delta / n
+            delta2 = x - mean
+            m2 += delta * delta2
             
-            class_sums[emotion_idx] += spectral_map
-            class_counts[emotion_idx] += 1
+            # Update Class Sums
+            class_sums[row['emotion_id']] += x
+            class_counts[row['emotion_id']] += 1
+            
         except: continue
 
-    class_means = torch.zeros_like(class_sums)
+    # Finalize Global Stats
+    global_mean = mean
+    global_var = m2 / (n - 1)
+    global_std = torch.sqrt(global_var) + 1e-6 # Stability epsilon
+
+    # Finalize Class Means (Prototypes)
+    class_prototypes = torch.zeros_like(class_sums)
     for i in range(5):
         if class_counts[i] > 0:
-            class_means[i] = class_sums[i] / class_counts[i]
+            class_prototypes[i] = class_sums[i] / class_counts[i]
 
-    # Global Mean per Band
-    global_mean = class_means.mean(dim=0) # [5, 32, 32]
-
-    # --- VISUALIZATION STRATEGY ---
-    # We will plot ALPHA (Idx 2) and GAMMA (Idx 4) separately
-    # This reveals the "See-Saw" effect
+    # 3. Compute Salience Masks (Z-Score Energy)
+    final_masks = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
     
+    print("Computing Z-Score Energy Maps...")
+    for i in range(5):
+        # A. Pixel-wise Z-Score per Band
+        # "How weird is this band at this pixel for this emotion?"
+        z_score = (class_prototypes[i] - global_mean) / global_std
+        
+        # B. Aggregate Energy (Root Mean Square)
+        # This treats suppression (-3) and activation (+3) as equal signal.
+        # It automatically weights bands: if Delta is noisy (high global_std), Z is low.
+        energy_map = torch.sqrt(torch.sum(z_score ** 2, dim=0))
+        
+        # C. Spatial Smoothing (Biology is smooth)
+        energy_map = F.gaussian_blur(energy_map.unsqueeze(0).unsqueeze(0), kernel_size=5, sigma=1.0).squeeze()
+        
+        # D. Normalize to [0, 1] for IoU calculation later
+        if energy_map.max() > 0:
+            energy_map = (energy_map - energy_map.min()) / (energy_map.max() - energy_map.min())
+            
+        final_masks[i] = energy_map
+
+    # 4. Save
+    save_path = f"evidence/subject{subject_id}_statistical_GT.pt"
+    torch.save(final_masks, save_path)
+    
+    # Visualization (Optional but recommended)
+    import matplotlib.pyplot as plt
     emotions = ['Disgust', 'Fear', 'Sad', 'Neutral', 'Happy']
-    bands = {2: 'Alpha (8-13Hz)', 4: 'Gamma (30Hz+)'}
-    
-    fig, axes = plt.subplots(len(bands), 5, figsize=(20, 8))
-    
-    print("\nComputing Band-Specific Differentials...")
-    
-    for row_idx, (band_idx, band_name) in enumerate(bands.items()):
-        
-        # Calculate Max Abs Value for this band to normalize scales (e.g. -1 to 1)
-        # We need a common scale to see which emotion is strongest
-        band_max = 0
-        
-        for emo_i in range(5):
-            # Difference from Mean (Signed!)
-            # Do NOT use ReLU yet. We want to see Blue (Suppression) too.
-            diff = class_means[emo_i, band_idx] - global_mean[band_idx]
-            
-            # Smooth
-            diff = F.gaussian_blur(diff.unsqueeze(0).unsqueeze(0), kernel_size=5, sigma=1.0).squeeze()
-            
-            # Update max for scaling
-            current_max = torch.max(torch.abs(diff)).item()
-            if current_max > band_max: band_max = current_max
+    fig, axes = plt.subplots(1, 5, figsize=(20, 5))
+    for i in range(5):
+        im = axes[i].imshow(final_masks[i].numpy(), cmap='magma', vmin=0, vmax=1)
+        axes[i].set_title(f"{emotions[i]}\nZ-Energy Mask")
+        axes[i].axis('off')
+    plt.colorbar(im, ax=axes.ravel().tolist())
+    plt.savefig(f"evidence/subject{subject_id}_statistical_GT.png")
+    print(f"Ground Truth saved to {save_path}")
 
-            # Plot
-            ax = axes[row_idx, emo_i]
-            im = ax.imshow(diff.numpy(), cmap='RdBu_r', vmin=-band_max, vmax=band_max)
-            
-            if row_idx == 0: ax.set_title(f"{emotions[emo_i]}", fontsize=14, fontweight='bold')
-            if emo_i == 0: ax.set_ylabel(f"{band_name}", fontsize=14, fontweight='bold')
-            
-            ax.axis('off')
-            # Only put colorbar on the last column to save space
-            if emo_i == 4:
-                plt.colorbar(im, ax=ax, fraction=0.046)
 
-    plt.suptitle(f"Subject {subject_id}: Spectral Decomposition of Emotion", fontsize=16)
-    plt.tight_layout()
-    save_path = f"evidence/subject{subject_id}_spectral_masks.png"
-    plt.savefig(save_path)
-    print(f"Saved spectral analysis to {save_path}")
 def seed_everything(seed=42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
