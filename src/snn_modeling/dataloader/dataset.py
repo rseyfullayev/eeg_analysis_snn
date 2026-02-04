@@ -163,6 +163,10 @@ class SWEEPDataset(Dataset):
 
     def __getitem__(self, idx):
         fname, label_idx, stats_key = self.samples[idx]
+
+        mean = self.stats_lookup[stats_key]['mean']
+        std = self.stats_lookup[stats_key]['std']
+
         
         file_path = os.path.join(self.samples_dir, fname)
         if self.preload:
@@ -174,7 +178,7 @@ class SWEEPDataset(Dataset):
                 print(f"Error loading {fname}: {e}")
                 return torch.zeros(5, 32, 32, 32), torch.zeros(32, 32), 0
 
-
+        video = (video - mean) / (std + 1e-8)
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
         target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
         

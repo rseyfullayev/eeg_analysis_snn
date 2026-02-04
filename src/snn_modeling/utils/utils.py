@@ -47,92 +47,85 @@ def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, t
 
 
 def generate_masks(config, subject_id=3):
-    print(f"--- GENERATING DIFFERENTIAL MASKS FOR SUBJECT {subject_id} ---")
+    print(f"--- GENERATING MASKS FOR SUBJECT {subject_id} ---")
     
     df = pd.read_csv(os.path.join(config['data']['dataset_path'], "index.csv"))
-    # Filter for Subject 3
     df = df[df['filename'].str.startswith(f"{subject_id}_")]
     
-    if len(df) == 0:
-        raise ValueError(f"No data found for Subject {subject_id}")
+    if len(df) == 0: raise ValueError(f"No data found for Subject {subject_id}")
 
-    class_sums = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
+    # Accumulate [Bands, H, W] instead of just [H, W]
+    class_sums = torch.zeros(5, 5, config['data']['grid_size'], config['data']['grid_size'])
     class_counts = torch.zeros(5)
     
-    print("Accumulating Spatial Topologies...")
+    print("Accumulating Spectral Topologies...")
     for _, row in tqdm(df.iterrows(), total=len(df)):
         fpath = os.path.join(config['data']['dataset_path'], row['filename'])
         emotion_idx = row['emotion_id']
-
         try:
-            data = torch.load(fpath)
+            data = torch.load(fpath) # [5, Time, 32, 32]
             
-            spatial_map = data.mean(dim=[0,1]) # Temporal and Channel Mean
+            # COLLAPSE TIME ONLY (Keep Bands)
+            spectral_map = data.mean(dim=1) # -> [5, 32, 32]
             
-            # Accumulate
-            class_sums[emotion_idx] += spatial_map
+            class_sums[emotion_idx] += spectral_map
             class_counts[emotion_idx] += 1
-            
-        except Exception as e:
-            print(f"Error loading {fpath}: {e}")
-            continue
+        except: continue
 
     class_means = torch.zeros_like(class_sums)
     for i in range(5):
         if class_counts[i] > 0:
             class_means[i] = class_sums[i] / class_counts[i]
 
-    # 2. Compute Global Mean (The "Common Mode" Background)
-    global_mean = class_means.mean(dim=0)
+    # Global Mean per Band
+    global_mean = class_means.mean(dim=0) # [5, 32, 32]
 
-    # 3. Compute Differential Masks
-    differential_masks = torch.zeros_like(class_means)
+    # --- VISUALIZATION STRATEGY ---
+    # We will plot ALPHA (Idx 2) and GAMMA (Idx 4) separately
+    # This reveals the "See-Saw" effect
     
-    print("\nComputing Differentials (One-vs-Rest)...")
-    for i in range(5):
-        diff = class_means[i] - global_mean
-        diff = torch.relu(diff)
+    emotions = ['Disgust', 'Fear', 'Sad', 'Neutral', 'Happy']
+    bands = {2: 'Alpha (8-13Hz)', 4: 'Gamma (30Hz+)'}
+    
+    fig, axes = plt.subplots(len(bands), 5, figsize=(20, 8))
+    
+    print("\nComputing Band-Specific Differentials...")
+    
+    for row_idx, (band_idx, band_name) in enumerate(bands.items()):
         
-        if diff.max() > 0:
-            diff = diff / diff.max()
+        # Calculate Max Abs Value for this band to normalize scales (e.g. -1 to 1)
+        # We need a common scale to see which emotion is strongest
+        band_max = 0
         
-        diff_smooth = F.gaussian_blur(diff.unsqueeze(0), kernel_size=5, sigma=1.5).squeeze(0)
-        
-        if diff_smooth.max() > 0:
-            diff_smooth = diff_smooth / diff_smooth.max()
+        for emo_i in range(5):
+            # Difference from Mean (Signed!)
+            # Do NOT use ReLU yet. We want to see Blue (Suppression) too.
+            diff = class_means[emo_i, band_idx] - global_mean[band_idx]
             
-        differential_masks[i] = diff_smooth
+            # Smooth
+            diff = F.gaussian_blur(diff.unsqueeze(0).unsqueeze(0), kernel_size=5, sigma=1.0).squeeze()
+            
+            # Update max for scaling
+            current_max = torch.max(torch.abs(diff)).item()
+            if current_max > band_max: band_max = current_max
 
-    # --- VISUALIZATION ---
-    print("Plotting results...")
-    emotions = ['Disgust', 'Fear', 'Sad', 'Neutral', 'Happy'] # Verify your order!
-    
-    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-    
-    # Row 1: Raw Averages (Likely look identical/messy)
-    for i in range(5):
-        im = axes[0, i].imshow(class_means[i].numpy(), cmap='jet')
-        axes[0, i].set_title(f"Raw Mean: {emotions[i]}")
-        axes[0, i].axis('off')
-        plt.colorbar(im, ax=axes[0, i], fraction=0.046)
+            # Plot
+            ax = axes[row_idx, emo_i]
+            im = ax.imshow(diff.numpy(), cmap='RdBu_r', vmin=-band_max, vmax=band_max)
+            
+            if row_idx == 0: ax.set_title(f"{emotions[emo_i]}", fontsize=14, fontweight='bold')
+            if emo_i == 0: ax.set_ylabel(f"{band_name}", fontsize=14, fontweight='bold')
+            
+            ax.axis('off')
+            # Only put colorbar on the last column to save space
+            if emo_i == 4:
+                plt.colorbar(im, ax=ax, fraction=0.046)
 
-    # Row 2: Idiosyncratic Masks (Should look distinct)
-    for i in range(5):
-        im = axes[1, i].imshow(differential_masks[i].numpy(), cmap='hot')
-        axes[1, i].set_title(f"Differential: {emotions[i]}")
-        axes[1, i].axis('off')
-        plt.colorbar(im, ax=axes[1, i], fraction=0.046)
-    
-    plt.suptitle(f"Subject {subject_id}: Deriving Biologically Grounded Segmentation Masks", fontsize=16)
+    plt.suptitle(f"Subject {subject_id}: Spectral Decomposition of Emotion", fontsize=16)
     plt.tight_layout()
-    plt.savefig(f"evidence/subject{subject_id}_biological_masks.png")
-    print(f"Saved visualization to subject{subject_id}_biological_masks.png")
-
-    # Save the Tensor for the DataLoader
-    torch.save(differential_masks, f"evidence/subject{subject_id}_masks.pt")
-    print(f"Saved masks to subject{subject_id}_masks.pt")
-
-
+    save_path = f"evidence/subject{subject_id}_spectral_masks.png"
+    plt.savefig(save_path)
+    print(f"Saved spectral analysis to {save_path}")
 def seed_everything(seed=42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)

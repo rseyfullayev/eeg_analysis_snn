@@ -35,7 +35,7 @@ class DyTNorm(nn.Module):
         
         p_safe = torch.maximum(p_val, torch.tensor(1e-6, device=x.device))
         return torch.tanh(x / p_safe * self.gain)
-
+    
 class GaussianNoise(nn.Module):
     def __init__(self, std=0.05):
         super().__init__()
