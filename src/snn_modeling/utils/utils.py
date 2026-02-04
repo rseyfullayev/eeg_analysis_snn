@@ -125,12 +125,12 @@ def generate_masks(config, subject_id=3):
     
     plt.suptitle(f"Subject {subject_id}: Deriving Biologically Grounded Segmentation Masks", fontsize=16)
     plt.tight_layout()
-    plt.savefig("subject3_biological_masks.png")
-    print("Saved visualization to subject3_biological_masks.png")
+    plt.savefig(f"evidence/subject{subject_id}_biological_masks.png")
+    print(f"Saved visualization to subject{subject_id}_biological_masks.png")
 
     # Save the Tensor for the DataLoader
-    torch.save(differential_masks, "evidence/subject3_masks.pt")
-    print("Saved masks to subject3_masks.pt")
+    torch.save(differential_masks, f"evidence/subject{subject_id}_masks.pt")
+    print(f"Saved masks to subject{subject_id}_masks.pt")
 
 
 def seed_everything(seed=42):
@@ -155,7 +155,7 @@ def generate_topology_proof(loader, device, class_names, max_batches=100):
     class_counts = torch.zeros(num_classes).to(device)
     
     # Iterate through data
-    for batch_idx, (data, _, target) in enumerate(loader):
+    for batch_idx, (data, _, target, _) in enumerate(loader):
         if batch_idx >= max_batches: break
 
         data = data.to(device)
@@ -223,7 +223,7 @@ def analyze_distribution(dataloader, num_batches=20, max_samples=100000):
     collected_samples = []
     
     print(f"Collecting samples from {num_batches} batches...")
-    for i, (data, _, _) in enumerate(dataloader):
+    for i, (data, _, _, _) in enumerate(dataloader):
         if i >= num_batches:
             break
         

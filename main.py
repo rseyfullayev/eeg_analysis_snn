@@ -34,7 +34,7 @@ def main():
     parser.add_argument('--coords_path', type=str, help='Path to electrodes coordinates .csv')
     parser.add_argument('--output_path', type=str, help='Destination folder for processed .npy files')
 
-    parser.add_argument('--calculate_stat', action='store_true', help='Calculate Fire Rate and Draw Distribution of dataset')
+    parser.add_argument('--calculate_stat', action='store_true', help='Draw Distribution of dataset')
     parser.add_argument('--find_repr', action='store_true', help='Find the most representative subject in the dataset')
     parser.add_argument('--audit_bio', action='store_true', help='Run Biological Audit (Model-Free)')
     parser.add_argument('--masks', type=int, help='Derive masks from Subject')
@@ -106,7 +106,7 @@ def main():
         print("Calculating Dataset Statistics...")
 
         analyze_distribution(dataloader)
-        calculate_optimal_firing_rate(dataset)
+        #calculate_optimal_firing_rate(dataset)
         generate_topology_proof(dataloader, torch.device("cuda"), class_names=[0,1,2,3,4])
 
         
