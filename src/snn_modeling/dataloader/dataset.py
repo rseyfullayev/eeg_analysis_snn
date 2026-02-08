@@ -6,6 +6,9 @@ from torch.utils.data import Dataset
 import torch.nn as nn
 import pandas as pd     
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from torch.utils.data.sampler import Sampler
+import random
+import collections
 
 class TopoMapper(nn.Module):
     def __init__(self, sensor_coords_df, grid_size=64, sigma=0.2, device='cuda'): # Using Azimuthal Equidistant Projection
@@ -66,7 +69,7 @@ class TopoMapper(nn.Module):
         return self.transform(tensor)
 
 class SWEEPDataset(Dataset):
-    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None):
+    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None):
         self.config = config
         self.split = split
         self.num_classes = config['data'].get('n_emotions', 5)
@@ -75,6 +78,7 @@ class SWEEPDataset(Dataset):
         self.samples_dir = os.path.join(self.dataset_path)
         self.preload = config['data'].get('preload_ram', False)
         self.train_size = config['data'].get('train_size', 0.8)
+        self.augmentations = augmentations
         self.cache = {}
 
         index_file = os.path.join(self.dataset_path, "index.csv")
@@ -164,8 +168,8 @@ class SWEEPDataset(Dataset):
     def __getitem__(self, idx):
         fname, label_idx, stats_key = self.samples[idx]
 
-        mean = self.stats_lookup[stats_key]['mean']
-        std = self.stats_lookup[stats_key]['std']
+        #mean = self.stats_lookup[stats_key]['mean']
+        #std = self.stats_lookup[stats_key]['std']
 
         
         file_path = os.path.join(self.samples_dir, fname)
@@ -177,9 +181,65 @@ class SWEEPDataset(Dataset):
             except Exception as e:
                 print(f"Error loading {fname}: {e}")
                 return torch.zeros(5, 32, 32, 32), torch.zeros(32, 32), 0
+        
+        mean = video.mean(dim=(2,3,4), keepdim=True)
+        std = video.std(dim=(2,3,4), keepdim=True) + 1e-8
 
-        video = (video - mean) / (std + 1e-8)
+
+        video = (video - mean) / (std)
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
         target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
+        if self.augmentations is not None and self.split == 'train':
+            video1 = self.augmentations(video)
+            video2 = self.augmentations(video)
+            return video1, video2, target_map, label_idx, fname
         
         return video, target_map, label_idx, fname
+    
+
+class PKSampler(Sampler):
+    def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None):
+        self.labels = [s[2] for s in dataset]
+        self.labels = torch.tensor(self.labels).long()
+        self.label_set = list(set(self.labels.numpy()))
+        
+        self.label_to_indices = {label: np.where(self.labels.numpy() == label)[0]
+                                 for label in self.label_set}
+        
+        for l in self.label_set:
+            np.random.shuffle(self.label_to_indices[l])
+            
+        self.used_label_indices_count = {label: 0 for label in self.label_set}
+        self.count = 0
+        self.n_classes = n_classes
+        
+        if n_samples_per_class is None:
+            self.n_samples_per_class = batch_size // n_classes
+        else:
+            self.n_samples_per_class = n_samples_per_class
+            
+        self.batch_size = self.n_samples_per_class * self.n_classes
+        self.dataset_len = len(dataset)
+
+    def __iter__(self):
+        self.count = 0
+        while self.count + self.batch_size < self.dataset_len:
+            classes = np.random.choice(self.label_set, self.n_classes, replace=False)
+            indices = []
+            
+            for class_ in classes:
+                indices.extend(self.label_to_indices[class_][
+                               self.used_label_indices_count[class_]:
+                               self.used_label_indices_count[class_] + self.n_samples_per_class])
+                
+                self.used_label_indices_count[class_] += self.n_samples_per_class
+                
+                if self.used_label_indices_count[class_] + self.n_samples_per_class > len(self.label_to_indices[class_]):
+                    np.random.shuffle(self.label_to_indices[class_])
+                    self.used_label_indices_count[class_] = 0
+                    
+            yield indices
+            self.count += self.batch_size
+
+    def __len__(self):
+        return self.dataset_len // self.batch_size

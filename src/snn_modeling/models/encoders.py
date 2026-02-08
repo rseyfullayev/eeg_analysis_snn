@@ -10,10 +10,11 @@ class SpikingResNet18Encoder(nn.Module):
         self.vit = vit
         self.stem = ConvSpiking(
             in_channels,
-            32,
+            20,
             kernel_size=3,
             stride=1,
             padding=1,
+            groups=5,
             bias=False,
             spike_model=nn.SiLU,
             use_norm=True)
@@ -22,14 +23,14 @@ class SpikingResNet18Encoder(nn.Module):
         if spike_model.__name__ == 'ALIF':
             no_norm_layer_params['batch_norm'] = False
 
-        self.layer1a = SpikingResBlock(32, 32, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
-        #self.layer1b = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
+        self.layer1a = SpikingResBlock(20, 32, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
+        self.layer1b = SpikingResBlock(32, 32, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
         
         self.layer2a = SpikingResBlock(32, 64, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **no_norm_layer_params)
         self.layer2b = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
         
-        self.layer3a = SpikingResBlock(64, 128, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **no_norm_layer_params)
-        self.layer3b = SpikingResBlock(128, 128, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
+        self.layer3a = SpikingResBlock(64, 64, p_drop=p_drop, use_norm = True, stride=2, spike_model=spike_model, **no_norm_layer_params)
+        #self.layer3b = SpikingResBlock(128, 128, p_drop=p_drop, use_norm = True, spike_model=spike_model, **no_norm_layer_params)
 
         last_layer_params = no_norm_layer_params.copy()
         if spike_model.__name__ == 'ALIF':
@@ -52,7 +53,7 @@ class SpikingResNet18Encoder(nn.Module):
         s2 = self.layer2a(s1)
         s2 = self.layer2b(s2)
         s3 = self.layer3a(s2)
-        s3 = self.layer3b(s3)
+        #s3 = self.layer3b(s3)
         #s4 = self.layer4a(s3)
         #s4 = self.layer4b(s4)
         #s4 = self.temporal(s4)

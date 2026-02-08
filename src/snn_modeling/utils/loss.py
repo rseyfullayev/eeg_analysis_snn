@@ -121,6 +121,10 @@ class ContrastiveLoss(nn.Module):
         # labels: (N,) with integer class labels
 
         device = features.device
+        if features.dim() == 3:
+            f1, f2 = torch.unbind(features, dim=1) 
+            features = torch.cat([f1, f2], dim=0)  # (2N, D)
+            labels = torch.cat([labels, labels], dim=0)  # (2N,)
         
         # 2. Cosine Similarity
         similarity_matrix = torch.matmul(features, features.T)

@@ -46,6 +46,17 @@ class GaussianNoise(nn.Module):
         noise = torch.randn_like(x) * self.std
         return x + noise
 
+class SignalJitter(nn.Module):
+    def __init__(self, lower=0.8, upper=1.2):
+        super().__init__()
+        self.lower = lower
+        self.upper = upper
+
+    def forward(self, x):
+        if not self.training: return x
+        jitter = torch.empty(1).uniform_(0.8, 1.2).to(x.device)
+        return x * jitter
+    
 class FrequencyDropout(nn.Module):
     """
     Randomly drops entire frequency bands (channels).
@@ -56,12 +67,24 @@ class FrequencyDropout(nn.Module):
 
     def forward(self, x):
         if not self.training: return x
-        x = x.permute(0,2,1,3,4)  # B,T,C,H,W -> B,C,T,H,W
         x = self.drop(x)
-        x = x.permute(0,2,1,3,4)  # B,C,T,H,W -> B,T,C,H,W
         return x
         
-        
+class TemporalMasking(nn.Module):
+    """
+    Randomly masks out entire frames in the temporal dimension.
+    """
+    def __init__(self, p=0.2):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        if not self.training: return x
+        _,T,_,_ = x.shape
+        if torch.rand(1) < self.time_mask_prob:
+            n_msk = torch.randint(1,4,(1,)).item()
+            ind = torch.randperm(T)[:n_msk]   
+            x[:,ind,:,:] = 0.0
 
 class VideoRandomErasing(nn.Module):
     """
@@ -108,4 +131,4 @@ class TemporalMix(nn.Module):
                 x_mixed[idxs, t] = x[shuffled_indices, t]
 
         return x_mixed, y
-    
+

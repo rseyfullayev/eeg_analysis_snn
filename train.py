@@ -1,10 +1,13 @@
+# CITE https://github.com/HobbitLong/SupContrast/tree/master
+
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss
-from src.snn_modeling.dataloader.dataset import SWEEPDataset
+from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss
+from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
 import re
 import os
 import gc
@@ -20,7 +23,7 @@ import numpy as np
 
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
-from src.snn_modeling.utils.augmentations import TemporalMix, GaussianNoise, FrequencyDropout, VideoRandomErasing, DyTNorm
+from src.snn_modeling.utils.augmentations import TemporalMix, GaussianNoise, FrequencyDropout, SignalJitter, TemporalMasking
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.models.encoders import SpikingResNet18Encoder
@@ -47,118 +50,71 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
 
 
 def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
+
     model.eval()
     val_loss = 0
-    correct = 0 
-    total = 0 
+    correct = 0
+    total = 0
     
     all_preds = []
     all_targets = []
+
     tp_tot, fp_tot, fn_tot, tn_tot = 0, 0, 0, 0
 
-    vote_storage = []
-    fname_pattern = re.compile(r"^(.*)_s(\d+)_lbl(\d+)\.pt$")
-
-    val_aug = nn.Sequential(DyTNorm(gain=3.0)) 
-    
     val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
-    
     with torch.no_grad():
-        for batch_idx, (inputs, targets, labels, filename) in enumerate(val_loop):
-            inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
-            
-            # Data Prep
-            inputs = val_aug(inputs)
-            B, C, T, H, W = inputs.shape
-            inputs = inputs.permute(2, 0, 1, 3, 4) # [T, B, C, H, W]
+        for batch_idx, (inputs, targets, labels) in enumerate(val_loop):
+            inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
+            B,C,T,H,W = inputs.shape
+            inputs = inputs.permute(2, 0, 1, 3, 4)
             
             outputs = model(inputs)
-            
-            # --- BRANCH 1: CLASSIFICATION ONLY ---
             if only_classification:
-                #_,C,H,W = outputs.shape
-                loss = criterion(outputs, labels)#.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
-                energy_logits = outputs#.view(T,B,C,H,W).mean(dim=[0, 3, 4])
-
+                _,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
+                loss = criterion(outputs, labels) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
+                #energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0,3,4])
             else:
                 loss = criterion(outputs, targets, labels)
+                B, C, H, W = outputs.shape
                 
-                # Segmentation Metrics
-                probs_map = torch.softmax(outputs, dim=1)
-                preds_map = torch.argmax(probs_map, dim=1)
-                
-                # Calculate metrics using SMP
-                tp, fp, fn, tn = smp.metrics.get_stats(preds_map, targets, mode='multiclass', num_classes=6)
-                tp_tot += tp[:, 1:].sum().item() # Ignore background class 0
+                probs = torch.softmax(outputs, dim=1)
+                energy_logits = probs[:, 1:, :, :].sum(dim=(2, 3))
+                preds_map = torch.argmax(probs, dim=1)
+                tp, fp, fn, tn = smp.metrics.get_stats(
+                    preds_map,
+                    targets, 
+                    mode='multiclass', 
+                    num_classes=6
+                )
+                tp_tot += tp[:, 1:].sum().item()
                 fp_tot += fp[:, 1:].sum().item()
                 fn_tot += fn[:, 1:].sum().item()
                 tn_tot += tn[:, 1:].sum().item()
+                preds = energy_logits.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
 
-                energy_logits = probs_map[:, 1:, :, :].sum(dim=(2, 3))
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(labels.cpu().numpy())
+
 
             val_loss += loss.item()
             val_loop.set_postfix(loss=loss.item())
             
-            preds = energy_logits.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(labels.cpu().numpy())
-
-            batch_probs = torch.softmax(energy_logits, dim=1).cpu().numpy()
-            batch_labels = labels.cpu().numpy()
             
-            for i in range(len(filename)):
-                fname_str = filename[i]
-                match = fname_pattern.match(fname_str)
-                if match:
-                    vote_storage.append({
-                        'session': match.group(1), 
-                        's_idx': int(match.group(2)),
-                        'true_label': batch_labels[i],
-                        'probs': batch_probs[i]
-                    })
-
-            del inputs, labels, outputs, loss, preds, energy_logits
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-    vote_storage.sort(key=lambda x: x['s_idx'])
-    
-    trial_correct = 0
-    trial_total = 0
-    
-    if len(vote_storage) > 0:
-        curr_probs = []
-        curr_label = vote_storage[0]['true_label']
-        curr_session = vote_storage[0]['session']
-        
-        for item in vote_storage:
-            if (item['true_label'] != curr_label) or (item['session'] != curr_session):
-                if curr_probs:
-                    avg_probs = np.mean(curr_probs, axis=0)
-                    final_pred = np.argmax(avg_probs)
-                    if final_pred == curr_label:
-                        trial_correct += 1
-                    trial_total += 1
+            
+            # Cleanup tensors to free memory
+            del inputs, labels, outputs, loss, preds
+            if not only_classification:
+                del preds_map, targets, tp, fp, fn, tn
                 
-                curr_probs = []
-                curr_label = item['true_label']
-                curr_session = item['session']
+    # Clear CUDA cache after validation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+                
             
-            curr_probs.append(item['probs'])
-        
-        if curr_probs:
-            avg_probs = np.mean(curr_probs, axis=0)
-            final_pred = np.argmax(avg_probs)
-            if final_pred == curr_label:
-                trial_correct += 1
-            trial_total += 1
-            
-    trial_acc = trial_correct / (trial_total + 1e-7)
-
     avg_loss = val_loss / len(val_loader)
-    window_acc = correct / total
+    accuracy = correct / total
     balanced_acc = balanced_accuracy_score(all_targets, all_preds)
     
     eps = 1e-7
@@ -167,7 +123,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     precision = tp_tot / (tp_tot + fp_tot + eps)
     recall = tp_tot / (tp_tot + fn_tot + eps)
 
-    return avg_loss, window_acc, trial_acc, balanced_acc, dice_score, iou_score, precision, recall
+    return avg_loss, accuracy, balanced_acc, dice_score, iou_score, precision, recall
 
 def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
 
@@ -304,14 +260,8 @@ def training_loop(phase,
                   checkpoint_dir,
                   freeze_bn=False):
     
-    train_aug = nn.Sequential(
-        DyTNorm(gain=3.0),
-        GaussianNoise(std=0.05),
-        FrequencyDropout(p=0.2),
-        #VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
-        
-    )
-    temp_mix = TemporalMix()
+    
+    #temp_mix = TemporalMix()
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -321,18 +271,21 @@ def training_loop(phase,
         train_loss = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, (inputs,  targets, targets_c, _) in enumerate(train_loop):
-            
-            inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
             if phase == 1:
-                with torch.no_grad():
-                    inputs = train_aug(inputs)
-                    #inputs, targets_c = temp_mix(inputs, targets_c)
+                inp1, inp2 = inputs
+                inp1, inp2 = inp1.to(device), inp2.to(device)
+                inputs = torch.cat([inp1, inp2], dim=0)
+            inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
+            
             B,C,T,H,W = inputs.shape
     
             inputs = inputs.permute(2, 0, 1, 3, 4)
             outputs = model(inputs)
+
             if phase == 1:
-                loss = loss_fn(outputs, targets_c) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
+                f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                loss = loss_fn(features, targets_c) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
             else:
                 loss = loss_fn(outputs, targets, targets_c)
            
@@ -420,7 +373,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         time_steps=config['data'].get('num_timesteps', 16),
     )"""
 
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+    loss_fn = ContrastiveLoss() #nn.CrossEntropyLoss(label_smoothing=0.1)
 
     loss_fn.to(device)
 
@@ -581,7 +534,14 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     density = masks.sum() / masks.numel()
     print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
 
-
+    train_aug = nn.Sequential(
+        GaussianNoise(std=0.05),
+        FrequencyDropout(p=0.2),
+        TemporalMasking(p=0.3),
+        SignalJitter(lower=0.8, upper=1.2),
+        #VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
+        
+    )
 
     train_set = SWEEPDataset(
         config,
@@ -589,7 +549,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         #experiment=True,
         loso=loso,
         subj=subj,
-        prototypes=masks
+        prototypes=masks,
+        augmentations=train_aug
     )
     
     val_set = SWEEPDataset(
@@ -607,6 +568,9 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     
     train_loader = DataLoader(train_set, 
                               batch_size=config['training']['batch_size'],
+                              batch_sampler=PKSampler(train_set, 
+                                                      batch_size=config['training']['batch_size'], 
+                                                      n_classes=config['model'].get('num_classes', 5)),
                               shuffle=True, 
                               num_workers=num_workers,
                               prefetch_factor=prefetch,
