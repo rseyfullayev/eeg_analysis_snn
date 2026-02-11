@@ -24,9 +24,10 @@ class TopoMapper(nn.Module):
         else:
             print("   Detected RADIANS in coordinates.")
             theta = theta
-        r = sensor_coords_df['radius'].values
+        r = sensor_coords_df['radius'].values.astype(np.float32)
 
         r = r / (np.max(np.abs(r)) + 1e-8)
+        r = r * 0.95  # Scale to fit within unit circle with margin
        
         x = r * np.cos(theta)
         y = r * np.sin(theta)
