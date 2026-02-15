@@ -49,7 +49,7 @@ class SpikingResBlock(nn.Module):
 
         )
         self.tsm = TemporalShift(8)
-        self.drop = TimeDistributed(nn.Dropout2d(p=p_drop))
+        self.drop = TemporalOrderFix(nn.Dropout3d(p=p_drop))
 
         if stride != 1 or in_channels != out_channels:
             self.downsample = ConvSpiking(in_channels, out_channels, kernel_size=1, stride=stride, bias=True, spike_model=nn.Identity, use_norm=True) #TimeDistributed(nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=True))
