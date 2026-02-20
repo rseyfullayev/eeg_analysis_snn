@@ -15,7 +15,7 @@ class WaveletModule(nn.Module):
         center_freq = 1.0 
         self.scales = (center_freq * fs) / self.freqs
  
-        B = 1.5
+        B = 3.0
         kernels = []
         for scale in self.scales:
             sigma = scale 
@@ -29,6 +29,13 @@ class WaveletModule(nn.Module):
             kernels.append(torch.tensor(wavelet, dtype=torch.complex64))
 
         max_len = max([k.shape[0] for k in kernels])
+
+        if max_len % 2 == 1:
+            max_len += 1
+
+        self.padding = max_len // 2
+
+
         self.max_kernel_len = max_len
         
         self.weights = torch.zeros(len(self.freqs), 1, max_len, dtype=torch.complex64)
@@ -58,11 +65,17 @@ class WaveletModule(nn.Module):
 
     def forward(self, eeg_data):
 
-        mean = eeg_data.mean(dim=-1, keepdim=True)
-        eeg_data = eeg_data - mean
-        std = eeg_data.std(dim=-1, keepdim=True)
-        eeg_data = torch.clamp(eeg_data, min=-6*std, max=6*std)
-        
+        median = eeg_data.median(dim=-1, keepdim=True).values
+        eeg_data = eeg_data - median
+
+        q1 = torch.quantile(eeg_data, 0.25, dim=-1, keepdim=True)
+        q3 = torch.quantile(eeg_data, 0.75, dim=-1, keepdim=True)
+        iqr = q3 - q1
+
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        eeg_data = torch.clamp(eeg_data, min=lower, max=upper)
+
         B, C, T = eeg_data.shape
         x = eeg_data.reshape(B * C, 1, T)
         

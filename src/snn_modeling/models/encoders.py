@@ -60,11 +60,3 @@ class SpikingResNet18Encoder(nn.Module):
         return s4, [s1, s2, s3]
     
 
-
-class ResNet18Encoder(nn.Module):
-    def __init__(self, in_channels):
-        super(ResNet18Encoder, self).__init__()
-    def forward(self, x):
-        raise NotImplementedError("This is a placeholder for the ANN ResNet18 Encoder.")
-
-# TODO: Implement ResNet50Encoder only if ResNet34Encoder is not sufficient for the task (BottleneckBlocks needed)
