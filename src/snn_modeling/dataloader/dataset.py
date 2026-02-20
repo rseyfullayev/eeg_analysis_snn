@@ -185,11 +185,11 @@ class SWEEPDataset(Dataset):
                 print(f"Error loading {fname}: {e}")
                 return torch.zeros(5, 32, 32, 32), torch.zeros(32, 32), 0
         
-        mean = video.mean(dim=(2,3,4), keepdim=True)
-        std = video.std(dim=(2,3,4), keepdim=True) + 1e-8
+        #mean = video.mean(dim=(2,3,4), keepdim=True)
+        #std = video.std(dim=(2,3,4), keepdim=True) + 1e-8
 
 
-        video = (video - mean) / (std)
+        #video = (video - mean) / (std)
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
         target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
         if self.augmentations is not None and self.split == 'train':

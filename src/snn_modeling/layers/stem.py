@@ -34,7 +34,7 @@ class ProjectionHead(nn.Module):
         self.avg_pool = TimeDistributed(nn.AdaptiveAvgPool2d((1,1)))
         self.supcon_head = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, kernel_size=1),
-            nn.BatchN(feature_dim, affine=True),
+            nn.BatchNorm2d(feature_dim, affine=True),
             nn.SiLU(inplace=True),
             nn.Conv2d(feature_dim, head_dim, kernel_size=1)
         )

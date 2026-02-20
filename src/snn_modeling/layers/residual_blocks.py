@@ -1,6 +1,9 @@
 import torch.nn as nn
 import snntorch as snn
 from .neurons import TimeDistributed, TemporalShift, TemporalOrderFix
+from torchvision.ops import StochasticDepth
+
+
 class ConvSpiking(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, groups=1, bias=False, spike_model=snn.Leaky, use_norm = False, **neuron_params):
         super(ConvSpiking, self).__init__()
@@ -20,7 +23,7 @@ class ConvSpiking(nn.Module):
         return x
 
 class SpikingResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, p_drop=0.2, spike_model=snn.Leaky, use_norm = False, **neuron_params):
+    def __init__(self, in_channels, out_channels, stride=1, p_drop=0.2, p_path=0.1, spike_model=snn.Leaky, use_norm = False, **neuron_params):
         super(SpikingResBlock, self).__init__()
 
         groups = in_channels if in_channels == out_channels else 1
@@ -60,6 +63,7 @@ class SpikingResBlock(nn.Module):
             layer_params['num_channels'] = out_channels
             
         self.final_spike = spike_model(**layer_params)
+        self.drop_path = StochasticDepth(p=p_path, mode='row')
 
     def forward(self, x):
         
@@ -69,7 +73,8 @@ class SpikingResBlock(nn.Module):
         out = self.block1(x)
         out = self.block2(out)
         out = self.drop(out)
-        out += identity
+        out = self.drop_path(out) + identity
+        
         out = self.final_spike(out)
             
         return out

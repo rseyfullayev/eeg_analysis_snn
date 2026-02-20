@@ -65,7 +65,7 @@ class SpikingResNetClassifier(nn.Module):
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
-        self.classifier = ProjectionHead(64, 64) #ClassifierHead(128, num_classes)
+        self.classifier = ProjectionHead(128, 64) #ClassifierHead(128, num_classes)
         
         
 

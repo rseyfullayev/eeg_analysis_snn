@@ -122,9 +122,9 @@ class TemporalOrderFix(nn.Module):
 
     def forward(self, x):
         if x.dim() == 5:
-            x_permuted = x.permute(1, 2, 0, 3, 4)  # B, C, T, H, W
+            x_permuted = x.permute(1, 2, 0, 3, 4).contiguous()  # B, C, T, H, W
             x_permuted = self.module(x_permuted)
-            x_permuted = x_permuted.permute(2, 0, 1, 3, 4)  # T, B, C, H, W
+            x_permuted = x_permuted.permute(2, 0, 1, 3, 4).contiguous()  # T, B, C, H, W
             return x_permuted
         else:
             return self.module(x)

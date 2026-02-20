@@ -88,21 +88,29 @@ def run_data_setup(config=None):
         raw_eeg = raw_eeg.to(device)
         if raw_eeg.shape[1] < WINDOW_SIZE: continue
 
-        feats = wavelet(raw_eeg)
-        feats = torch.log1p(feats)
+        with torch.no_grad():
+            feats = wavelet(raw_eeg)
+            feats = torch.log1p(feats)
+            median = feats.median(dim=-1, keepdim=True).values
+            q1 = torch.quantile(feats, 0.25, dim=-1, keepdim=True)
+            q3 = torch.quantile(feats, 0.75, dim=-1, keepdim=True)
+            iqr = q3 - q1 + 1e-6
 
-        windows = feats.unfold(1, WINDOW_SIZE, STEP_SIZE)
+            feats = (feats - median) / iqr
+            feats = torch.clamp(feats, -4.0, 4.0) # 1 iqr is typically ~1.5 std, so this is roughly 6 stds from the median, which should be safe for outliers
 
-        windows = windows.permute(1, 0, 2)
+            windows = feats.unfold(dimension=-1, size=WINDOW_SIZE, step=STEP_SIZE)
 
-        windows = F.interpolate(
-            windows,
-            size=TARGET_STEPS,
-            mode='linear',
-            align_corners=False
-        )
+            windows = windows.permute(3, 1, 2, 4).squeeze(0)
+            W, C, B, WS = windows.shape
 
-        full_batch_tensor = windows
+            win_flat = windows.reshape(W, C * B, WS)
+            win_flat = F.interpolate(win_flat, 
+                                     size=TARGET_STEPS, 
+                                     mode='linear', 
+                                     align_corners=False)
+            
+            full_batch_tensor = win_flat.reshape(W, C, B, TARGET_STEPS)
 
         if use_sampling_limit:
             if emotion_id not in emotion_map: continue
@@ -120,17 +128,19 @@ def run_data_setup(config=None):
             
             with torch.no_grad():
 
+                '''
                 # Collect Stats (Per Session/Subject)
                 if len(stats_reservoir[stats_key]) < RESERVOIR_LIMIT:
                     flat_data = feats.flatten().cpu().numpy()
                     indices = np.random.randint(0, len(flat_data), size=min(100, len(flat_data)))
                     stats_reservoir[stats_key].extend(flat_data[indices])
+                '''
 
                 # Topo & Save
-                video_batch = topo(full_batch_tensor)
+                video_batch = topo(batch_tensor)
                 video_batch = torch.clamp(video_batch, min=0.0, max=50.0)  # 10^50 is impossible thus clipping
-
                 video_batch = video_batch.cpu()
+
                 for k in range(video_batch.shape[0]):
                     # Unique filename for the window
                     fname = f"{subject_id}_{trial_id}_s{sample_global_id}.pt"
@@ -145,6 +155,8 @@ def run_data_setup(config=None):
                 
             torch.cuda.empty_cache()
 
+
+    '''
     # --- SAVE ---
     print("Computing Stats...")
     final_stats = {}
@@ -158,6 +170,7 @@ def run_data_setup(config=None):
 
     with open(os.path.join(OUTPUT_FOLDER, "stats.json"), 'w') as f:
         json.dump(final_stats, f, indent=4)
+    '''
 
     with open(os.path.join(OUTPUT_FOLDER, "index.csv"), 'w') as f:
 

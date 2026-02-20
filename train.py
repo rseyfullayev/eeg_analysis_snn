@@ -539,7 +539,6 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         FrequencyDropout(p=0.2),
         TemporalMasking(p=0.3),
         SignalJitter(lower=0.8, upper=1.2),
-        #VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
         
     )
 

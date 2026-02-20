@@ -11,7 +11,7 @@ class WaveletModule(nn.Module):
         
         self.freqs = np.arange(1, 51, 0.5)
         
-        # 2. Define Scales (cmor1.5-1.0)
+        # Define Scales (Center Freq = 1.0, B = 3.0)
         center_freq = 1.0 
         self.scales = (center_freq * fs) / self.freqs
  
@@ -30,7 +30,7 @@ class WaveletModule(nn.Module):
 
         max_len = max([k.shape[0] for k in kernels])
 
-        if max_len % 2 == 1:
+        if max_len % 2 == 0:
             max_len += 1
 
         self.padding = max_len // 2
@@ -64,18 +64,7 @@ class WaveletModule(nn.Module):
         return indices
 
     def forward(self, eeg_data):
-
-        median = eeg_data.median(dim=-1, keepdim=True).values
-        eeg_data = eeg_data - median
-
-        q1 = torch.quantile(eeg_data, 0.25, dim=-1, keepdim=True)
-        q3 = torch.quantile(eeg_data, 0.75, dim=-1, keepdim=True)
-        iqr = q3 - q1
-
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        eeg_data = torch.clamp(eeg_data, min=lower, max=upper)
-
+        
         if eeg_data.dim() == 2:
             eeg_data = eeg_data.unsqueeze(0)
 
@@ -83,28 +72,12 @@ class WaveletModule(nn.Module):
         x = eeg_data.reshape(B * C, 1, T)
         
         
-        required_len = self.max_kernel_len
-        pad_needed = max(0, required_len - T)
-        total_pad = pad_needed + (self.max_kernel_len // 2) * 2
-        
-        if total_pad > 0:
-            x = F.pad(x, (total_pad//2, total_pad - total_pad//2), mode='replicate')
+        x = F.pad(x, (self.padding, self.padding), mode='reflect')
 
         # 1. CWT Convolution
         # result: (Batch*Channels, Freqs, Time_Padded)
         cwt_complex = F.conv1d(x.to(dtype=torch.complex64), self.weights)
         #print(cwt_complex.shape)
-        # 3. Crop back to original time T
-        # The convolution reduces size by kernel_len - 1
-        # We need to center-crop the result to match input T
-
-
-
-        curr_len = cwt_complex.shape[-1]
-        start = (curr_len - T) // 2
-        cwt_complex = cwt_complex[..., start : start + T]
-
-
 
         # 4. Power & Band Integration
         power = cwt_complex.abs().pow(2) 
@@ -116,12 +89,8 @@ class WaveletModule(nn.Module):
         
         out = torch.stack(band_powers, dim=1) # (B*C, 5, Time)
         
-        # 5. Resample
-        out = F.interpolate(out, size=self.output_steps, mode='linear', align_corners=False)
-        
         # 6. Final Shape
-        out = out.view(B, C, 5, self.output_steps)
-        out = out.permute(0, 2, 3, 1) # (B, 5, 32, 62)
+        out = out.view(B, C, 5, T)
       
             
         return out
