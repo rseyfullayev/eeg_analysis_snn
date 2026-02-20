@@ -8,6 +8,8 @@ from data_process.data_loader import DatasetReader
 from data_process.wavelet import WaveletModule
 from src.snn_modeling.dataloader.dataset import TopoMapper
 import json
+import torch.nn.functional as F
+
 SELECTED_EMOTIONS = [0, 1, 2, 3, 4] 
 
 def parse_metadata(filename):
@@ -85,8 +87,22 @@ def run_data_setup(config=None):
 
         raw_eeg = raw_eeg.to(device)
         if raw_eeg.shape[1] < WINDOW_SIZE: continue
-        windows = raw_eeg.unfold(1, WINDOW_SIZE, STEP_SIZE)
-        full_batch_tensor = windows.permute(1, 0, 2)
+
+        feats = wavelet(raw_eeg)
+        feats = torch.log1p(feats)
+
+        windows = feats.unfold(1, WINDOW_SIZE, STEP_SIZE)
+
+        windows = windows.permute(1, 0, 2)
+
+        windows = F.interpolate(
+            windows,
+            size=TARGET_STEPS,
+            mode='linear',
+            align_corners=False
+        )
+
+        full_batch_tensor = windows
 
         if use_sampling_limit:
             if emotion_id not in emotion_map: continue
@@ -103,10 +119,7 @@ def run_data_setup(config=None):
             batch_tensor = full_batch_tensor[i : i + GPU_BATCH_SIZE]
             
             with torch.no_grad():
-       
-                feats = wavelet(batch_tensor) 
-                feats = torch.log1p(feats) 
-                
+
                 # Collect Stats (Per Session/Subject)
                 if len(stats_reservoir[stats_key]) < RESERVOIR_LIMIT:
                     flat_data = feats.flatten().cpu().numpy()
@@ -114,7 +127,7 @@ def run_data_setup(config=None):
                     stats_reservoir[stats_key].extend(flat_data[indices])
 
                 # Topo & Save
-                video_batch = topo(feats)
+                video_batch = topo(full_batch_tensor)
                 video_batch = torch.clamp(video_batch, min=0.0, max=50.0)  # 10^50 is impossible thus clipping
 
                 video_batch = video_batch.cpu()

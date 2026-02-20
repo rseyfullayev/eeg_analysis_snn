@@ -76,6 +76,9 @@ class WaveletModule(nn.Module):
         upper = q3 + 1.5 * iqr
         eeg_data = torch.clamp(eeg_data, min=lower, max=upper)
 
+        if eeg_data.dim() == 2:
+            eeg_data = eeg_data.unsqueeze(0)
+
         B, C, T = eeg_data.shape
         x = eeg_data.reshape(B * C, 1, T)
         
@@ -94,10 +97,15 @@ class WaveletModule(nn.Module):
         # 3. Crop back to original time T
         # The convolution reduces size by kernel_len - 1
         # We need to center-crop the result to match input T
+
+
+
         curr_len = cwt_complex.shape[-1]
         start = (curr_len - T) // 2
         cwt_complex = cwt_complex[..., start : start + T]
-        
+
+
+
         # 4. Power & Band Integration
         power = cwt_complex.abs().pow(2) 
         
