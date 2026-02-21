@@ -67,6 +67,7 @@ class FrequencyDropout(nn.Module):
 
     def forward(self, x):
         if not self.training: return x
+        # Dropout3d expects input of shape [B, C, T, H, W], so we need to permute
         x = self.drop(x)
         return x
         

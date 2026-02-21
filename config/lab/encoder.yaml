@@ -6,7 +6,7 @@ data:
   save_path: "/media/temporaryuser3/STORAGE/ERO/"
   dataset_mode: "eeg"
   encoding_method: "direct"
-  num_timesteps: 16
+  num_timesteps: 32
   window_size:  200
   sampling_rate: 200
   step_size: 100
