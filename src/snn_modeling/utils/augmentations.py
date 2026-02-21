@@ -86,6 +86,7 @@ class TemporalMasking(nn.Module):
             n_msk = torch.randint(1,4,(1,)).item()
             ind = torch.randperm(T)[:n_msk]   
             x[:,ind,:,:] = 0.0
+        return x
 
 class VideoRandomErasing(nn.Module):
     """
