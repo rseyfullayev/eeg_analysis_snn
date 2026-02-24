@@ -35,15 +35,15 @@ class ProjectionHead(nn.Module):
         self.supcon_head = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, kernel_size=1),
             nn.BatchNorm2d(feature_dim, affine=True),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
             nn.Conv2d(feature_dim, head_dim, kernel_size=1)
         )
     def forward(self, features):
         T, B, C, H, W = features.shape
         features = self.avg_pool(features).mean(dim=0)  # B x C x 1 x 1
 
-        proj = self.supcon_head(features) + 1e-6 
-        embedding = F.normalize(proj.view(B, -1), dim=1)
+        proj = self.supcon_head(features)
+        embedding = F.normalize(proj.view(B, -1), dim=1, eps=1e-6)
         return embedding
     
 class TemporalViTBlock(nn.Module):

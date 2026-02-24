@@ -545,11 +545,11 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
 
     train_aug = nn.Sequential(
-        GaussianNoise(std=0.05),
-        FrequencyDropout(p=0.2),
-        VideoTemporalMasking(p=0.3),
-        SignalJitter(lower=0.8, upper=1.2),
-        VideoRandomErasing(p=0.3)
+        GaussianNoise(std=0.01),
+        FrequencyDropout(p=0.1),
+        VideoTemporalMasking(p=0.1, max_mask_len=2),
+        #SignalJitter(lower=0.8, upper=1.2),
+        #VideoRandomErasing(p=0.3)
     )
 
     train_set = SWEEPDataset(

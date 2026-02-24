@@ -98,26 +98,24 @@ class GSPLoss(nn.Module):
 class ContrastiveLoss(nn.Module):
 
     """
+    Supervised Contrastive Loss with temperature scaling.
+    
     Reference:
-    @misc{kim2025temperaturefree,
-        title={Temperature-Free Loss Function for Contrastive Learning}, 
-        author={Bum Jun Kim and Sang Woo Kim},
-        year={2025},
-        eprint={2501.17683},
+    @misc{khosla2020supervised,
+        title={Supervised Contrastive Learning}, 
+        author={Prannay Khosla et al.},
+        year={2020},
+        eprint={2004.11362},
         archivePrefix={arXiv},
-        primaryClass={cs.LG},
-        url={https://arxiv.org/abs/2501.17683}
     }
-    Implementation Note:
-    Replaces standard exp(sim / temp) with exp(arctanh(sim)) to prevent 
-    gradient vanishing on well-clustered embeddings.
     """
     
-    def __init__(self):
+    def __init__(self, temperature=0.07):
         super(ContrastiveLoss, self).__init__()
+        self.temperature = temperature
 
     def forward(self, features, labels):
-        # features: (N, D) where N is batch size and D is feature dimension. Normalized.
+        # features: (N, 2, D) or (N, D) where N is batch size and D is feature dimension.
         # labels: (N,) with integer class labels
 
         device = features.device
@@ -126,44 +124,36 @@ class ContrastiveLoss(nn.Module):
             features = torch.cat([f1, f2], dim=0)  # (2N, D)
             labels = torch.cat([labels, labels], dim=0)  # (2N,)
         
-        # 2. Cosine Similarity
-        similarity_matrix = torch.matmul(features, features.T)
+        # Normalize features
+        features = F.normalize(features, dim=1, eps=1e-6)
         
-        # 3. Arctanh warping
-        # Clamp to avoid infinity at exactly 1.0 or -1.0
-        # arctanh(x) = 0.5 * log((1+x)/(1-x))
-
-        eps = 1e-6
-        sim_clamped = torch.clamp(similarity_matrix, -1 + eps, 1 - eps)
-        logits = 0.5 * torch.log((1 + sim_clamped) / (1 - sim_clamped))
+        # Cosine similarity scaled by temperature
+        similarity_matrix = torch.matmul(features, features.T) / self.temperature
         
-        
-        # Create Mask
+        # Create positive mask (same class)
         labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, labels.T).float().to(device)
         
-        # Remove self-contrast
-        logits_mask = torch.scatter(
-            torch.ones_like(mask), 
-            1, 
-            torch.arange(mask.shape[0]).view(-1, 1).to(device), 
-            0
-        )
+        # Remove self-contrast (diagonal)
+        batch_size = features.shape[0]
+        logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=device)
         mask = mask * logits_mask
         
-        # Numerical Stability for LogSumExp
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits = logits - logits_max.detach()
+        # Numerical Stability: subtract max for LogSumExp
+        logits_max, _ = torch.max(similarity_matrix * logits_mask, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
         
+        # Compute log softmax
         exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
         
-        # Mean Log-Likelihood
+        # Mean log-likelihood over positives
         mask_sum = mask.sum(1)
-        mask_sum = torch.where(mask_sum == 0, torch.ones_like(mask_sum), mask_sum)
+        # Avoid division by zero for samples with no positives
+        mask_sum = torch.clamp(mask_sum, min=1.0)
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
         
-        loss = - mean_log_prob_pos.mean()
+        loss = -mean_log_prob_pos.mean()
         return loss
 
 

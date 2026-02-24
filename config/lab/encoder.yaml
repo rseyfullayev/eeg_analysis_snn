@@ -33,7 +33,7 @@ model:
   encoder_mode: "cnn"
   in_channels: 5
   num_classes: 5
-  dropout: 0.5
+  dropout: 0.2
   vit_dropout: 0.3
 
 neuron_params:
@@ -56,7 +56,7 @@ training:
   phase_2_epochs: 50
   phase_3_epochs: 50
   batch_size: 64
-  learning_rate: 0.001
+  learning_rate: 0.0001
   weight_decay: 0.01
   accumulation_steps: 1
 
