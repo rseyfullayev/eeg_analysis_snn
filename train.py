@@ -23,7 +23,7 @@ import numpy as np
 
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
-from src.snn_modeling.utils.augmentations import TemporalMix, GaussianNoise, FrequencyDropout, SignalJitter, TemporalMasking
+from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.models.encoders import SpikingResNet18Encoder
@@ -537,9 +537,9 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     train_aug = nn.Sequential(
         GaussianNoise(std=0.05),
         FrequencyDropout(p=0.2),
-        TemporalMasking(p=0.3),
+        VideoTemporalMasking(p=0.3),
         SignalJitter(lower=0.8, upper=1.2),
-        
+        VideoRandomErasing(p=0.3)
     )
 
     train_set = SWEEPDataset(

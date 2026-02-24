@@ -80,33 +80,36 @@ class FrequencyDropout(nn.Module):
             mask = mask.view(1, C, 1, 1)
         return x * mask
 
-class TemporalMasking(nn.Module):
+class VideoTemporalMasking(nn.Module):
     """
-    Randomly masks out entire frames in the temporal dimension.
-    Input: [B, T, C, H, W] or [T, C, H, W]
+    Masks out a CONTIGUOUS block of frames.
+    Simulates a sustained sensor disconnect or a wiped-out artifact.
+    Input shape: [B, T, C, H, W] or [T, C, H, W]
     """
-    def __init__(self, p=0.2):
+    def __init__(self, p=0.3, max_mask_len=5):
         super().__init__()
         self.p = p
+        self.max_mask_len = max_mask_len
 
     def forward(self, x):
         if not self.training: return x
-        if x.dim() == 5:
-            # x: [B, T, C, H, W]
-            T = x.shape[1]
-            if torch.rand(1) < self.p:
-                x = x.clone()
-                n_msk = torch.randint(1, 4, (1,)).item()
-                ind = torch.randperm(T)[:n_msk]
-                x[:, ind, :, :, :] = 0.0
-        else:
-            # x: [T, C, H, W]
-            T = x.shape[0]
-            if torch.rand(1) < self.p:
-                x = x.clone()
-                n_msk = torch.randint(1, 4, (1,)).item()
-                ind = torch.randperm(T)[:n_msk]
-                x[ind, :, :, :] = 0.0
+        
+        if torch.rand(1).item() < self.p:
+            x = x.clone()  # Safe for SupCon multi-view
+            
+            if x.dim() == 5:
+                # x: [B, T, C, H, W]
+                T = x.shape[1]
+                mask_len = torch.randint(1, min(self.max_mask_len + 1, T), (1,)).item()
+                start_idx = torch.randint(0, T - mask_len + 1, (1,)).item()
+                x[:, start_idx : start_idx + mask_len, :, :, :] = 0.0
+            else:
+                # x: [T, C, H, W]
+                T = x.shape[0]
+                mask_len = torch.randint(1, min(self.max_mask_len + 1, T), (1,)).item()
+                start_idx = torch.randint(0, T - mask_len + 1, (1,)).item()
+                x[start_idx : start_idx + mask_len, :, :, :] = 0.0
+            
         return x
 
 
@@ -117,22 +120,26 @@ class VideoRandomErasing(nn.Module):
     """
     def __init__(self, p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)):
         super().__init__()
-        self.eraser = RandomErasing(p=p, scale=scale, ratio=ratio, value=0, inplace=False)
+        self.p = p
+        self.eraser = RandomErasing(p=1.0, scale=scale, ratio=ratio, value=0, inplace=False)
 
     def forward(self, x):
         if not self.training: return x
-        
-        if x.dim() == 5:
-            # x: [B, T, C, H, W]
-            B, T, C, H, W = x.shape
-            x_flat = x.reshape(B * T, C, H, W)
-            out = self.eraser(x_flat)
-            return out.view(B, T, C, H, W)
-        else:
-            # x: [T, C, H, W]
-            T, C, H, W = x.shape
-            out = self.eraser(x)
-            return out
+        if torch.rand(1).item() < self.p:
+            if x.dim() == 5: # x: [B, T, C, H, W]
+                frame_0 = x[:, 0:1].clone()   
+            else: # x: [T, C, H, W]
+                frame_0 = x[0:1].clone() 
+
+            erased_frame = self.eraser(frame_0) 
+            
+            # Detect erased region by comparing before/after (not just == 0)
+            mask = (frame_0 != erased_frame)
+            
+            x = x.clone()
+            x = x.masked_fill_(mask, 0.0)
+
+        return x
 
 class TemporalMix(nn.Module):
     """
