@@ -453,7 +453,7 @@ def initialize_network(model, train_loader, device):
 
     apply_kaiming_init(model)
     run_bn_warmup(model, train_loader, device)
-    initialize_head(model.classifier.head)
+    #initialize_head(model.classifier.head)
     if model.encoder.vit:
         initialize_vit(model.encoder.temporal)
     """if hasattr(model, 'decoder') and model.decoder.recurrent:
