@@ -15,7 +15,7 @@ class GatedSkip(nn.Module):
 
         self.adapter = TimeDistributed(nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=1),
-            nn.SiLU(inplace=True)
+            nn.SiLU(inplace=False)
         ))
         layer_params = neuron_params.copy()
         if spike_model.__name__ == 'ALIF':

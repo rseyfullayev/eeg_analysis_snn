@@ -80,7 +80,7 @@ class TemporalGCBlock(nn.Module):
         self.transform = nn.Sequential(
             nn.Conv1d(in_channels, in_channels // reduction, kernel_size=1),
             nn.LayerNorm([in_channels // reduction, 1]),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
             nn.Conv1d(in_channels // reduction, in_channels, kernel_size=1)
         )
     
