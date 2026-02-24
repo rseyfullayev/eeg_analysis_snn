@@ -70,7 +70,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             
             outputs = model(inputs)
             if only_classification:
-                _,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
+                #_,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
                 loss = criterion(outputs, labels) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
                 #energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0,3,4])
             else:
