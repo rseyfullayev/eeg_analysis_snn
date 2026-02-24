@@ -50,7 +50,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
 
 
 def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
-
+   
     model.eval()
     val_loss = 0
     correct = 0
@@ -73,6 +73,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
                 #_,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
                 loss = 0 #criterion(outputs, labels) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
                 #energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0,3,4])
+                return 0,0,0,0,0,0,0
             else:
                 loss = criterion(outputs, targets, labels)
                 B, C, H, W = outputs.shape
@@ -321,18 +322,18 @@ def training_loop(phase,
 
         avg_train_loss = train_loss / len(train_loader)
           
-        val_loss, val_acc, val_trial_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
+        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
         if phase == 1:
             print(f"Phase {phase} Epoch {epoch} | LR: {current_lr:.2e} | "
                   f"Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val Acc: {val_acc:.4f} | Val Trial Acc: {val_trial_acc:.4f}")
+                  f"Val Acc: {val_acc:.4f}")
         else:
             print(f"Phase {phase} Epoch {epoch} | LR: {current_lr:.2e} | "
                   f"Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val Acc: {val_acc:.4f} | Val Trial Acc: {val_trial_acc:.4f} Dice: {val_dice:.4f} | "
+                  f"Val Acc: {val_acc:.4f} | Dice: {val_dice:.4f} | "
                   f"Val Pre: {val_pre:.4f} | Val Rec: {val_rec:.4f}")
         
         log_dict = {
