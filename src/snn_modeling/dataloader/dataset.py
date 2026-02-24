@@ -176,7 +176,7 @@ class SWEEPDataset(Dataset):
         #mean = self.stats_lookup[stats_key]['mean']
         #std = self.stats_lookup[stats_key]['std']
 
-        
+        #print(label_idx)
         file_path = os.path.join(self.samples_dir, fname)
         if self.preload:
             video = self.cache[fname]  # No clone needed - data is not modified in-place
@@ -205,7 +205,9 @@ class SWEEPDataset(Dataset):
 
 class PKSampler(Sampler):
     def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None):
-        self.labels = [s[2] for s in dataset]
+        self.labels = [s[2 if dataset.split == 'train' else 3] for s in dataset]
+        print(len(self.labels))
+        
         self.labels = torch.tensor(self.labels).long()
         self.label_set = list(set(self.labels.numpy()))
         
