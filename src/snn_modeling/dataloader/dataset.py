@@ -93,8 +93,10 @@ class SWEEPDataset(Dataset):
         print(f"Loading index from {index_file}...")
         df = pd.read_csv(index_file)
 
+        '''
         with open(stats_path, 'r') as f:
             self.stats_lookup = json.load(f)
+        '''
 
         indices = np.arange(len(df))
         labels = df['emotion_id'].values
@@ -190,7 +192,7 @@ class SWEEPDataset(Dataset):
 
 
         #video = (video - mean) / (std)
-        print(video.shape)
+        #print(video.shape)
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
         target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
         if self.augmentations is not None and self.split == 'train':
