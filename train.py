@@ -63,7 +63,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
 
     val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
     with torch.no_grad():
-        for batch_idx, (inputs, targets, labels) in enumerate(val_loop):
+        for batch_idx, (inputs, targets, labels, _) in enumerate(val_loop):
             inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
             B,T,C,H,W = inputs.shape
             inputs = inputs.permute(0, 1, 2, 3, 4)
