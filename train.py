@@ -270,12 +270,22 @@ def training_loop(phase,
             model.encoder.apply(freeze_bn_stats)
         train_loss = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
-        for batch_idx, (inputs,  targets, targets_c, _) in enumerate(train_loop):
-            if phase == 1:
-                inp1, inp2 = inputs
-                inp1, inp2 = inp1.to(device), inp2.to(device)
-                inputs = torch.cat([inp1, inp2], dim=0)
-            inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
+        for batch_idx, batch in enumerate(train_loop):
+            # Handle both augmented (5 items) and non-augmented (4 items) returns
+            if len(batch) == 5:
+                inp1, inp2, targets, targets_c, _ = batch
+                if phase == 1:
+                    # Contrastive: concatenate both views
+                    inp1, inp2 = inp1.to(device), inp2.to(device)
+                    inputs = torch.cat([inp1, inp2], dim=0)
+                else:
+                    # Non-contrastive phases: just use first view
+                    inputs = inp1.to(device)
+            else:
+                inputs, targets, targets_c, _ = batch
+                inputs = inputs.to(device)
+                
+            targets, targets_c = targets.to(device), targets_c.to(device)
             
             B,T,C,H,W = inputs.shape
     
