@@ -101,7 +101,8 @@ def run_data_setup(config=None):
 
             windows = feats.unfold(dimension=-1, size=WINDOW_SIZE, step=STEP_SIZE)
 
-            windows = windows.permute(3, 1, 2, 4).squeeze(0)
+            windows = windows.squeeze(0).permute(2, 0, 1, 3)
+            
             W, C, B, WS = windows.shape
 
             win_flat = windows.reshape(W, C * B, WS)
@@ -111,6 +112,7 @@ def run_data_setup(config=None):
                                      align_corners=False)
             
             full_batch_tensor = win_flat.reshape(W, C, B, TARGET_STEPS)
+            full_batch_tensor = full_batch_tensor.permute(0, 3, 2, 1)
 
         if use_sampling_limit:
             if emotion_id not in emotion_map: continue
