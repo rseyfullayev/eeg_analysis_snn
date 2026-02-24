@@ -205,8 +205,9 @@ class SWEEPDataset(Dataset):
 
 class PKSampler(Sampler):
     def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None):
-        self.labels = [s[2 if dataset.split == 'train' else 3] for s in dataset]
-        print(len(self.labels))
+        # Access labels directly from dataset.samples: (filename, emotion_id, stats_key)
+        self.labels = [s[1] for s in dataset.samples]
+        print(f"PKSampler: {len(self.labels)} samples")
         
         self.labels = torch.tensor(self.labels).long()
         self.label_set = list(set(self.labels.numpy()))

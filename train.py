@@ -566,11 +566,9 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     persist = num_workers > 0  # Only use persistent_workers if num_workers > 0
     
     train_loader = DataLoader(train_set, 
-                              batch_size=config['training']['batch_size'],
                               batch_sampler=PKSampler(train_set, 
                                                       batch_size=config['training']['batch_size'], 
                                                       n_classes=config['model'].get('num_classes', 5)),
-                              shuffle=True, 
                               num_workers=num_workers,
                               prefetch_factor=prefetch,
                               persistent_workers=persist,
