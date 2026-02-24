@@ -54,26 +54,13 @@ class SignalJitter(nn.Module):
 
     def forward(self, x):
         if not self.training: return x
-        jitter = torch.empty(1).uniform_(0.8, 1.2).to(x.device)
+        jitter = torch.empty(1).uniform_(self.lower, self.upper).to(x.device)
         return x * jitter
     
 class FrequencyDropout(nn.Module):
     """
     Randomly drops entire frequency bands (channels).
-    """
-    def __init__(self, p=0.2):
-        super().__init__()
-        self.drop = nn.Dropout3d(p=p)
-
-    def forward(self, x):
-        if not self.training: return x
-        # Dropout3d expects input of shape [B, C, T, H, W], so we need to permute
-        x = self.drop(x)
-        return x
-        
-class TemporalMasking(nn.Module):
-    """
-    Randomly masks out entire frames in the temporal dimension.
+    Input: [B, T, C, H, W] or [T, C, H, W]
     """
     def __init__(self, p=0.2):
         super().__init__()
@@ -81,37 +68,76 @@ class TemporalMasking(nn.Module):
 
     def forward(self, x):
         if not self.training: return x
-        _,T,_,_ = x.shape
-        if torch.rand(1) < self.time_mask_prob:
-            n_msk = torch.randint(1,4,(1,)).item()
-            ind = torch.randperm(T)[:n_msk]   
-            x[:,ind,:,:] = 0.0
+        if x.dim() == 5:
+            # x: [B, T, C, H, W]
+            C = x.shape[2]
+            mask = (torch.rand(C, device=x.device) > self.p).float()
+            mask = mask.view(1, 1, C, 1, 1)
+        else:
+            # x: [T, C, H, W]
+            C = x.shape[1]
+            mask = (torch.rand(C, device=x.device) > self.p).float()
+            mask = mask.view(1, C, 1, 1)
+        return x * mask
+
+class TemporalMasking(nn.Module):
+    """
+    Randomly masks out entire frames in the temporal dimension.
+    Input: [B, T, C, H, W] or [T, C, H, W]
+    """
+    def __init__(self, p=0.2):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        if not self.training: return x
+        if x.dim() == 5:
+            # x: [B, T, C, H, W]
+            T = x.shape[1]
+            if torch.rand(1) < self.p:
+                x = x.clone()
+                n_msk = torch.randint(1, 4, (1,)).item()
+                ind = torch.randperm(T)[:n_msk]
+                x[:, ind, :, :, :] = 0.0
+        else:
+            # x: [T, C, H, W]
+            T = x.shape[0]
+            if torch.rand(1) < self.p:
+                x = x.clone()
+                n_msk = torch.randint(1, 4, (1,)).item()
+                ind = torch.randperm(T)[:n_msk]
+                x[ind, :, :, :] = 0.0
         return x
+
 
 class VideoRandomErasing(nn.Module):
     """
     Applies Cutout/Erasing to frames. 
-    Can erase the same spot in all frames (Spatial Consistency) 
-    or different spots (Temporal Chaos).
+    Input: [B, T, C, H, W] or [T, C, H, W]
     """
-    def __init__(self, p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3), consistent=False):
+    def __init__(self, p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)):
         super().__init__()
-        self.consistent = consistent
         self.eraser = RandomErasing(p=p, scale=scale, ratio=ratio, value=0, inplace=False)
 
     def forward(self, x):
         if not self.training: return x
         
-        B, T, C, H, W = x.shape
-
-        x_flat = x.view(B * T, C, H, W)
-        out = self.eraser(x_flat)
-
-        return out.view(B, T, C, H, W)
+        if x.dim() == 5:
+            # x: [B, T, C, H, W]
+            B, T, C, H, W = x.shape
+            x_flat = x.reshape(B * T, C, H, W)
+            out = self.eraser(x_flat)
+            return out.view(B, T, C, H, W)
+        else:
+            # x: [T, C, H, W]
+            T, C, H, W = x.shape
+            out = self.eraser(x)
+            return out
 
 class TemporalMix(nn.Module):
     """
     Temporal Mixup: Mixes multiple videos along the temporal dimension.
+    Input: [B, T, C, H, W]
     """
     def __init__(self):
         super().__init__()
@@ -133,4 +159,3 @@ class TemporalMix(nn.Module):
                 x_mixed[idxs, t] = x[shuffled_indices, t]
 
         return x_mixed, y
-

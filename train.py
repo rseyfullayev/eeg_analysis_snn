@@ -65,8 +65,8 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     with torch.no_grad():
         for batch_idx, (inputs, targets, labels) in enumerate(val_loop):
             inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
-            B,C,T,H,W = inputs.shape
-            inputs = inputs.permute(2, 0, 1, 3, 4)
+            B,T,C,H,W = inputs.shape
+            inputs = inputs.permute(0, 1, 2, 3, 4)
             
             outputs = model(inputs)
             if only_classification:
@@ -277,9 +277,9 @@ def training_loop(phase,
                 inputs = torch.cat([inp1, inp2], dim=0)
             inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
             
-            B,C,T,H,W = inputs.shape
+            B,T,C,H,W = inputs.shape
     
-            inputs = inputs.permute(2, 0, 1, 3, 4)
+            inputs = inputs.permute(1,0,2,3,4) 
             outputs = model(inputs)
 
             if phase == 1:

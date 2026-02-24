@@ -68,9 +68,9 @@ def generate_masks(config, subject_id):
     for _, row in tqdm(df.iterrows(), total=len(df)):
         fpath = os.path.join(config['data']['dataset_path'], row['filename'])
         try:
-            # Load [5, T, 32, 32] -> Mean over Time -> [5, 32, 32]
+            # Load [T, 5, 32, 32] -> Mean over Time -> [5, 32, 32]
             # We treat the *Trial Average* as the data point.
-            x = torch.load(fpath).mean(dim=1)
+            x = torch.load(fpath).mean(dim=0)
             
             # Update Global Stats (Welford)
             n += 1
@@ -83,7 +83,9 @@ def generate_masks(config, subject_id):
             class_sums[row['emotion_id']] += x
             class_counts[row['emotion_id']] += 1
             
-        except: continue
+        except Exception as e:
+            print(f"Warning: Could not process {fpath}. Skipping. Error: {e}")
+            continue
 
     # Finalize Global Stats
     global_mean = mean
