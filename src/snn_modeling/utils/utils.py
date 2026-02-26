@@ -549,7 +549,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
 
 
 def run_bio_audit(config, device='cpu', samples=300):
-    print("--- STARTING BIOLOGICAL AUDIT (MODEL-FREE) ---")
+    print("--- STARTING BIOLOGICAL AUDIT (MODEL-FREE, MAHALANOBIS) ---")
 
     df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
     all_subjects = sorted(df['filename'].str.split('_').str[0].unique(), key=int)
@@ -587,46 +587,68 @@ def run_bio_audit(config, device='cpu', samples=300):
             else:
                 subject_maps[subj][emotion] = np.zeros((5, 32, 32))
 
-    print("Calculating Compatibility Matrix...")
+    # Compute global mean and variance per emotion (across subjects) for diagonal Mahalanobis
+    print("Computing Global Statistics for Diagonal Mahalanobis...")
+    global_mean_per_emotion = {}
+    global_var_per_emotion = {}
+
+    for emotion in range(5):
+        all_vecs = []
+        for subj in all_subjects:
+            all_vecs.append(subject_maps[subj][emotion].flatten())
+        all_vecs = np.stack(all_vecs, axis=0)  # [num_subjects, D]
+        global_mean_per_emotion[emotion] = np.mean(all_vecs, axis=0)
+        global_var_per_emotion[emotion] = np.var(all_vecs, axis=0) + 1e-8  # diagonal covariance
+
+    print("Calculating Compatibility Matrix (Diagonal Mahalanobis)...")
     num_subs = len(all_subjects)
     compat_matrix = np.zeros((num_subs, num_subs))
     
     for i, subj_a in enumerate(all_subjects):
         for j, subj_b in enumerate(all_subjects):
             if i == j:
-                compat_matrix[i, j] = 1.0
+                compat_matrix[i, j] = 0.0
                 continue
             
-            corrs = []
+            dists = []
             for emotion in range(5):
-                map_a = subject_maps[subj_a][emotion].flatten()
-                map_b = subject_maps[subj_b][emotion].flatten()
+                vec_a = subject_maps[subj_a][emotion].flatten()
+                vec_b = subject_maps[subj_b][emotion].flatten()
+                inv_var = 1.0 / global_var_per_emotion[emotion]
                 
-                if np.std(map_a) > 0 and np.std(map_b) > 0:
-                    corr = np.corrcoef(map_a, map_b)[0, 1]
-                    corrs.append(corr)
+                # Diagonal Mahalanobis: sqrt( sum( (a-b)^2 / var ) )
+                diff = vec_a - vec_b
+                mahal_dist = np.sqrt(np.sum(diff ** 2 * inv_var))
+                dists.append(mahal_dist)
 
-            compat_matrix[i, j] = np.mean(corrs) if corrs else 0
+            compat_matrix[i, j] = np.mean(dists) if dists else float('inf')
+
+    # Convert distance to similarity for visualization: sim = exp(-d / median(d))
+    nonzero_dists = compat_matrix[compat_matrix > 0]
+    median_dist = np.median(nonzero_dists) if len(nonzero_dists) > 0 else 1.0
+    similarity_matrix = np.exp(-compat_matrix / median_dist)
+    np.fill_diagonal(similarity_matrix, 1.0)
 
     plt.figure(figsize=(12, 10))
-    sns.heatmap(compat_matrix, 
+    sns.heatmap(similarity_matrix, 
                 xticklabels=all_subjects, 
                 yticklabels=all_subjects, 
                 cmap="RdBu_r",
-                center=0, vmin=-0.5, vmax=1.0)
-    plt.title("Biological Compatibility (Spatial Topology Correlation)")
+                center=0.5, vmin=0, vmax=1.0)
+    plt.title("Biological Compatibility (Diagonal Mahalanobis Similarity)")
     plt.savefig("./evidence/bio_compatibility.png")
 
-    print("\n--- Ranked by Avg Correlation ---")
+    print("\n--- Ranked by Avg Mahalanobis Distance (lower = more representative) ---")
+    # Average distance to all other subjects (lower = closer to population center)
     scores = np.mean(compat_matrix, axis=1)
     
-    ranked_indices = np.argsort(scores)[::-1]
+    ranked_indices = np.argsort(scores)  # ascending: lowest distance first
     
     for rank, idx in enumerate(ranked_indices):
         subj = all_subjects[idx]
-        print(f"Rank {rank+1}: Subject {subj} | Score: {scores[idx]:.4f}")
+        print(f"Rank {rank+1}: Subject {subj} | Avg Mahalanobis Dist: {scores[idx]:.4f}")
 
     best = all_subjects[ranked_indices[0]]
     worst = all_subjects[ranked_indices[-1]]
-    print(f"Best: {best}")
-    print(f"Outlier: {worst}")
+    print(f"Best (most representative): {best}")
+    print(f"Outlier (most distant): {worst}")
