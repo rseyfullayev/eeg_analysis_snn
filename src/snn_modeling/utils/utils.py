@@ -19,17 +19,17 @@ def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, t
     encoder.eval()
     encoder.to(device)
     
-    dummy_bn = TemporalOrderFix(nn.BatchNorm3d(512).to(device))
+    dummy_bn = TemporalOrderFix(nn.BatchNorm3d(128).to(device))
     dummy_bn.train() 
     all_voltages = []
     
     with torch.no_grad():
-        for i, (inputs, _, _) in enumerate(tqdm(loader, total=num_batches, desc="Calibrating")):
+        for i, (inputs, *rest) in enumerate(tqdm(loader, total=num_batches, desc="Calibrating")):
             if i >= num_batches:
                 break
             inputs = inputs.to(device)
             if inputs.dim() == 5:
-                inputs = inputs.permute(2, 0, 1, 3, 4)  # [T, B, C, H, W]
+                inputs = inputs.permute(1,0,2, 3, 4)  # [T, B, C, H, W]
 
             features, _ = encoder(inputs) # [T, B, C, H, W]
             norm_feats = dummy_bn(features)

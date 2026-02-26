@@ -54,11 +54,15 @@ class UpsampleLayer(nn.Module):
         return self.layer(x)
 
 class SpikingUpsampleBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, spike_model=snn.Leaky, **neuron_params):
+    def __init__(self, in_channels, skip_channels, out_channels, upsample=True, spike_model=snn.Leaky, **neuron_params):
         super(SpikingUpsampleBlock, self).__init__()
 
-        self.upsample = UpsampleLayer(in_channels, in_channels // 2, kernel_size=3, stride=2)
-        concat_channels = (in_channels // 2) + skip_channels 
+        if upsample:
+            self.upsample = UpsampleLayer(in_channels, in_channels // 2, kernel_size=3, stride=2)
+            concat_channels = (in_channels // 2) + skip_channels
+        else:
+            self.upsample = nn.Identity()
+            concat_channels = in_channels + skip_channels
 
         self.conv1 = ConvSpiking(
             concat_channels, 

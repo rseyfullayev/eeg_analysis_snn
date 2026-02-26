@@ -27,7 +27,7 @@ class SpikingUNet(nn.Module):
             spike_model=encoder_spike_model,
             **(snn_params if encoder_mode == 'snn' else {})
         )
-        self.bottleneck = BottleneckBlock(512, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
+        self.bottleneck = BottleneckBlock(128, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
         self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('reccurent_decoder', False), spike_model=spike_model, **snn_params)
         self.classifier = ClassifierHead(64, num_classes)
 

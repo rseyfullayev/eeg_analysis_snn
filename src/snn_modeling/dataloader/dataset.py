@@ -220,7 +220,10 @@ class PKSampler(Sampler):
             
         self.used_label_indices_count = {label: 0 for label in self.label_set}
         self.count = 0
-        self.n_classes = n_classes
+
+        self.n_classes = min(n_classes, len(self.label_set))
+        if self.n_classes < n_classes:
+            print(f"PKSampler: Warning - only {self.label_set} classes are avalable!")
         
         if n_samples_per_class is None:
             self.n_samples_per_class = batch_size // n_classes

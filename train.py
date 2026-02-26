@@ -66,7 +66,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
         for batch_idx, (inputs, targets, labels, _) in enumerate(val_loop):
             inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
             B,T,C,H,W = inputs.shape
-            inputs = inputs.permute(0, 1, 2, 3, 4)
+            inputs = inputs.permute(1, 0, 2, 3, 4)
             
             outputs = model(inputs)
             if only_classification:
@@ -355,7 +355,7 @@ def training_loop(phase,
         for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
 
         if val_acc > best_acc:
-            best_acc = val_acc
+            best_acc = avg_train_loss if phase == 1 else val_acc
             best_dice = val_dice
             save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
         
@@ -389,7 +389,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     loss_fn.to(device)
 
     start_epoch = 0
-    best_acc = 0.0
+    best_acc = 100.0
     best_dice = 0.0
     epochs = config['training']['phase_1_epochs']
     accumulation_steps = config['training'].get('accumulation_steps', 1)
@@ -579,7 +579,7 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     train_loader = DataLoader(train_set, 
                               batch_sampler=PKSampler(train_set, 
                                                       batch_size=config['training']['batch_size'], 
-                                                      n_classes=config['model'].get('num_classes', 5)),
+                                                      n_classes=config['model'].get('n_emotions', 5)),
                               num_workers=num_workers,
                               prefetch_factor=prefetch,
                               persistent_workers=persist,

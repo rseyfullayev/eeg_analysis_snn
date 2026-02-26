@@ -10,9 +10,10 @@ class SpikingResNetDecoder(nn.Module):
 
         # up1: no recurrent
         self.up1 = SpikingUpsampleBlock(
-            in_channels=512, 
-            skip_channels=256,
-            out_channels=256, 
+            in_channels=128, 
+            skip_channels=128,
+            out_channels=128, 
+            upsample=False,
             spike_model=spike_model, **neuron_params
         )
         
@@ -22,9 +23,9 @@ class SpikingResNetDecoder(nn.Module):
             recurrent_params['recurrent'] = recurrent
         
         self.up2 = SpikingUpsampleBlock(
-            in_channels=256, 
-            skip_channels=128, 
-            out_channels=128, 
+            in_channels=128, 
+            skip_channels=64, 
+            out_channels=64, 
             spike_model=spike_model, **recurrent_params
         )
 
@@ -35,14 +36,14 @@ class SpikingResNetDecoder(nn.Module):
             last_layer_params['norm_mem'] = nn.BatchNorm3d
         
         self.up3 = SpikingUpsampleBlock(
-            in_channels=128, 
-            skip_channels=64, 
-            out_channels=64, 
+            in_channels=64, 
+            skip_channels=32, 
+            out_channels=32, 
             spike_model=spike_model, **last_layer_params
         )
 
         self.final_up = FinalUpBlock(
-            in_channels=64, 
+            in_channels=32, 
             out_channels=64
         )
 
