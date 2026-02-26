@@ -74,5 +74,5 @@ logging:
   project_name: "snn-encoding-showdown"
   run_name: "SWEEPNet_Hybrid"
   tags: ["sweepnet", "con", "tsm", "hybrid","phase2"]
-  offline: true
+  offline: false
   log_interval: 1

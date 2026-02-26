@@ -355,7 +355,7 @@ def training_loop(phase,
         wandb.log(log_dict, step=epoch)
         for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
 
-        if val_acc > best_acc:
+        if (-1 if phase==1 else 1)  * val_acc > (-1 if phase==1 else 1) * best_acc:
             best_acc = avg_train_loss if phase == 1 else val_acc
             best_dice = val_dice
             save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
@@ -396,10 +396,13 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     warmup_epochs = config['training'].get('warmup_epochs', 0)
     accumulation_steps = config['training'].get('accumulation_steps', 1)
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
-    scheduler = SequentialLR(optimizer, [
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+    '''
+    SequentialLR(optimizer, [
         LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs),
         CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
     ], milestones=[warmup_epochs])
+    '''
     
     if resume:
         enc_class.load_state_dict(checkpoint['model_state_dict'])
