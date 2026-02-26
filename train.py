@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss
@@ -392,9 +393,13 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     best_acc = 100.0
     best_dice = 0.0
     epochs = config['training']['phase_1_epochs']
+    warmup_epochs = config['training'].get('warmup_epochs', 0)
     accumulation_steps = config['training'].get('accumulation_steps', 1)
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, [
+        LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs),
+        CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+    ], milestones=[warmup_epochs])
     
     if resume:
         enc_class.load_state_dict(checkpoint['model_state_dict'])
