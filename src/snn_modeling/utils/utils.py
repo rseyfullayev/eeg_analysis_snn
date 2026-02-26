@@ -509,10 +509,8 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
             for fname in df_subj['filename']:
                 path = os.path.join(config['data']['dataset_path'], fname)
                 try:
-                    data = torch.load(path).float()
-                    p98 = torch.quantile(data.abs(), 0.98)
-                    data = torch.tanh(data / (p98 + 1e-6) * 3.0)   
-                    data = data.unsqueeze(0).to(device).permute(2,0,1,3,4)  # [T, 1, C, H, W]
+                    data = torch.load(path).float()   
+                    data = data.unsqueeze(0).to(device).permute(1,0,2,3,4)  # [T, 1, C, H, W]
 
                     features, _ = model.encoder(data) # output: [T, 1, 512, 4, 4]
                     
