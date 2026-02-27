@@ -72,7 +72,7 @@ loss:
 
 logging:
   project_name: "snn-encoding-showdown"
-  run_name: "ResNet18_Encoder"
-  tags: ["resnet18", "gc", "tsm"]
+  run_name: "MobileNet_Encoder"
+  tags: ["mobilenet", "con", "tsm"]
   offline: false 
   log_interval: 1
