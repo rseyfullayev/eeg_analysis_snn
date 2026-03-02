@@ -11,9 +11,9 @@ import random
 import collections
 
 class TopoMapper(nn.Module):
-    def __init__(self, sensor_coords_df, grid_size=64, sigma=0.2, device='cuda'): # Using Azimuthal Equidistant Projection
+    def __init__(self, sensor_coords_df, grid_size=64, perplexity=5.0, device='cuda'):  # t-SNE binary search with perplexity
         super(TopoMapper, self).__init__()
-        self.sigma = sigma
+        self.perplexity = perplexity
         self.grid_size = grid_size
         theta = sensor_coords_df['theta'].values
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -41,13 +41,84 @@ class TopoMapper(nn.Module):
         
         self.target_points = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
         self.mask_indices = (self.target_points[:, 0]**2 + self.target_points[:, 1]**2) > 1.0
-        dists = torch.cdist(self.target_points, self.points)
-        weights = torch.exp(-(dists.pow(2)) / (2 * (self.sigma ** 2)))
-        weight_sums = weights.sum(dim=1, keepdim=True)
-        weight_sums = torch.clamp(weight_sums, min=1e-8)
-        weights = weights / weight_sums
+
+        # Squared distances from each grid point to each sensor
+        dists_sq = torch.cdist(self.target_points, self.points).pow(2)
+
+        # t-SNE-style binary search: find per-grid-point sigma so that
+        # the Gaussian kernel over sensors has the desired perplexity
+        weights = self._binsearch_perplexity(dists_sq, perplexity)
+
         weights[self.mask_indices, :] = 0.0
         self.register_buffer('weights', weights)
+
+    @staticmethod
+    def _binsearch_perplexity(dists_sq, target_perplexity, tol=1e-5, max_iter=50):
+        """Binary search for per-row sigma that yields target perplexity.
+        Scikit-learn's t-SNE uses a similar approach to find the bandwidth of the Gaussian kernel for each data point, such that the perplexity of the distribution over neighbors matches a specified value. This function implements that binary search.
+
+        Args:
+            dists_sq: (N, K) squared distances from N grid points to K sensors.
+            target_perplexity: desired perplexity (effective number of neighbours).
+            tol: convergence tolerance on log-perplexity.
+            max_iter: maximum binary-search iterations.
+
+        Returns:
+            weights: (N, K) row-normalised Gaussian weights with adaptive sigma.
+        """
+        N, K = dists_sq.shape
+        target_entropy = np.log(target_perplexity)  # ln-based
+
+        # Precision beta = 1 / (2 * sigma^2); search in log-space
+        beta = torch.ones(N, 1, device=dists_sq.device)
+        beta_min = torch.full((N, 1), -float('inf'), device=dists_sq.device)
+        beta_max = torch.full((N, 1), float('inf'), device=dists_sq.device)
+
+        for _iter in range(max_iter):
+            # Compute Gaussian kernel with current beta (precision)
+            W = torch.exp(-dists_sq * beta)           # (N, K)
+            sum_W = W.sum(dim=1, keepdim=True).clamp(min=1e-12)
+            P = W / sum_W                              # row-normalised probs
+
+            # Shannon entropy H = -sum(p * ln(p)), with 0*ln(0)=0
+            log_P = torch.log(P.clamp(min=1e-12))
+            H = -(P * log_P).sum(dim=1, keepdim=True)  # (N, 1)
+
+            # Check convergence
+            H_diff = H - target_entropy
+            converged = H_diff.abs() < tol
+            if converged.all():
+                break
+
+            # Binary-search update
+            needs_increase = (H_diff > 0).squeeze(1)   # entropy too high → increase beta (shrink sigma)
+            needs_decrease = (H_diff < 0).squeeze(1)    # entropy too low  → decrease beta (grow sigma)
+
+            # Update bounds
+            beta_min[needs_increase] = beta[needs_increase]
+            beta_max[needs_decrease] = beta[needs_decrease]
+
+            # Step
+            finite_max = torch.isfinite(beta_max)
+            finite_min = torch.isfinite(beta_min)
+
+            # Both bounds finite → bisect
+            both = (finite_max & finite_min).squeeze(1)
+            beta[both] = (beta_min[both] + beta_max[both]) / 2.0
+
+            # Only lower bound finite → double
+            only_min = (finite_min & ~finite_max).squeeze(1) & needs_increase
+            beta[only_min] = beta[only_min] * 2.0
+
+            # Only upper bound finite → halve
+            only_max = (~finite_min & finite_max).squeeze(1) & needs_decrease
+            beta[only_max] = beta[only_max] / 2.0
+
+        # Final normalised weights
+        W = torch.exp(-dists_sq * beta)
+        sum_W = W.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        weights = W / sum_W
+        return weights
 
     def transform(self, x):
 
