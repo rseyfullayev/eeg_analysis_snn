@@ -11,7 +11,7 @@ class ConvSpiking(nn.Module):
                  stride=1, 
                  padding=0, 
                  groups=1,
-                 dilation=0, 
+                 dilation=1, 
                  bias=False, 
                  spike_model=snn.Leaky, 
                  use_norm = False, 
@@ -56,7 +56,7 @@ class SpikingResBlock(nn.Module):
 
         self.block1 = ConvSpiking(
             in_channels, 
-            out_channels, 
+            in_channels, 
             kernel_size=3, 
             stride=stride, 
             padding=dilation,
@@ -69,9 +69,9 @@ class SpikingResBlock(nn.Module):
         )
         
         self.block2 = ConvSpiking(
+            in_channels, 
             out_channels, 
-            out_channels, 
-            kernel_size=3,  
+            kernel_size=1,  
             bias=False, 
             spike_model=nn.Identity, 
             use_norm=use_norm,
@@ -101,7 +101,6 @@ class SpikingResBlock(nn.Module):
     def forward(self, x):
         
         identity = self.downsample(x)
-        
         x = self.tsm(x)
         out = self.block1(x)
         out = self.block2(out)

@@ -290,7 +290,7 @@ def training_loop(phase,
             targets, targets_c = targets.to(device), targets_c.to(device)
             
             B,T,C,H,W = inputs.shape
-    
+            
             inputs = inputs.permute(1,0,2,3,4) 
             outputs = model(inputs)
 
@@ -326,6 +326,9 @@ def training_loop(phase,
         val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
+
+        save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_temp.pt") 
+        os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_last.pt")
         
         if phase == 1:
             print(f"Phase {phase} Epoch {epoch} | LR: {current_lr:.2e} | "
@@ -352,19 +355,22 @@ def training_loop(phase,
                 f"Phase{phase}/Val/Recall": val_rec,
             })
 
-        wandb.log(log_dict, step=epoch)
+        
         for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
 
         if (-1 if phase==1 else 1)  * val_acc > (-1 if phase==1 else 1) * best_acc:
             best_acc = avg_train_loss if phase == 1 else val_acc
             best_dice = val_dice
-            save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
+            save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_best.pt") #_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}
+            wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
         
         elif val_acc == best_acc and val_dice > best_dice:
             best_dice = val_dice
             save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
+        else:
+            print(f"Best Result yet: {best_acc:.4f}")
 
-
+        wandb.log(log_dict, step=epoch)
 
 
 def phase_one(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
