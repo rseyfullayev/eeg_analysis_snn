@@ -385,7 +385,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         time_steps=config['data'].get('num_timesteps', 16),
     )"""
 
-    loss_fn = ContrastiveLoss() #nn.CrossEntropyLoss(label_smoothing=0.1)
+    loss_fn = ContrastiveLoss(train_loader.dataset.prototypes) #nn.CrossEntropyLoss(label_smoothing=0.1)
 
     loss_fn.to(device)
 
