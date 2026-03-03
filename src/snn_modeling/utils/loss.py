@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 from segmentation_models_pytorch.losses import TverskyLoss, FocalLoss
+import segmentation_models_pytorch as smp
 import torch.nn.functional as F
+
+
 
 class FiringRateRegularizer:
     def __init__(self, model, target_rate=0.05, lambda_reg=0.1):
@@ -110,9 +113,34 @@ class ContrastiveLoss(nn.Module):
     }
     """
     
-    def __init__(self, temperature=0.07):
+    def __init__(self, masks, temperature=0.07):
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature
+        sim_score = self.compute_mask_dice_matrix(masks)  # (C, C) precomputed similarity between prototype masks
+        self.register_buffer('sim_score', sim_score)  # (C, C) buffer for efficient lookup
+
+    def compute_mask_dice_matrix(self, prototypes, threshold=0.1):
+        """Precompute pairwise Dice scores between C prototype masks using smp.
+
+        Args:
+            prototypes: (C, H, W) soft prototype masks.
+            threshold: binarisation threshold (same as used in target_map).
+
+        Returns:
+            dice_matrix: (C, C) tensor of pairwise Dice scores.
+        """
+        C = prototypes.shape[0]
+        binary = (prototypes > threshold).long()  # (C, H, W)
+
+        # Build all C×C pairs: pred[i*C+j] = mask_i, target[i*C+j] = mask_j
+        pred   = binary.unsqueeze(1).expand(C, C, -1, -1).reshape(C * C, *binary.shape[1:])
+        target = binary.unsqueeze(0).expand(C, C, -1, -1).reshape(C * C, *binary.shape[1:])
+
+        tp, fp, fn, tn = smp.metrics.get_stats(pred, target, mode='binary')
+        f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction='none')  # (C*C,)
+        dice_matrix = f1.reshape(C, C)
+        return dice_matrix
+
 
     def forward(self, features, labels):
         # features: (N, 2, D) or (N, D) where N is batch size and D is feature dimension.
@@ -139,12 +167,19 @@ class ContrastiveLoss(nn.Module):
         logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=device)
         mask = mask * logits_mask
         
+        # Build per-pair Dice weights from precomputed sim_score matrix
+        label_flat = labels.squeeze(1)                                     # (2N,)
+        dice_pair = self.sim_score[label_flat][:, label_flat]   # (2N, 2N)
+        neg_mask = logits_mask - mask                                      # 1 for negatives, 0 for positives/self
+        # Negatives weighted by (1 + dice), positives by 1, self by 0
+        denom_weights = logits_mask + neg_mask * dice_pair
+
         # Numerical Stability: subtract max for LogSumExp
         logits_max, _ = torch.max(similarity_matrix * logits_mask, dim=1, keepdim=True)
         logits = similarity_matrix - logits_max.detach()
         
-        # Compute log softmax
-        exp_logits = torch.exp(logits) * logits_mask
+        # Compute log softmax with dice-scaled denominator
+        exp_logits = torch.exp(logits) * denom_weights
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
         
         # Mean log-likelihood over positives
