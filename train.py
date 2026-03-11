@@ -1,11 +1,15 @@
+# CITE https://github.com/HobbitLong/SupContrast/tree/master
+
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss
-from src.snn_modeling.dataloader.dataset import SWEEPDataset
-import time
+from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss
+from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
+import re
 import os
 import gc
 from datetime import datetime
@@ -20,7 +24,7 @@ import numpy as np
 
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
-from src.snn_modeling.utils.augmentations import TemporalMix, GaussianNoise, FrequencyDropout, VideoRandomErasing, DyTNorm
+from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.models.encoders import SpikingResNet18Encoder
@@ -45,8 +49,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
     }, path)
     print(f"New Record! Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
 
-def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
 
+def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
+   
     model.eval()
     val_loss = 0
     correct = 0
@@ -57,22 +62,19 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
 
     tp_tot, fp_tot, fn_tot, tn_tot = 0, 0, 0, 0
 
-    val_aug = nn.Sequential(
-        DyTNorm(gain=3.0)
-    )
     val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
     with torch.no_grad():
-        for batch_idx, (inputs, targets, labels) in enumerate(val_loop):
+        for batch_idx, (inputs, targets, labels, _) in enumerate(val_loop):
             inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
-            B,C,T,H,W = inputs.shape
-            inputs = val_aug(inputs)
-            inputs = inputs.permute(2, 0, 1, 3, 4)
+            B,T,C,H,W = inputs.shape
+            inputs = inputs.permute(1, 0, 2, 3, 4)
             
             outputs = model(inputs)
             if only_classification:
-                _,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
-                loss = criterion(outputs, labels.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
-                energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0,3,4])
+                #_,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
+                loss = 0 #criterion(outputs, labels) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
+                #energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0,3,4])
+                return 0,0,0,0,0,0,0
             else:
                 loss = criterion(outputs, targets, labels)
                 B, C, H, W = outputs.shape
@@ -90,17 +92,18 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
                 fp_tot += fp[:, 1:].sum().item()
                 fn_tot += fn[:, 1:].sum().item()
                 tn_tot += tn[:, 1:].sum().item()
+                preds = energy_logits.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(labels.cpu().numpy())
 
 
             val_loss += loss.item()
             val_loop.set_postfix(loss=loss.item())
             
-            preds = energy_logits.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(labels.cpu().numpy())
+            
             
             # Cleanup tensors to free memory
             del inputs, labels, outputs, loss, preds
@@ -259,13 +262,8 @@ def training_loop(phase,
                   checkpoint_dir,
                   freeze_bn=False):
     
-    train_aug = nn.Sequential(
-        DyTNorm(gain=3.0),
-        #GaussianNoise(std=0.01),
-        #VideoRandomErasing(p=0.3, scale=(0.02, 0.15)),
-        
-    )
-    temp_mix = TemporalMix()
+    
+    #temp_mix = TemporalMix()
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -274,19 +272,32 @@ def training_loop(phase,
             model.encoder.apply(freeze_bn_stats)
         train_loss = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
-        for batch_idx, (inputs,  targets, targets_c) in enumerate(train_loop):
+        for batch_idx, batch in enumerate(train_loop):
+            # Handle both augmented (5 items) and non-augmented (4 items) returns
+            if len(batch) == 5:
+                inp1, inp2, targets, targets_c, _ = batch
+                if phase == 1:
+                    # Contrastive: concatenate both views
+                    inp1, inp2 = inp1.to(device), inp2.to(device)
+                    inputs = torch.cat([inp1, inp2], dim=0)
+                else:
+                    # Non-contrastive phases: just use first view
+                    inputs = inp1.to(device)
+            else:
+                inputs, targets, targets_c, _ = batch
+                inputs = inputs.to(device)
+                
+            targets, targets_c = targets.to(device), targets_c.to(device)
             
-            inputs, targets, targets_c = inputs.to(device), targets.to(device), targets_c.to(device)
-            if phase == 1:
-                with torch.no_grad():
-                    inputs = train_aug(inputs)
-                    inputs, targets_c = temp_mix(inputs, targets_c)
-            B,C,T,H,W = inputs.shape
-    
-            inputs = inputs.permute(2, 0, 1, 3, 4)
+            B,T,C,H,W = inputs.shape
+            
+            inputs = inputs.permute(1,0,2,3,4) 
             outputs = model(inputs)
+
             if phase == 1:
-                loss = loss_fn(outputs, targets_c.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
+                f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                loss = loss_fn(features, targets_c) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
             else:
                 loss = loss_fn(outputs, targets, targets_c)
            
@@ -315,6 +326,9 @@ def training_loop(phase,
         val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
+
+        save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_temp.pt") 
+        os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_last.pt")
         
         if phase == 1:
             print(f"Phase {phase} Epoch {epoch} | LR: {current_lr:.2e} | "
@@ -341,19 +355,22 @@ def training_loop(phase,
                 f"Phase{phase}/Val/Recall": val_rec,
             })
 
-        wandb.log(log_dict, step=epoch)
+        
         for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
 
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if (-1 if phase==1 else 1)  * val_acc > (-1 if phase==1 else 1) * best_acc:
+            best_acc = avg_train_loss if phase == 1 else val_acc
             best_dice = val_dice
-            save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
+            save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_best.pt") #_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}
+            wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
         
         elif val_acc == best_acc and val_dice > best_dice:
             best_dice = val_dice
             save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
+        else:
+            print(f"Best Result yet: {best_acc:.4f}")
 
-
+        wandb.log(log_dict, step=epoch)
 
 
 def phase_one(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
@@ -374,17 +391,24 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         time_steps=config['data'].get('num_timesteps', 16),
     )"""
 
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = ContrastiveLoss(train_loader.dataset.prototypes) #nn.CrossEntropyLoss(label_smoothing=0.1)
 
     loss_fn.to(device)
 
     start_epoch = 0
-    best_acc = 0.0
+    best_acc = 100.0
     best_dice = 0.0
     epochs = config['training']['phase_1_epochs']
+    warmup_epochs = config['training'].get('warmup_epochs', 0)
     accumulation_steps = config['training'].get('accumulation_steps', 1)
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+    '''
+    SequentialLR(optimizer, [
+        LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs),
+        CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+    ], milestones=[warmup_epochs])
+    '''
     
     if resume:
         enc_class.load_state_dict(checkpoint['model_state_dict'])
@@ -514,7 +538,7 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_loso{loso}"
     else:
         run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_subj{subj}"
-    checkpoint_dir = os.path.join("saved_models", f"phase{phase}", run_name)
+    checkpoint_dir = os.path.join(config['data'].get('save_path', ''), "saved_models", f"phase{phase}", run_name)
     
     
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -535,15 +559,22 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     density = masks.sum() / masks.numel()
     print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
 
-
+    train_aug = nn.Sequential(
+        GaussianNoise(std=0.01),
+        FrequencyDropout(p=0.1),
+        VideoTemporalMasking(p=0.1, max_mask_len=2),
+        #SignalJitter(lower=0.8, upper=1.2),
+        #VideoRandomErasing(p=0.3)
+    )
 
     train_set = SWEEPDataset(
-        config, 
+        config,
         split='train',
         #experiment=True,
         loso=loso,
         subj=subj,
-        prototypes=masks
+        prototypes=masks,
+        augmentations=train_aug
     )
     
     val_set = SWEEPDataset(
@@ -560,8 +591,9 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     persist = num_workers > 0  # Only use persistent_workers if num_workers > 0
     
     train_loader = DataLoader(train_set, 
-                              batch_size=config['training']['batch_size'],
-                              shuffle=True, 
+                              batch_sampler=PKSampler(train_set, 
+                                                      batch_size=config['training']['batch_size'], 
+                                                      n_classes=config['model'].get('n_emotions', 5)),
                               num_workers=num_workers,
                               prefetch_factor=prefetch,
                               persistent_workers=persist,

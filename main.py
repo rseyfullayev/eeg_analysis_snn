@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from generate_dataset import run_data_setup
 from train import run_training, validate
+from test import test
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.utils.model_builder import build_model
 from src.snn_modeling.utils.utils import run_bio_audit, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject, generate_masks, calibrate_params
@@ -34,13 +35,14 @@ def main():
     parser.add_argument('--coords_path', type=str, help='Path to electrodes coordinates .csv')
     parser.add_argument('--output_path', type=str, help='Destination folder for processed .npy files')
 
-    parser.add_argument('--calculate_stat', action='store_true', help='Calculate Fire Rate and Draw Distribution of dataset')
+    parser.add_argument('--calculate_stat', action='store_true', help='Draw Distribution of dataset')
     parser.add_argument('--find_repr', action='store_true', help='Find the most representative subject in the dataset')
     parser.add_argument('--audit_bio', action='store_true', help='Run Biological Audit (Model-Free)')
     parser.add_argument('--masks', type=int, help='Derive masks from Subject')
     parser.add_argument('--calibrate', action='store_true', help='Calibrate optimal ALIF parameters')
     args = parser.parse_args()
     config_path = args.config
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if not os.path.exists(args.config):
         raise FileNotFoundError(f"Config file not found: {args.config}")
@@ -55,6 +57,22 @@ def main():
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
 
+    if args.mode == 'test':
+        if args.checkpoint is None:
+            parser.error("You MUST specify --checkpoint for test.")
+        model = build_model(config).to(device)
+        enc_class = SpikingResNetClassifier(
+            encoder_backbone = model.encoder,
+            num_classes=config['model'].get('num_classes', 5)
+        ).to(device)
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        print(f"Loaded checkpoint from {args.checkpoint}.")
+        enc_class.load_state_dict(checkpoint['model_state_dict'])
+
+        test(config, args.loso, args.subj, device, enc_class)
+
+
+
 
     if args.audit_bio:
         run_bio_audit(config, device=torch.device('cuda'), samples=300)
@@ -65,7 +83,7 @@ def main():
         if args.checkpoint is None:
             parser.error("You MUST specify --checkpoint for calibration.")
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         model = build_model(config).to(device)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         print(f"Loaded checkpoint from {args.checkpoint}.")
@@ -106,7 +124,7 @@ def main():
         print("Calculating Dataset Statistics...")
 
         analyze_distribution(dataloader)
-        calculate_optimal_firing_rate(dataset)
+        #calculate_optimal_firing_rate(dataset)
         generate_topology_proof(dataloader, torch.device("cuda"), class_names=[0,1,2,3,4])
 
         

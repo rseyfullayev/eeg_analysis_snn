@@ -49,8 +49,13 @@ class DatasetReader(Dataset):
                 raw.drop_channels(useless_ch, on_missing='ignore') 
                 # Pick EEG
                 raw.pick_types(eeg=True)
+
+                raw.notch_filter(50)
+                raw.filter(1, 75)
+
+
                 if len(raw.ch_names) != 62:
-                    print(f"⚠️ Channel Mismatch in: Has {len(raw.ch_names)} channels. Expected 62.")
+                    print(f" Channel Mismatch in: Has {len(raw.ch_names)} channels. Expected 62.")
                     print(f"   Channels found: {raw.ch_names}")
                     print(f"   File: {path}")  
                     if len(raw.ch_names) > 62:

@@ -19,17 +19,17 @@ def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, t
     encoder.eval()
     encoder.to(device)
     
-    dummy_bn = TemporalOrderFix(nn.BatchNorm3d(512).to(device))
+    dummy_bn = TemporalOrderFix(nn.BatchNorm3d(128).to(device))
     dummy_bn.train() 
     all_voltages = []
     
     with torch.no_grad():
-        for i, (inputs, _, _) in enumerate(tqdm(loader, total=num_batches, desc="Calibrating")):
+        for i, (inputs, *rest) in enumerate(tqdm(loader, total=num_batches, desc="Calibrating")):
             if i >= num_batches:
                 break
             inputs = inputs.to(device)
             if inputs.dim() == 5:
-                inputs = inputs.permute(2, 0, 1, 3, 4)  # [T, B, C, H, W]
+                inputs = inputs.permute(1,0,2, 3, 4)  # [T, B, C, H, W]
 
             features, _ = encoder(inputs) # [T, B, C, H, W]
             norm_feats = dummy_bn(features)
@@ -43,94 +43,99 @@ def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, t
 
     print(f"Calibrated Threshold: {thresh:.4f}, Beta: {beta:.4f}, Decay Adapt: {decay_adapt:.4f}, Gamma Adapt: {gamma_adapt:.4f}")
 
-            
-
-
-def generate_masks(config, subject_id=3):
-    print(f"--- GENERATING DIFFERENTIAL MASKS FOR SUBJECT {subject_id} ---")
+ 
+def generate_masks(config, subject_id):
+    print(f"--- GENERATING MASKS USING MAHALANOBIS (STATISTICAL SALIENCE) FOR SUBJECT {subject_id} ---")
     
+    # 1. Load Index
     df = pd.read_csv(os.path.join(config['data']['dataset_path'], "index.csv"))
-    # Filter for Subject 3
     df = df[df['filename'].str.startswith(f"{subject_id}_")]
     
-    if len(df) == 0:
-        raise ValueError(f"No data found for Subject {subject_id}")
+    if len(df) == 0: raise ValueError(f"No data found for Subject {subject_id}")
 
-    class_sums = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
-    class_counts = torch.zeros(5)
+    # 2. Welford's Online Algorithm for Mean/Std Calculation
+    # We need accurate pixel-wise STD to punish noisy bands.
+    n = 0
+    mean = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
+    m2 = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size']) # Sum of squares of differences
     
-    print("Accumulating Spatial Topologies...")
+    # We also need to accumulate class-specific sums
+    class_sums = torch.zeros(5, 5, config['data']['grid_size'], config['data']['grid_size'])
+    class_counts = torch.zeros(5)
+
+    print("Scanning Dataset for Statistics...")
+    # NOTE: To save time, you can sample 20% of data, but full scan is better for GT.
     for _, row in tqdm(df.iterrows(), total=len(df)):
         fpath = os.path.join(config['data']['dataset_path'], row['filename'])
-        emotion_idx = row['emotion_id']
-
         try:
-            data = torch.load(fpath)
+            # Load [T, 5, 32, 32] -> Mean over Time -> [5, 32, 32]
+            # We treat the *Trial Average* as the data point.
+            x = torch.load(fpath).mean(dim=0)
             
-            spatial_map = data.mean(dim=[0,1]) # Temporal and Channel Mean
+            # Update Global Stats (Welford)
+            n += 1
+            delta = x - mean
+            mean += delta / n
+            delta2 = x - mean
+            m2 += delta * delta2
             
-            # Accumulate
-            class_sums[emotion_idx] += spatial_map
-            class_counts[emotion_idx] += 1
+            # Update Class Sums
+            class_sums[row['emotion_id']] += x
+            class_counts[row['emotion_id']] += 1
             
         except Exception as e:
-            print(f"Error loading {fpath}: {e}")
+            print(f"Warning: Could not process {fpath}. Skipping. Error: {e}")
             continue
 
-    class_means = torch.zeros_like(class_sums)
+    # Finalize Global Stats
+    global_mean = mean
+    global_var = m2 / (n - 1)
+    global_std = torch.sqrt(global_var) + 1e-6 # Stability epsilon
+
+    # Finalize Class Means (Prototypes)
+    class_prototypes = torch.zeros_like(class_sums)
     for i in range(5):
         if class_counts[i] > 0:
-            class_means[i] = class_sums[i] / class_counts[i]
+            class_prototypes[i] = class_sums[i] / class_counts[i]
 
-    # 2. Compute Global Mean (The "Common Mode" Background)
-    global_mean = class_means.mean(dim=0)
-
-    # 3. Compute Differential Masks
-    differential_masks = torch.zeros_like(class_means)
+    # 3. Compute Salience Masks (Z-Score Energy)
+    final_masks = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
     
-    print("\nComputing Differentials (One-vs-Rest)...")
+    print("Computing Z-Score Energy Maps...")
     for i in range(5):
-        diff = class_means[i] - global_mean
-        diff = torch.relu(diff)
+        # A. Pixel-wise Z-Score per Band
+        # "How weird is this band at this pixel for this emotion?"
+        z_score = (class_prototypes[i] - global_mean) / global_std
         
-        if diff.max() > 0:
-            diff = diff / diff.max()
+        # B. Aggregate Energy (Root Mean Square)
+        # This treats suppression (-3) and activation (+3) as equal signal.
+        # It automatically weights bands: if Delta is noisy (high global_std), Z is low.
+        energy_map = torch.sqrt(torch.sum(z_score ** 2, dim=0))
         
-        diff_smooth = F.gaussian_blur(diff.unsqueeze(0), kernel_size=5, sigma=1.5).squeeze(0)
+        # C. Spatial Smoothing (Biology is smooth)
+        energy_map = F.gaussian_blur(energy_map.unsqueeze(0).unsqueeze(0), kernel_size=5, sigma=1.0).squeeze()
         
-        if diff_smooth.max() > 0:
-            diff_smooth = diff_smooth / diff_smooth.max()
+        # D. Normalize to [0, 1] for IoU calculation later
+        if energy_map.max() > 0:
+            energy_map = (energy_map - energy_map.min()) / (energy_map.max() - energy_map.min())
             
-        differential_masks[i] = diff_smooth
+        final_masks[i] = energy_map
 
-    # --- VISUALIZATION ---
-    print("Plotting results...")
-    emotions = ['Disgust', 'Fear', 'Sad', 'Neutral', 'Happy'] # Verify your order!
+    # 4. Save
+    save_path = f"evidence/subject{subject_id}_statistical_GT.pt"
+    torch.save(final_masks, save_path)
     
-    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-    
-    # Row 1: Raw Averages (Likely look identical/messy)
+    # Visualization (Optional but recommended)
+    import matplotlib.pyplot as plt
+    emotions = ['Disgust', 'Fear', 'Sad', 'Neutral', 'Happy']
+    fig, axes = plt.subplots(1, 5, figsize=(20, 5))
     for i in range(5):
-        im = axes[0, i].imshow(class_means[i].numpy(), cmap='jet')
-        axes[0, i].set_title(f"Raw Mean: {emotions[i]}")
-        axes[0, i].axis('off')
-        plt.colorbar(im, ax=axes[0, i], fraction=0.046)
-
-    # Row 2: Idiosyncratic Masks (Should look distinct)
-    for i in range(5):
-        im = axes[1, i].imshow(differential_masks[i].numpy(), cmap='hot')
-        axes[1, i].set_title(f"Differential: {emotions[i]}")
-        axes[1, i].axis('off')
-        plt.colorbar(im, ax=axes[1, i], fraction=0.046)
-    
-    plt.suptitle(f"Subject {subject_id}: Deriving Biologically Grounded Segmentation Masks", fontsize=16)
-    plt.tight_layout()
-    plt.savefig("subject3_biological_masks.png")
-    print("Saved visualization to subject3_biological_masks.png")
-
-    # Save the Tensor for the DataLoader
-    torch.save(differential_masks, "evidence/subject3_masks.pt")
-    print("Saved masks to subject3_masks.pt")
+        im = axes[i].imshow(final_masks[i].numpy(), cmap='magma', vmin=0, vmax=1)
+        axes[i].set_title(f"{emotions[i]}\nZ-Energy Mask")
+        axes[i].axis('off')
+    plt.colorbar(im, ax=axes.ravel().tolist())
+    plt.savefig(f"evidence/subject{subject_id}_statistical_GT.png")
+    print(f"Ground Truth saved to {save_path}")
 
 
 def seed_everything(seed=42):
@@ -155,7 +160,7 @@ def generate_topology_proof(loader, device, class_names, max_batches=100):
     class_counts = torch.zeros(num_classes).to(device)
     
     # Iterate through data
-    for batch_idx, (data, _, target) in enumerate(loader):
+    for batch_idx, (data, _, target, _) in enumerate(loader):
         if batch_idx >= max_batches: break
 
         data = data.to(device)
@@ -223,7 +228,7 @@ def analyze_distribution(dataloader, num_batches=20, max_samples=100000):
     collected_samples = []
     
     print(f"Collecting samples from {num_batches} batches...")
-    for i, (data, _, _) in enumerate(dataloader):
+    for i, (data, _, _, _) in enumerate(dataloader):
         if i >= num_batches:
             break
         
@@ -403,12 +408,12 @@ def run_bn_warmup(model, loader, device, num_batches=10):
     model.to(device)
     
     with torch.no_grad():
-        for i, (inputs, _, _) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
+        for i, (inputs, *_rest) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
             if i >= num_batches:
                 break
             inputs = inputs.to(device)
             if inputs.dim() == 5:
-                inputs = inputs.permute(2, 0, 1, 3, 4)
+                inputs = inputs.permute(1, 0, 2, 3, 4)
             
             _ = model(inputs)
             del inputs  # Free memory after each batch
@@ -448,7 +453,7 @@ def initialize_network(model, train_loader, device):
 
     apply_kaiming_init(model)
     run_bn_warmup(model, train_loader, device)
-    initialize_head(model.classifier.head)
+    #initialize_head(model.classifier.head)
     if model.encoder.vit:
         initialize_vit(model.encoder.temporal)
     """if hasattr(model, 'decoder') and model.decoder.recurrent:
@@ -504,10 +509,8 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
             for fname in df_subj['filename']:
                 path = os.path.join(config['data']['dataset_path'], fname)
                 try:
-                    data = torch.load(path).float()
-                    p98 = torch.quantile(data.abs(), 0.98)
-                    data = torch.tanh(data / (p98 + 1e-6) * 3.0)   
-                    data = data.unsqueeze(0).to(device).permute(2,0,1,3,4)  # [T, 1, C, H, W]
+                    data = torch.load(path).float()   
+                    data = data.unsqueeze(0).to(device).permute(1,0,2,3,4)  # [T, 1, C, H, W]
 
                     features, _ = model.encoder(data) # output: [T, 1, 512, 4, 4]
                     
@@ -546,7 +549,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
 
 
 def run_bio_audit(config, device='cpu', samples=300):
-    print("--- STARTING BIOLOGICAL AUDIT (MODEL-FREE) ---")
+    print("--- STARTING BIOLOGICAL AUDIT (MODEL-FREE, MAHALANOBIS) ---")
 
     df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
     all_subjects = sorted(df['filename'].str.split('_').str[0].unique(), key=int)
@@ -584,46 +587,68 @@ def run_bio_audit(config, device='cpu', samples=300):
             else:
                 subject_maps[subj][emotion] = np.zeros((5, 32, 32))
 
-    print("Calculating Compatibility Matrix...")
+    # Compute global mean and variance per emotion (across subjects) for diagonal Mahalanobis
+    print("Computing Global Statistics for Diagonal Mahalanobis...")
+    global_mean_per_emotion = {}
+    global_var_per_emotion = {}
+
+    for emotion in range(5):
+        all_vecs = []
+        for subj in all_subjects:
+            all_vecs.append(subject_maps[subj][emotion].flatten())
+        all_vecs = np.stack(all_vecs, axis=0)  # [num_subjects, D]
+        global_mean_per_emotion[emotion] = np.mean(all_vecs, axis=0)
+        global_var_per_emotion[emotion] = np.var(all_vecs, axis=0) + 1e-8  # diagonal covariance
+
+    print("Calculating Compatibility Matrix (Diagonal Mahalanobis)...")
     num_subs = len(all_subjects)
     compat_matrix = np.zeros((num_subs, num_subs))
     
     for i, subj_a in enumerate(all_subjects):
         for j, subj_b in enumerate(all_subjects):
             if i == j:
-                compat_matrix[i, j] = 1.0
+                compat_matrix[i, j] = 0.0
                 continue
             
-            corrs = []
+            dists = []
             for emotion in range(5):
-                map_a = subject_maps[subj_a][emotion].flatten()
-                map_b = subject_maps[subj_b][emotion].flatten()
+                vec_a = subject_maps[subj_a][emotion].flatten()
+                vec_b = subject_maps[subj_b][emotion].flatten()
+                inv_var = 1.0 / global_var_per_emotion[emotion]
                 
-                if np.std(map_a) > 0 and np.std(map_b) > 0:
-                    corr = np.corrcoef(map_a, map_b)[0, 1]
-                    corrs.append(corr)
+                # Diagonal Mahalanobis: sqrt( sum( (a-b)^2 / var ) )
+                diff = vec_a - vec_b
+                mahal_dist = np.sqrt(np.sum(diff ** 2 * inv_var))
+                dists.append(mahal_dist)
 
-            compat_matrix[i, j] = np.mean(corrs) if corrs else 0
+            compat_matrix[i, j] = np.mean(dists) if dists else float('inf')
+
+    # Convert distance to similarity for visualization: sim = exp(-d / median(d))
+    nonzero_dists = compat_matrix[compat_matrix > 0]
+    median_dist = np.median(nonzero_dists) if len(nonzero_dists) > 0 else 1.0
+    similarity_matrix = np.exp(-compat_matrix / median_dist)
+    np.fill_diagonal(similarity_matrix, 1.0)
 
     plt.figure(figsize=(12, 10))
-    sns.heatmap(compat_matrix, 
+    sns.heatmap(similarity_matrix, 
                 xticklabels=all_subjects, 
                 yticklabels=all_subjects, 
                 cmap="RdBu_r",
-                center=0, vmin=-0.5, vmax=1.0)
-    plt.title("Biological Compatibility (Spatial Topology Correlation)")
+                center=0.5, vmin=0, vmax=1.0)
+    plt.title("Biological Compatibility (Diagonal Mahalanobis Similarity)")
     plt.savefig("./evidence/bio_compatibility.png")
 
-    print("\n--- Ranked by Avg Correlation ---")
+    print("\n--- Ranked by Avg Mahalanobis Distance (lower = more representative) ---")
+    # Average distance to all other subjects (lower = closer to population center)
     scores = np.mean(compat_matrix, axis=1)
     
-    ranked_indices = np.argsort(scores)[::-1]
+    ranked_indices = np.argsort(scores)  # ascending: lowest distance first
     
     for rank, idx in enumerate(ranked_indices):
         subj = all_subjects[idx]
-        print(f"Rank {rank+1}: Subject {subj} | Score: {scores[idx]:.4f}")
+        print(f"Rank {rank+1}: Subject {subj} | Avg Mahalanobis Dist: {scores[idx]:.4f}")
 
     best = all_subjects[ranked_indices[0]]
     worst = all_subjects[ranked_indices[-1]]
-    print(f"Best: {best}")
-    print(f"Outlier: {worst}")
+    print(f"Best (most representative): {best}")
+    print(f"Outlier (most distant): {worst}")

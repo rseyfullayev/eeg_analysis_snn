@@ -122,9 +122,9 @@ class TemporalOrderFix(nn.Module):
 
     def forward(self, x):
         if x.dim() == 5:
-            x_permuted = x.permute(1, 2, 0, 3, 4)  # B, C, T, H, W
+            x_permuted = x.permute(1, 2, 0, 3, 4).contiguous()  # B, C, T, H, W
             x_permuted = self.module(x_permuted)
-            x_permuted = x_permuted.permute(2, 0, 1, 3, 4)  # T, B, C, H, W
+            x_permuted = x_permuted.permute(2, 0, 1, 3, 4).contiguous()  # T, B, C, H, W
             return x_permuted
         else:
             return self.module(x)
@@ -144,6 +144,7 @@ class ALIF(nn.Module):
     """
     def __init__(self, num_channels, beta=0.9, threshold=1.0, 
                  decay_adapt=0.96, gamma_adapt=0.5, batch_norm=True,
+                 norm_mem = nn.InstanceNorm3d,
                  spike_grad=None, return_mem=False,
                  learn_beta=False, learn_threshold=False, 
                  learn_decay=False, learn_gamma=False,
@@ -177,7 +178,7 @@ class ALIF(nn.Module):
 
         self.bn = TemporalOrderFix(nn.BatchNorm3d(num_channels, eps=1e-4)) if batch_norm else nn.Identity()
         if return_mem:
-            self.mem_ = nn.Sequential(TemporalOrderFix(nn.BatchNorm3d(num_channels, eps=1e-4)), 
+            self.mem_ = nn.Sequential(TemporalOrderFix(norm_mem(num_channels, eps=1e-4)), 
                                       nn.SiLU())
         self.return_mem = return_mem
         self.spike_grad = LearnableAtan(alpha=2.0, learnable=learn_slope)

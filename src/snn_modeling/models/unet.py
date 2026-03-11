@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import snntorch as snn
 from .decoders import ResNetDecoder, SpikingResNetDecoder
-from ..layers.stem import BottleneckBlock, ClassifierHead
+from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead
 from ..layers.neurons import ALIF
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
@@ -27,7 +27,7 @@ class SpikingUNet(nn.Module):
             spike_model=encoder_spike_model,
             **(snn_params if encoder_mode == 'snn' else {})
         )
-        self.bottleneck = BottleneckBlock(512, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
+        self.bottleneck = BottleneckBlock(128, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
         self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('reccurent_decoder', False), spike_model=spike_model, **snn_params)
         self.classifier = ClassifierHead(64, num_classes)
 
@@ -65,7 +65,8 @@ class SpikingResNetClassifier(nn.Module):
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
-        self.classifier = ClassifierHead(512, num_classes)
+        self.classifier = ProjectionHead(256, 128) #ClassifierHead(128, num_classes)
+        
         
 
     def forward(self, x):
@@ -73,6 +74,6 @@ class SpikingResNetClassifier(nn.Module):
         #features = features.mean(dim=[3,4]).unsqueeze(3).unsqueeze(4) # Global Average Pooling
 
         out = self.classifier(features)
-        T,B,C,H,W = out.shape
-        out = out.view(T*B, C, H, W)
+        #T,B,C,H,W = out.shape
+        #out = out.mean(dim=[0,3,4])
         return out #.mean(dim=0) # Mean over time dimension

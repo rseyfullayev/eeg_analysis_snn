@@ -1,8 +1,8 @@
-experiment_name: "SWEEPNet_Hybrid"
+experiment_name: "ResNet18_Encoder_SNN"
 description: "SWEEP-Net"
 
 data:
-  dataset_path: "D:\\SEED-V\\preprocessed_eeg"
+  dataset_path: "/media/temporaryuser3/STORAGE/SEED-V/preprocessed_eeg"
   dataset_mode: "eeg"
   encoding_method: "direct"
   num_timesteps: 16
@@ -29,22 +29,22 @@ model:
   reccurent_decoder: false
   vit_integration: false
   gc_integration: true
-  encoder_mode: "cnn"
+  encoder_mode: "snn"
   in_channels: 5
-  num_classes: 6
+  num_classes: 5
   dropout: 0.2
   vit_dropout: 0.3
 
 neuron_params:
   spike_model: "ALIF" 
   beta: 0.9
-  threshold: 0.5
+  threshold: 1.0
   decay_adapt: 0.9
   gamma_adapt: 0.2
   spike_grad_alpha: 2.0
   learn_slope: false
   learn_threshold: false
-  learn_beta: false
+  learn_beta: true
   learn_gamma: false
   learn_decay: false
   
@@ -54,14 +54,14 @@ training:
   phase_1_epochs: 50
   phase_2_epochs: 50
   phase_3_epochs: 50
-  batch_size: 16
+  batch_size: 64
   learning_rate: 0.001
   weight_decay: 0.01
   accumulation_steps: 1
 
 loss:
   smooth: 0.0
-  lambda_seg: 1.0
+  lambda_seg: 0.0
   lambda_con: 0.0
   lambda_class: 1.0
   lambda_fire: 20.0
@@ -71,7 +71,7 @@ loss:
 
 logging:
   project_name: "snn-encoding-showdown"
-  run_name: "SWEEPNet_Hybrid"
-  tags: ["sweepnet", "gc", "tsm", "hybrid"]
+  run_name: "ResNet18_Encoder_SNN"
+  tags: ["resnet18", "gc", "tsm", "snn"]
   offline: false 
   log_interval: 1

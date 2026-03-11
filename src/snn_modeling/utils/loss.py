@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 from segmentation_models_pytorch.losses import TverskyLoss, FocalLoss
+import segmentation_models_pytorch as smp
 import torch.nn.functional as F
+
+
 
 class FiringRateRegularizer:
     def __init__(self, model, target_rate=0.05, lambda_reg=0.1):
@@ -98,68 +101,94 @@ class GSPLoss(nn.Module):
 class ContrastiveLoss(nn.Module):
 
     """
+    Supervised Contrastive Loss with temperature scaling.
+    
     Reference:
-    @misc{kim2025temperaturefree,
-        title={Temperature-Free Loss Function for Contrastive Learning}, 
-        author={Bum Jun Kim and Sang Woo Kim},
-        year={2025},
-        eprint={2501.17683},
+    @misc{khosla2020supervised,
+        title={Supervised Contrastive Learning}, 
+        author={Prannay Khosla et al.},
+        year={2020},
+        eprint={2004.11362},
         archivePrefix={arXiv},
-        primaryClass={cs.LG},
-        url={https://arxiv.org/abs/2501.17683}
     }
-    Implementation Note:
-    Replaces standard exp(sim / temp) with exp(arctanh(sim)) to prevent 
-    gradient vanishing on well-clustered embeddings.
     """
     
-    def __init__(self):
+    def __init__(self, masks, temperature=0.07):
         super(ContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        sim_score = self.compute_mask_dice_matrix(masks)  # (C, C) precomputed similarity between prototype masks
+        self.register_buffer('sim_score', sim_score)  # (C, C) buffer for efficient lookup
+
+    def compute_mask_dice_matrix(self, prototypes, threshold=0.1):
+        """Precompute pairwise Dice scores between C prototype masks using smp.
+
+        Args:
+            prototypes: (C, H, W) soft prototype masks.
+            threshold: binarisation threshold (same as used in target_map).
+
+        Returns:
+            dice_matrix: (C, C) tensor of pairwise Dice scores.
+        """
+        C = prototypes.shape[0]
+        binary = (prototypes > threshold).long()  # (C, H, W)
+
+        # Build all C×C pairs: pred[i*C+j] = mask_i, target[i*C+j] = mask_j
+        pred   = binary.unsqueeze(1).expand(C, C, -1, -1).reshape(C * C, *binary.shape[1:])
+        target = binary.unsqueeze(0).expand(C, C, -1, -1).reshape(C * C, *binary.shape[1:])
+
+        tp, fp, fn, tn = smp.metrics.get_stats(pred, target, mode='binary')
+        f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction='none')  # (C*C,)
+        dice_matrix = f1.reshape(C, C)
+        return dice_matrix
+
 
     def forward(self, features, labels):
-        # features: (N, D) where N is batch size and D is feature dimension. Normalized.
+        # features: (N, 2, D) or (N, D) where N is batch size and D is feature dimension.
         # labels: (N,) with integer class labels
 
         device = features.device
+        if features.dim() == 3:
+            f1, f2 = torch.unbind(features, dim=1) 
+            features = torch.cat([f1, f2], dim=0)  # (2N, D)
+            labels = torch.cat([labels, labels], dim=0)  # (2N,)
         
-        # 2. Cosine Similarity
-        similarity_matrix = torch.matmul(features, features.T)
+        # Normalize features
+        features = F.normalize(features, dim=1, eps=1e-6)
         
-        # 3. Arctanh warping
-        # Clamp to avoid infinity at exactly 1.0 or -1.0
-        # arctanh(x) = 0.5 * log((1+x)/(1-x))
-
-        eps = 1e-6
-        sim_clamped = torch.clamp(similarity_matrix, -1 + eps, 1 - eps)
-        logits = 0.5 * torch.log((1 + sim_clamped) / (1 - sim_clamped))
+        # Cosine similarity scaled by temperature
+        similarity_matrix = torch.matmul(features, features.T) / self.temperature
         
-        
-        # Create Mask
+        # Create positive mask (same class)
         labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, labels.T).float().to(device)
         
-        # Remove self-contrast
-        logits_mask = torch.scatter(
-            torch.ones_like(mask), 
-            1, 
-            torch.arange(mask.shape[0]).view(-1, 1).to(device), 
-            0
-        )
+        # Remove self-contrast (diagonal)
+        batch_size = features.shape[0]
+        logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=device)
         mask = mask * logits_mask
         
-        # Numerical Stability for LogSumExp
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits = logits - logits_max.detach()
+        # Build per-pair Dice weights from precomputed sim_score matrix
+        label_flat = labels.squeeze(1)                                     # (2N,)
+        dice_pair = self.sim_score[label_flat][:, label_flat]   # (2N, 2N)
+        neg_mask = logits_mask - mask                                      # 1 for negatives, 0 for positives/self
+        # Negatives weighted by (1 + dice), positives by 1, self by 0
+        denom_weights = logits_mask + neg_mask * dice_pair
+
+        # Numerical Stability: subtract max for LogSumExp
+        logits_max, _ = torch.max(similarity_matrix * logits_mask, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
         
-        exp_logits = torch.exp(logits) * logits_mask
+        # Compute log softmax with dice-scaled denominator
+        exp_logits = torch.exp(logits) * denom_weights
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
         
-        # Mean Log-Likelihood
+        # Mean log-likelihood over positives
         mask_sum = mask.sum(1)
-        mask_sum = torch.where(mask_sum == 0, torch.ones_like(mask_sum), mask_sum)
+        # Avoid division by zero for samples with no positives
+        mask_sum = torch.clamp(mask_sum, min=1.0)
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
         
-        loss = - mean_log_prob_pos.mean()
+        loss = -mean_log_prob_pos.mean()
         return loss
 
 
