@@ -1,7 +1,7 @@
 
 import snntorch as snn
 from ..models.unet import SpikingUNet, UNet
-from ..models.encoders import  SpikingResNet18Encoder
+from ..models.encoders import SpikingMobileNetEncoder
 import inspect
 from ..layers.neurons import ALIF
 
@@ -34,8 +34,8 @@ def build_model(config):
     model_type = config['model']['type']
     
     if model_type == "SpikingUNet":
-        if config['model']['encoder_type'] == "ResNet18":
-            encoder = SpikingResNet18Encoder
+        if config['model']['encoder_type'] == "MobileNet":
+            encoder = SpikingMobileNetEncoder
         else:
             raise ValueError(f"Unknown encoder type: {config['model']['encoder_type']}")
         spike_model_class = SPIKE_MODEL_MAP[config['neuron_params']['spike_model']]

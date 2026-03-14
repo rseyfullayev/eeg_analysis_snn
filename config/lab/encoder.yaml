@@ -1,4 +1,4 @@
-experiment_name: "ResNet18_Encoder"
+experiment_name: "MobileNet_Encoder"
 description: "SWEEP-Net"
 
 data:
@@ -26,7 +26,7 @@ mask:
 
 model:
   type: "SpikingUNet"
-  encoder_type: "ResNet18"
+  encoder_type: "MobileNet"
   reccurent_decoder: false
   vit_integration: false
   gc_integration: false

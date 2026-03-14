@@ -1,6 +1,6 @@
 import torch.nn as nn
 import snntorch as snn
-from .neurons import TimeDistributed, TemporalShift, TemporalOrderFix
+from .neurons import TimeDistributed, TemporalShift, TemporalOrderFix, ODConv2d
 from torchvision.ops import StochasticDepth
 
 
@@ -14,11 +14,20 @@ class ConvSpiking(nn.Module):
                  dilation=1, 
                  bias=False, 
                  spike_model=snn.Leaky, 
-                 use_norm = False, 
+                 use_norm = False,
+                 odconv=False,
                  **neuron_params):
         super(ConvSpiking, self).__init__()
         #pad = dilation * (kernel_size - 1) // 2
-        self.conv = TimeDistributed(nn.Conv2d(in_channels, 
+        self.conv = TimeDistributed(ODConv2d(in_channels,
+                                             out_channels,
+                                             kernel_size=kernel_size, 
+                                              stride=stride, 
+                                              padding=padding,
+                                              dilation=dilation,
+                                              groups=groups) if odconv else 
+
+                                              nn.Conv2d(in_channels, 
                                               out_channels, 
                                               kernel_size=kernel_size, 
                                               stride=stride, 
@@ -26,6 +35,7 @@ class ConvSpiking(nn.Module):
                                               dilation=dilation, 
                                               bias=bias, 
                                               groups=groups))
+        
         layer_params = neuron_params.copy()
         if spike_model.__name__ == 'ALIF':
             layer_params['num_channels'] = out_channels
@@ -49,27 +59,39 @@ class SpikingResBlock(nn.Module):
                  p_drop=0.2, 
                  p_path=0.1, 
                  spike_model=snn.Leaky, 
-                 use_norm = False, 
+                 use_norm = False,
+                 odconv=False,
                  **neuron_params):
         
         super(SpikingResBlock, self).__init__()
 
         self.block1 = ConvSpiking(
             in_channels, 
-            in_channels, 
+            in_channels*2, 
+            kernel_size=1,  
+            bias=False, 
+            spike_model=nn.Identity, 
+            use_norm=use_norm,
+
+        )
+
+        self.block2 = ConvSpiking(
+            in_channels*2, 
+            in_channels*2, 
             kernel_size=3, 
             stride=stride, 
             padding=dilation,
             dilation=dilation,
             bias=False, 
             spike_model=spike_model, 
-            groups=in_channels,
+            groups=in_channels*2,
             use_norm=use_norm,
+            odconv=odconv,
             **neuron_params
         )
         
-        self.block2 = ConvSpiking(
-            in_channels, 
+        self.block3 = ConvSpiking(
+            in_channels*2, 
             out_channels, 
             kernel_size=1,  
             bias=False, 
@@ -104,6 +126,7 @@ class SpikingResBlock(nn.Module):
         x = self.tsm(x)
         out = self.block1(x)
         out = self.block2(out)
+        out = self.block3(out)
         out = self.drop(out)
         out = self.drop_path(out) + identity
         

@@ -1,19 +1,16 @@
 # CITE https://github.com/HobbitLong/SupContrast/tree/master
 
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
-import re
 import os
 import gc
 from datetime import datetime
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import balanced_accuracy_score
 import snntorch as snn
 import segmentation_models_pytorch as smp
@@ -21,13 +18,11 @@ import wandb
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
 import numpy as np
-
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
 from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingResNetClassifier
-from src.snn_modeling.models.encoders import SpikingResNet18Encoder
 
 # Ignore the specific sklearn warning about missing classes
 warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")

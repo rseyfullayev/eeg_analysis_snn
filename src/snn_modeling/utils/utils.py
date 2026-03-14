@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import snntorch as snn
-from ..layers.neurons import ALIF, SwiGLU, TemporalOrderFix
+from ..layers.neurons import ALIF, SwiGLU, TemporalOrderFix, ODConv2d
 import numpy as np
 import os
 import pandas as pd
@@ -368,10 +368,25 @@ def manual_reset(model):
                 module.reset_hidden()
 
 
-def apply_kaiming_init(model):
+def apply_kaiming_init(model, keep_odconv_attention_init=True):
     print("Applying Kaiming (He) Initialization...")
     count = 0
+    
+    # 1. Catalog all internal modules of ODConv2d to protect them
+    skip_ids = set()
+    if keep_odconv_attention_init:
+        for m in model.modules():
+            if isinstance(m, ODConv2d):
+                # Add the ODConv2d module itself and all its submodules
+                for sub_m in m.modules():
+                    skip_ids.add(id(sub_m))
+
+    # 2. Standard Initialization Loop
     for m in model.modules():
+        # Protect ODConv internals
+        if keep_odconv_attention_init and id(m) in skip_ids:
+            continue
+            
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
             # Fan_in preserves magnitude in the forward pass
             # Nonlinearity 'relu' is the standard proxy for SNN spikes
@@ -382,13 +397,13 @@ def apply_kaiming_init(model):
             count += 1
             
         elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.GroupNorm, nn.InstanceNorm2d, nn.InstanceNorm3d)):
-
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
                 
     print(f"   Initialized {count} Convolutional layers.")
+    
     count = 0
     for m in model.modules():
         if "GatedSkip" in m.__class__.__name__:
