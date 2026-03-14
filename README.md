@@ -57,7 +57,7 @@ Unlike standard classifiers, SWEEP-Net visually outputs the predicted brain acti
 
 <div align="center">
   <img src="milestones/figures/subj1_gt.png" alt="Ground Truth Masks" width="80%">
-  <p><i><b>Figure 2:</b> Ground Truth Z-Energy Masks generated via Class Medoid formulation.</i></p>
+  <p><i><b>Figure 2:</b> Ground Truth Z-Energy Masks generated via Statistical Salience (employed so bands don't overpower/cancel out each other)</i></p>
 </div>
 
 ---
