@@ -156,7 +156,6 @@ class SWEEPDataset(Dataset):
         self.cache = {}
 
         index_file = os.path.join(self.dataset_path, "index.csv")
-        stats_path = os.path.join(self.dataset_path, "stats.json")
 
         if not os.path.exists(index_file):
             raise FileNotFoundError(f"Index not found at {index_file}.")
@@ -164,19 +163,12 @@ class SWEEPDataset(Dataset):
         print(f"Loading index from {index_file}...")
         df = pd.read_csv(index_file)
 
-        '''
-        with open(stats_path, 'r') as f:
-            self.stats_lookup = json.load(f)
-        '''
-
-        indices = np.arange(len(df))
-        labels = df['emotion_id'].values
         if subj is not None:
 
             df = df[df['filename'].str.split('_').str[0] == str(subj)]
-            #df_train, df_val = train_test_split(df, test_size=0.2, random_state=42, stratify=df['emotion_id'])
+
             splitter = GroupShuffleSplit(n_splits=1, test_size=1.0 - self.train_size, random_state=42)
-            train_idx, val_idx = next(splitter.split(df, groups=df['group_id']))
+            train_idx, val_idx = next(splitter.split(df, groups=df['bag_id']))
 
             df_train = df.iloc[train_idx]
             df_val = df.iloc[val_idx]
@@ -187,29 +179,46 @@ class SWEEPDataset(Dataset):
     
 
         if split == 'train':
-            print(f"Selecting TRAINING set ({len(df_train)} samples)")
-            df_slice = df_train if not experiment else df_train.sample(25000, random_state=42) #[:25000]
+            print(f"Selecting TRAINING set ({len(df_train)} windows)")
+            df_slice = df_train 
         elif split == 'val':
-            print(f"Selecting VALIDATION set ({len(df_val)} samples)")
-            df_slice = df_val if not experiment else df_val.sample(6400, random_state=42)#[:6400]
+            print(f"Selecting VALIDATION set ({len(df_val)} windows)")
+            df_slice = df_val 
         else:
             raise ValueError(f"Unknown split '{split}'. Use 'train' or 'val'.")
         
-        self.samples = list(zip(df_slice['filename'], df_slice['emotion_id'], df_slice['stats_key']))
+        # --- BAG LEVEL RESTRUCTURING ---
+        self.bag_size_limit = config['data'].get('mil_bag_size', 60) # Max windows per bag
+        
+        # Group by 'bag_id' (each trial clip is one bag)
+        grouped = df_slice.groupby('bag_id')
+        self.samples = []
+        for bag_id, group_df in grouped:
+            emotion_idx = group_df['emotion_id'].iloc[0]
+            # Maintain chronological order of files (s0, s1, s2, ...)
+            # Ensure proper string/int casting for consistent sorting if needed, but for now we expect the filenames to be chronological or we can just list them
+            files = group_df['filename'].tolist()
+            self.samples.append((bag_id, files, emotion_idx))
+
+        print(f"[{split.upper()}] Initialized with {len(self.samples)} Bags (Total Windows: {len(df_slice)})")
 
         if self.preload:
             print("Preloading data into RAM...")
-            for fname, _ in self.samples:
-                file_path = os.path.join(self.samples_dir, fname)
-                try:
-                    # Use weights_only=True for security, map_location='cpu' to avoid GPU memory
-                    # Use half precision to reduce RAM by 50% if acceptable
-                    video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-                    # Share memory for multiprocessing efficiency
-                    video.share_memory_()
-                    self.cache[fname] = video
-                except Exception as e:
-                    print(f"Error loading {fname}: {e}")
+            # We must preload all possible files mentioned in any bag
+            for _, files, _, _ in self.samples:
+                for fname in files:
+                    # Skip if already cached
+                    if fname in self.cache: continue
+                    file_path = os.path.join(self.samples_dir, fname)
+                    try:
+                        # Use weights_only=True for security, map_location='cpu' to avoid GPU memory
+                        # Use half precision to reduce RAM by 50% if acceptable
+                        video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+                        # Share memory for multiprocessing efficiency
+                        video.share_memory_()
+                        self.cache[fname] = video
+                    except Exception as e:
+                        print(f"Error loading {fname}: {e}")
             print("Cache complete!")
 
 
@@ -242,42 +251,61 @@ class SWEEPDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        fname, label_idx, stats_key = self.samples[idx]
+        bag_id, files, label_idx = self.samples[idx]
 
-        #mean = self.stats_lookup[stats_key]['mean']
-        #std = self.stats_lookup[stats_key]['std']
-
-        #print(label_idx)
-        file_path = os.path.join(self.samples_dir, fname)
-        if self.preload:
-            video = self.cache[fname]  # No clone needed - data is not modified in-place
+        # 1. Subsample files if the trial is too long
+        if len(files) > self.bag_size_limit:
+            selected_files = random.sample(files, self.bag_size_limit)
         else:
-            try:
-                video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-            except Exception as e:
-                print(f"Error loading {fname}: {e}")
-                return torch.zeros(5, 32, 32, 32), torch.zeros(32, 32), 0
+            selected_files = files
+
+        # Optional: Maintain chronological order
+        # Assuming filename format ending with '_s{id}.pt'
+        selected_files.sort(key=lambda x: int(x.split('_s')[-1].split('.pt')[0]))
         
-        #mean = video.mean(dim=(2,3,4), keepdim=True)
-        #std = video.std(dim=(2,3,4), keepdim=True) + 1e-8
+        loaded_tensors = []
+        for fname in selected_files:
+            file_path = os.path.join(self.samples_dir, fname)
+            if self.preload:
+                video = self.cache[fname] 
+            else:
+                try:
+                    video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+                except Exception as e:
+                    print(f"Error loading {fname}: {e}")
+                    # Zero tensor fallback for missing window
+                    video = torch.zeros(5, 32, 32, 32)
+            loaded_tensors.append(video)
 
+        # Stack into [K, C, H, W, T] (or your specific shape)
+        bag_video = torch.stack(loaded_tensors, dim=0) 
 
-        #video = (video - mean) / (std)
-        #print(video.shape)
+        # 2. Pad if bag was smaller than the limit (to prevent collate_fn crash)
+        if bag_video.size(0) < self.bag_size_limit:
+            pad_size = self.bag_size_limit - bag_video.size(0)
+            pad_shape = list(bag_video.shape)
+            pad_shape[0] = pad_size
+            padding = torch.zeros(pad_shape, dtype=bag_video.dtype, device=bag_video.device)
+            bag_video = torch.cat([bag_video, padding], dim=0)
+
+        # We keep the single prototype map for the whole bag
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
         target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
-        if self.augmentations is not None and self.split == 'train':
-            video1 = self.augmentations(video)
-            video2 = self.augmentations(video)
-            return video1, video2, target_map, label_idx, fname
         
-        return video, target_map, label_idx, fname
-    
+        # When augmentations happen, they need to handle the batched/bag 5D size 
+        # or we iteratively apply it. Assuming it's applied correctly later.
+        if self.augmentations is not None and self.split == 'train':
+            # Note: you may need to apply augmentations over the batch dimension K safely
+            video1 = self.augmentations(bag_video)
+            video2 = self.augmentations(bag_video)
+            return video1, video2, target_map, label_idx, bag_id
+
+        return bag_video, target_map, label_idx, bag_id
 
 class PKSampler(Sampler):
     def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None):
-        # Access labels directly from dataset.samples: (filename, emotion_id, stats_key)
-        self.labels = [s[1] for s in dataset.samples]
+        # Access labels directly from dataset.samples: (bag_id, files, emotion_idx)
+        self.labels = [s[2] for s in dataset.samples]
         print(f"PKSampler: {len(self.labels)} samples")
         
         self.labels = torch.tensor(self.labels).long()

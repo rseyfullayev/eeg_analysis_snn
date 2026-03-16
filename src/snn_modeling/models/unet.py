@@ -3,7 +3,7 @@ import torch.nn as nn
 import snntorch as snn
 from .decoders import ResNetDecoder, SpikingResNetDecoder
 from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead
-from ..layers.neurons import ALIF
+from ..layers.neurons import ALIF, TimeDistributed
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
 
@@ -31,7 +31,7 @@ class SpikingUNet(nn.Module):
         self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('reccurent_decoder', False), spike_model=spike_model, **snn_params)
         self.classifier = ClassifierHead(64, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, K=None):
         if self.encoding == 'latency':
             x_static = x.mean(dim=0)
             x = spikegen.latency(x_static, num_steps=self.num_timesteps, tau=5, threshold=0.01, normalize=True, clip=True)
@@ -65,15 +65,39 @@ class SpikingResNetClassifier(nn.Module):
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
-        self.classifier = ProjectionHead(256, 128) #ClassifierHead(128, num_classes)
+        self.avg_pool = TimeDistributed(nn.AdaptiveAvgPool2d((1,1)))
+        self.classifier = ProjectionHead(256, 128)
         
         
 
-    def forward(self, x):
+    def forward(self, x, K=None):
         features, _ = self.encoder(x)
-        #features = features.mean(dim=[3,4]).unsqueeze(3).unsqueeze(4) # Global Average Pooling
+        out = self.avg_pool(features).mean(dim=0)  # B x C x 1 x 1 -> B x C
 
-        out = self.classifier(features)
+        # === RTFM MIL SIEVE ===
+        # If K (windows per bag) is provided, perform Top-K aggregation
+        if K is not None and K > 1:
+            B_total, C_dim = out.shape
+            B = B_total // K
+            
+            out = out.view(B, K, C_dim)
+            
+            # Feature magnitude
+            magnitudes = torch.linalg.norm(out, dim=-1) # [B, K]
+            
+            top_k_val = min(5, K) # Keep top 5 windows
+            _, topk_indices = torch.topk(magnitudes, k=top_k_val, dim=1) # [B, 5]
+            
+            master_vectors = []
+            for b in range(B):
+                loudest_embeds = out[b, topk_indices[b], :] # [5, C_dim]
+                master_vectors.append(loudest_embeds.mean(dim=0))
+                
+            out = torch.stack(master_vectors, dim=0) # [B, C_dim]
+        # ======================
+
+        out = self.classifier(out)
+        
         #T,B,C,H,W = out.shape
         #out = out.mean(dim=[0,3,4])
-        return out #.mean(dim=0) # Mean over time dimension
+        return out

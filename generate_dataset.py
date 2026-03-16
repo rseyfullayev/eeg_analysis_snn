@@ -29,11 +29,10 @@ def parse_metadata(filename):
         subject_id = parts[0]
         session_id = "unknown"
 
-    stats_key = f"{subject_id}_{session_id}"
     
     trial_unique_id = clean_name 
     
-    return stats_key, subject_id, trial_unique_id
+    return subject_id, trial_unique_id
 
 def run_data_setup(config=None):
     print("Initializing Pipeline...")
@@ -68,9 +67,6 @@ def run_data_setup(config=None):
     
     # --- STATISTICS COLLECTOR ---
 
-    stats_reservoir = defaultdict(list)
-    RESERVOIR_LIMIT = 20000 
-
     registry = []
     sample_global_id = 0
     class_counts = {i: 0 for i in range(len(SELECTED_EMOTIONS))}
@@ -81,7 +77,7 @@ def run_data_setup(config=None):
     
     for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader)): 
         
-        stats_key, subject_id, trial_id = parse_metadata(orig_filename)
+        subject_id, trial_id = parse_metadata(orig_filename)
 
         if use_sampling_limit and total_collected >= TOTAL_TARGET: break
 
@@ -130,17 +126,10 @@ def run_data_setup(config=None):
             
             with torch.no_grad():
 
-                '''
-                # Collect Stats (Per Session/Subject)
-                if len(stats_reservoir[stats_key]) < RESERVOIR_LIMIT:
-                    flat_data = feats.flatten().cpu().numpy()
-                    indices = np.random.randint(0, len(flat_data), size=min(100, len(flat_data)))
-                    stats_reservoir[stats_key].extend(flat_data[indices])
-                '''
+    
 
                 # Topo & Save
                 video_batch = topo(batch_tensor)
-                #video_batch = torch.clamp(video_batch, min=0.0, max=50.0)  # 10^50 is impossible thus clipping
                 video_batch = video_batch.cpu()
 
                 for k in range(video_batch.shape[0]):
@@ -150,33 +139,15 @@ def run_data_setup(config=None):
                     
                     torch.save(video_batch[k].clone(), save_path)
                     
-                    # stats_key -> Used to look up Mean/Std later
-                    # trial_id -> Used for GroupShuffleSplit (The Video)
-                    registry.append(f"{fname},{stats_key},{trial_id},{emotion_id}")
+                    # trial_id -> Acts as our Bag ID (The unique Movie Clip)
+                    registry.append(f"{fname},{trial_id},{emotion_id}")
                     sample_global_id += 1
                 
             torch.cuda.empty_cache()
 
-
-    '''
-    # --- SAVE ---
-    print("Computing Stats...")
-    final_stats = {}
-    for key, values in stats_reservoir.items():
-        arr = np.array(values)
-        final_stats[key] = {
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
-            "p98": float(np.percentile(arr, 98))
-        }
-
-    with open(os.path.join(OUTPUT_FOLDER, "stats.json"), 'w') as f:
-        json.dump(final_stats, f, indent=4)
-    '''
-
     with open(os.path.join(OUTPUT_FOLDER, "index.csv"), 'w') as f:
 
-        f.write("filename,stats_key,group_id,emotion_id\n")
+        f.write("filename,bag_id,emotion_id\n")
         for line in registry:
             f.write(f"{line}\n")
             

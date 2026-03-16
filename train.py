@@ -61,10 +61,21 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     with torch.no_grad():
         for batch_idx, (inputs, targets, labels, _) in enumerate(val_loop):
             inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
-            B,T,C,H,W = inputs.shape
+            
+            K_bag = None
+            if inputs.dim() == 6:
+                B, K_bag, T, C, H, W = inputs.shape
+                inputs = inputs.view(B * K_bag, T, C, H, W)
+            else:
+                B, T, C, H, W = inputs.shape
+                
             inputs = inputs.permute(1, 0, 2, 3, 4)
             
-            outputs = model(inputs)
+            outputs = model(inputs, K=K_bag)
+
+            if K_bag is not None and outputs.shape[0] == B * K_bag:
+                outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
+
             if only_classification:
                 #_,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
                 loss = 0 #criterion(outputs, labels) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
@@ -284,10 +295,23 @@ def training_loop(phase,
                 
             targets, targets_c = targets.to(device), targets_c.to(device)
             
-            B,T,C,H,W = inputs.shape
+            # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
+            K_bag = None
+            if inputs.dim() == 6:
+                B, K_bag, T, C, H, W = inputs.shape
+                # Flatten Bags into Batch dimension for the SNN Encoder
+                inputs = inputs.view(B * K_bag, T, C, H, W)
+            else:
+                B, T, C, H, W = inputs.shape
             
+            # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
             inputs = inputs.permute(1,0,2,3,4) 
-            outputs = model(inputs)
+            outputs = model(inputs, K=K_bag)
+
+            # If the model didn't internally reduce K (e.g. Phase 2 UNet)
+            if K_bag is not None and outputs.shape[0] == B * K_bag:
+                # Average all windows in the bag so it matches the B targets
+                outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
 
             if phase == 1:
                 f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)

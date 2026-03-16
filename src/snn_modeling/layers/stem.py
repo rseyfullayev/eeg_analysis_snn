@@ -31,7 +31,7 @@ class BottleneckBlock(nn.Module):
 class ProjectionHead(nn.Module):
     def __init__(self, feature_dim=512, head_dim=128):
         super(ProjectionHead, self).__init__()
-        self.avg_pool = TimeDistributed(nn.AdaptiveAvgPool2d((1,1)))
+
         self.supcon_head = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, kernel_size=1),
             nn.BatchNorm2d(feature_dim, affine=True),
@@ -39,9 +39,7 @@ class ProjectionHead(nn.Module):
             nn.Conv2d(feature_dim, head_dim, kernel_size=1)
         )
     def forward(self, features):
-        T, B, C, H, W = features.shape
-        features = self.avg_pool(features).mean(dim=0)  # B x C x 1 x 1
-
+        B, D = features.shape
         proj = self.supcon_head(features)
         embedding = F.normalize(proj.view(B, -1), dim=1, eps=1e-6)
         return embedding
