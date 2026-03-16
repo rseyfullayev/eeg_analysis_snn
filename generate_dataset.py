@@ -61,7 +61,10 @@ def run_data_setup(config=None):
     dataset_reader = DatasetReader(RAW_FOLDER)
     wavelet = WaveletModule(fs=SAMPLING_RATE, target_steps=TARGET_STEPS, device=device)
     coords = pd.read_csv(COORDS_PATH, sep=',')
-    topo = TopoMapper(coords, grid_size=config['data'].get('grid_size', 32), device=device)
+    
+    # Allow perplexity to be dynamically configured
+    perplexity_val = config['data'].get('perplexity', 5.0)
+    topo = TopoMapper(coords, grid_size=config['data'].get('grid_size', 32), perplexity=perplexity_val, device=device)
 
     emotion_map = {original: idx for idx, original in enumerate(SELECTED_EMOTIONS)}
     

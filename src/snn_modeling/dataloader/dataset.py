@@ -253,15 +253,13 @@ class SWEEPDataset(Dataset):
     def __getitem__(self, idx):
         bag_id, files, label_idx = self.samples[idx]
 
-        # 1. Subsample files if the trial is too long
+        # 1. Subsample random independent windows from across the entire trial.
+        # This ensures the MIL bag captures a representative distribution of the whole movie,
+        # maximizing the chance we include the transient 300ms emotional spike!
         if len(files) > self.bag_size_limit:
             selected_files = random.sample(files, self.bag_size_limit)
         else:
             selected_files = files
-
-        # Optional: Maintain chronological order
-        # Assuming filename format ending with '_s{id}.pt'
-        selected_files.sort(key=lambda x: int(x.split('_s')[-1].split('.pt')[0]))
         
         loaded_tensors = []
         for fname in selected_files:
