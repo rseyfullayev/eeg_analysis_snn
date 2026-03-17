@@ -3,7 +3,7 @@ import torch.nn as nn
 import snntorch as snn
 from .decoders import ResNetDecoder, SpikingResNetDecoder
 from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead
-from ..layers.neurons import ALIF, TimeDistributed
+from ..layers.neurons import ALIF, TimeDistributed, SwiGLU
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
 
@@ -60,44 +60,64 @@ class UNet(nn.Module):
         raise NotImplementedError("This is a placeholder for the ANN UNet.")
 
 class SpikingResNetClassifier(nn.Module):
-    def __init__(self, encoder_backbone, num_classes=5):
+    def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False):
         super().__init__()
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
         self.avg_pool = TimeDistributed(nn.AdaptiveAvgPool2d((1,1)))
-        self.classifier = ProjectionHead(256, 128)
+        self.use_swiglu = use_swiglu
+        
+        # --- SwiGLU MIL Attention Heads (Optional) ---
+        if self.use_swiglu:
+            self.mil_attention = nn.Sequential(
+                SwiGLU(feature_dim, p_drop=0.2),
+                nn.Linear(feature_dim, 1, bias=False)
+            )
+        
+        self.classifier = ProjectionHead(feature_dim, 128)
         
         
 
     def forward(self, x, K=None):
         features, _ = self.encoder(x)
-        out = self.avg_pool(features).mean(dim=0)  # B x C x 1 x 1 -> B x C
+        out = self.avg_pool(features).mean(dim=0).squeeze(-1).squeeze(-1)  # B x C x 1 x 1 -> B x C
 
-        # === RTFM MIL SIEVE ===
-        # If K (windows per bag) is provided, perform Top-K aggregation
+        # === HYBRID MIL: Pre-Normalized RTFM Gating (or SwiGLU) ===
         if K is not None and K > 1:
             B_total, C_dim = out.shape
             B = B_total // K
             
+            # Reshape to [Bags, Windows, Channels]
             out = out.view(B, K, C_dim)
             
-            # Feature magnitude
-            magnitudes = torch.linalg.norm(out, dim=-1) # [B, K]
-            
-            top_k_val = min(5, K) # Keep top 5 windows
-            _, topk_indices = torch.topk(magnitudes, k=top_k_val, dim=1) # [B, 5]
-            
-            master_vectors = []
-            for b in range(B):
-                loudest_embeds = out[b, topk_indices[b], :] # [5, C_dim]
-                master_vectors.append(loudest_embeds.mean(dim=0))
+            if self.use_swiglu:
+                # 1. Compute Attention Scores using SwiGLU
+                attn_scores = self.mil_attention(out)
+                # 2. Normalize via Softmax across the K windows
+                attn_weights = torch.softmax(attn_scores, dim=1)
+                # 3. Aggregate windows via weighted sum
+                out = torch.sum(out * attn_weights, dim=1)
+            else:
+                # --- Pre-Normalized RTFM Sieve ---
+                # 1. Calculate unnormalized L2 magnitude of embeddings
+                magnitudes = torch.linalg.norm(out, dim=-1) # [B, K]
                 
-            out = torch.stack(master_vectors, dim=0) # [B, C_dim]
-        # ======================
+                # 2. Extract Top-K (e.g., top 5) loudest bursts
+                top_k_val = min(5, K) 
+                _, topk_indices = torch.topk(magnitudes, k=top_k_val, dim=1) # [B, 5]
+                
+                master_vectors = []
+                for b in range(B):
+                    # 3. Gather highest magnitude vectors and average them BEFORE projection
+                    loudest_embeds = out[b, topk_indices[b], :] # [5, C_dim]
+                    master_vectors.append(loudest_embeds.mean(dim=0))
+                    
+                out = torch.stack(master_vectors, dim=0) # [B, C_dim]
+        # ============================
 
+        # The averaged Top-K (or SwiGLU-weighted) vector is passed to the Projection Head
+        # which will apply F.normalize prior to SupCon!
         out = self.classifier(out)
         
-        #T,B,C,H,W = out.shape
-        #out = out.mean(dim=[0,3,4])
         return out
