@@ -1,5 +1,5 @@
 import argparse
-import yaml
+from omegaconf import OmegaConf
 import os
 import torch
 import torch.nn as nn
@@ -54,8 +54,15 @@ def main():
         parser.error("You CANNOT specify both --loso and --subj at the same time.")
     
     
-    with open(config_path, 'r') as file:
-        config = yaml.safe_load(file)
+    # Load base config
+    base_config = OmegaConf.load(config_path)
+    # Parse any unknown args from CLI as OmegaConf overrides (e.g. data.batch_size=64)
+    # argparse ignores `key=value` by default if not added via add_argument, but we can capture them:
+    import sys
+    cli_args = [arg for arg in sys.argv[1:] if '=' in arg]
+    cli_config = OmegaConf.from_cli(cli_args)
+    
+    config = OmegaConf.merge(base_config, cli_config)
 
     if args.mode == 'test':
         if args.checkpoint is None:
@@ -63,7 +70,8 @@ def main():
         model = build_model(config).to(device)
         enc_class = SpikingResNetClassifier(
             encoder_backbone = model.encoder,
-            num_classes=config['model'].get('num_classes', 5)
+            num_classes=config.model.get('num_classes', 5),
+            use_swiglu=config.model.get('use_swiglu', False)
         ).to(device)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         print(f"Loaded checkpoint from {args.checkpoint}.")
@@ -90,7 +98,7 @@ def main():
         chk = {k[8:]:v for k,v in checkpoint['model_state_dict'].items() if 'encoder' in k}
         model.encoder.load_state_dict(chk)
 
-        masks = torch.load(os.path.join(config['data']['dataset_path'],'masks.pt')).to(device)
+        masks = torch.load(os.path.join(config.data.dataset_path,'masks.pt')).to(device)
         val_set = SWEEPDataset(
                                 config, 
                                 split='val',
@@ -101,9 +109,9 @@ def main():
                                 )
         
         val_loader = DataLoader(val_set, 
-                            batch_size=config['training']['batch_size'], 
+                            batch_size=config.training.batch_size, 
                             shuffle=False, 
-                            num_workers=config['data'].get('num_workers', 0),
+                            num_workers=config.data.get('num_workers', 0),
                             prefetch_factor=4,
                             persistent_workers=True,
                             pin_memory=True)
@@ -133,9 +141,9 @@ def main():
         print("Running dataset setup...")
         if not args.raw_path or not args.coords_path or not args.output_path:
             parser.error("When using --setup_data, you MUST specify --raw_path, --coords_path, and --output_path.")
-        config['data']['raw_path'] = args.raw_path
-        config['data']['coords_path'] = args.coords_path
-        config['data']['dataset_path'] = args.output_path
+        config.data.raw_path = args.raw_path
+        config.data.coords_path = args.coords_path
+        config.data.dataset_path = args.output_path
         print(f"   Raw Source: {args.raw_path}")
         print(f"   Coordinates: {args.coords_path}")
         print(f"   Target: {args.output_path}")
@@ -157,7 +165,8 @@ def main():
         if args.phase == 1:
             model = SpikingResNetClassifier(
                                             encoder_backbone = model.encoder,
-                                            num_classes=config['model'].get('num_classes', 5)
+                                            num_classes=config.model.get('num_classes', 5),
+                                            use_swiglu=config.model.get('use_swiglu', False)
                                             ).to(device)
         if checkpoint is not None:
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -170,7 +179,7 @@ def main():
         if not args.loso and not args.subj:
             parser.error("You MUST specify --loso or --subj for validation.")
         
-        masks = torch.load(os.path.join(config['data']['dataset_path'],'masks.pt')).to(device)
+        masks = torch.load(os.path.join(config.data.dataset_path,'masks.pt')).to(device)
         val_set = SWEEPDataset(
                                 config, 
                                 split='val',
@@ -181,9 +190,9 @@ def main():
                                 )
         
         val_loader = DataLoader(val_set, 
-                            batch_size=config['training']['batch_size'], 
+                            batch_size=config.training.batch_size, 
                             shuffle=False, 
-                            num_workers=config['data'].get('num_workers', 0),
+                            num_workers=config.data.get('num_workers', 0),
                             prefetch_factor=4,
                             persistent_workers=True,
                             pin_memory=True)
@@ -191,12 +200,12 @@ def main():
 
         loss_fn = FullHybridLoss(
         smooth = 0.0,
-        lambda_seg = config['loss'].get('lambda_seg', 1.0),
+        lambda_seg = config.loss.get('lambda_seg', 1.0),
         lambda_con = 0.0,
-        lambda_class = config['loss'].get('lambda_class', 1.0),
-        alpha = config['loss'].get('alpha', 0.5),
-        beta = config['loss'].get('beta', 0.5),
-        time_steps=config['data'].get('num_timesteps', 16),
+        lambda_class = config.loss.get('lambda_class', 1.0),
+        alpha = config.loss.get('alpha', 0.5),
+        beta = config.loss.get('beta', 0.5),
+        time_steps=config.data.get('num_timesteps', 16),
         )
 
         loss_fn.class_loss.masks = val_loader.dataset.prototypes
@@ -225,7 +234,8 @@ def main():
         if args.find_repr:
             enc_class = SpikingResNetClassifier(
             encoder_backbone = model.encoder,
-            num_classes=config['model'].get('num_classes', 5)
+            num_classes=config.model.get('num_classes', 5),
+            use_swiglu=config.model.get('use_swiglu', False)
             ).to(device)
             
             enc_class.load_state_dict(checkpoint['model_state_dict'])

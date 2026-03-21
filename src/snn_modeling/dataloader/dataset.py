@@ -146,12 +146,12 @@ class SWEEPDataset(Dataset):
     def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None):
         self.config = config
         self.split = split
-        self.num_classes = config['data'].get('n_emotions', 5)
-        self.grid_size = config['data'].get('grid_size', 32)
-        self.dataset_path = config['data']['dataset_path'] 
+        self.num_classes = config.data.get('n_emotions', 5)
+        self.grid_size = config.data.get('grid_size', 32)
+        self.dataset_path = config.data.dataset_path 
         self.samples_dir = os.path.join(self.dataset_path)
-        self.preload = config['data'].get('preload_ram', False)
-        self.train_size = config['data'].get('train_size', 0.8)
+        self.preload = config.data.get('preload_ram', False)
+        self.train_size = config.data.get('train_size', 0.8)
         self.augmentations = augmentations
         self.cache = {}
 
@@ -188,7 +188,7 @@ class SWEEPDataset(Dataset):
             raise ValueError(f"Unknown split '{split}'. Use 'train' or 'val'.")
         
         # --- BAG LEVEL RESTRUCTURING ---
-        self.bag_size_limit = config['data'].get('mil_bag_size', 60) # Max windows per bag
+        self.bag_size_limit = config.data.get('mil_bag_size', 60) # Max windows per bag
         
         # Group by 'bag_id' (each trial clip is one bag)
         grouped = df_slice.groupby('bag_id')
@@ -222,8 +222,8 @@ class SWEEPDataset(Dataset):
             print("Cache complete!")
 
 
-        sigma = config['mask'].get('sigma', 0.25)
-        radius = config['mask'].get('radius', 0.7)
+        sigma = config.mask.get('sigma', 0.25)
+        radius = config.mask.get('radius', 0.7)
         if prototypes is not None:
             self.prototypes = prototypes
         else:

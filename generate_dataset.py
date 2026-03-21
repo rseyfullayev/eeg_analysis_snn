@@ -38,14 +38,14 @@ def run_data_setup(config=None):
     print("Initializing Pipeline...")
 
      # [Standard Config Setup - Same as before]
-    WINDOW_SIZE = config['data'].get('window_size', 256)
-    STEP_SIZE = config['data'].get('step_size', 128)
-    TARGET_STEPS = config['data'].get('num_timesteps', 32)
-    SAMPLING_RATE = config['data'].get('sampling_rate', 256) 
-    RAW_FOLDER = config['data']['raw_path']
-    COORDS_PATH = config['data']['coords_path']
-    OUTPUT_FOLDER = config['data']['dataset_path'] 
-    TOTAL_TARGET = config['data'].get('num_samples', None)
+    WINDOW_SIZE = config.data.get('window_size', 256)
+    STEP_SIZE = config.data.get('step_size', 128)
+    TARGET_STEPS = config.data.get('num_timesteps', 32)
+    SAMPLING_RATE = config.data.get('sampling_rate', 256) 
+    RAW_FOLDER = config.data.raw_path
+    COORDS_PATH = config.data.coords_path
+    OUTPUT_FOLDER = config.data.dataset_path 
+    TOTAL_TARGET = config.data.get('num_samples', None)
 
     # [Setup Limit Logic - Same as before]
     if TOTAL_TARGET:
@@ -63,8 +63,8 @@ def run_data_setup(config=None):
     coords = pd.read_csv(COORDS_PATH, sep=',')
     
     # Allow perplexity to be dynamically configured
-    perplexity_val = config['data'].get('perplexity', 5.0)
-    topo = TopoMapper(coords, grid_size=config['data'].get('grid_size', 32), perplexity=perplexity_val, device=device)
+    perplexity_val = config.data.get('perplexity', 5.0)
+    topo = TopoMapper(coords, grid_size=config.data.get('grid_size', 32), perplexity=perplexity_val, device=device)
 
     emotion_map = {original: idx for idx, original in enumerate(SELECTED_EMOTIONS)}
     

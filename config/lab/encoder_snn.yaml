@@ -34,6 +34,7 @@ model:
   num_classes: 5
   dropout: 0.2
   vit_dropout: 0.3
+  use_swiglu: false # Choose between SwiGLU Attention Heads (true) or Pre-Normalized RTFM Gating (false)
 
 neuron_params:
   spike_model: "ALIF" 

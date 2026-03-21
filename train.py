@@ -187,7 +187,7 @@ def freeze_bn_stats(module):
             module.eval()
 
 def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
-    lr = config['training'].get('learning_rate', 1e-3)
+    lr = config.training.get('learning_rate', 1e-3)
     encoder_params = []
     base_params = []
     base_params_no_decay = []
@@ -240,8 +240,8 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
             base_params.append(param)
             print(f"Base Decay Param: {name}")
     optimizer = optim.AdamW([
-        {'params': base_params, 'lr': lr, 'weight_decay': config['training'].get('weight_decay', 1e-4)},
-        {'params': encoder_params, 'lr': lr * 1e-2, 'weight_decay': config['training'].get('weight_decay', 1e-4)},
+        {'params': base_params, 'lr': lr, 'weight_decay': config.training.get('weight_decay', 1e-4)},
+        {'params': encoder_params, 'lr': lr * 1e-2, 'weight_decay': config.training.get('weight_decay', 1e-4)},
         {'params': base_params_no_decay, 'lr': lr, 'weight_decay': 0.0},
         {'params': time_params, 'lr': lr * 0.5, 'weight_decay': 0.0},
         {'params': threshold_params, 'lr': lr * 1.0, 'weight_decay': 0.0}
@@ -396,18 +396,19 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     print("=== Phase One: Training Encoder Only ===")
     enc_class = SpikingResNetClassifier(
         encoder_backbone = model.encoder,
-        num_classes=config['model'].get('num_classes', 5)
+        num_classes=config.model.get('num_classes', 5),
+        use_swiglu=config.model.get('use_swiglu', False)
     ).to(device)
 
     initialize_network(enc_class, train_loader, device)
     """loss_fn = FullHybridLoss(
         smooth = 0.,
-        lambda_seg = config['loss'].get('lambda_seg', 1.0),
-        lambda_con = config['loss'].get('lambda_con', 0.0),
-        lambda_class = config['loss'].get('lambda_class', 1.0),
+        lambda_seg = config.loss.get('lambda_seg', 1.0),
+        lambda_con = config.loss.get('lambda_con', 0.0),
+        lambda_class = config.loss.get('lambda_class', 1.0),
         alpha = 0.,
         beta = 0.,
-        time_steps=config['data'].get('num_timesteps', 16),
+        time_steps=config.data.get('num_timesteps', 16),
     )"""
 
     loss_fn = ContrastiveLoss(train_loader.dataset.prototypes) #nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -417,9 +418,9 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     start_epoch = 0
     best_acc = 100.0
     best_dice = 0.0
-    epochs = config['training']['phase_1_epochs']
-    warmup_epochs = config['training'].get('warmup_epochs', 0)
-    accumulation_steps = config['training'].get('accumulation_steps', 1)
+    epochs = config.training.phase_1_epochs
+    warmup_epochs = config.training.get('warmup_epochs', 0)
+    accumulation_steps = config.training.get('accumulation_steps', 1)
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
     '''
@@ -447,12 +448,12 @@ def phase_two(config, model, device, train_loader, val_loader, writer, checkpoin
     initialize_network(model, train_loader, device)
     loss_fn = FullHybridLoss(
         smooth = 0.0,
-        lambda_seg = config['loss'].get('lambda_seg', 1.0),
+        lambda_seg = config.loss.get('lambda_seg', 1.0),
         lambda_con = 0.0,
-        lambda_class = config['loss'].get('lambda_class', 1.0),
-        alpha = config['loss'].get('alpha', 0.5),
-        beta = config['loss'].get('beta', 0.5),
-        time_steps=config['data'].get('num_timesteps', 16),
+        lambda_class = config.loss.get('lambda_class', 1.0),
+        alpha = config.loss.get('alpha', 0.5),
+        beta = config.loss.get('beta', 0.5),
+        time_steps=config.data.get('num_timesteps', 16),
     )
     loss_fn.class_loss.masks = train_loader.dataset.prototypes
 
@@ -464,8 +465,8 @@ def phase_two(config, model, device, train_loader, val_loader, writer, checkpoin
     start_epoch = 0
     best_acc = 0.0
     best_dice = 0.0
-    epochs = config['training']['phase_2_epochs']
-    accumulation_steps = config['training'].get('accumulation_steps', 1)
+    epochs = config.training.phase_2_epochs
+    accumulation_steps = config.training.get('accumulation_steps', 1)
 
     for param in model.encoder.parameters():
         param.requires_grad = False
@@ -491,17 +492,17 @@ def phase_three(config, model, device, train_loader, val_loader, writer, checkpo
     
     loss_fn = FullHybridLoss(
         smooth = 0.0,
-        lambda_seg = config['loss'].get('lambda_seg', 1.0),
+        lambda_seg = config.loss.get('lambda_seg', 1.0),
         lambda_con = 0.0,
-        lambda_class = config['loss'].get('lambda_class', 1.0),
-        alpha = config['loss'].get('alpha', 0.5),
-        beta = config['loss'].get('beta', 0.5),
-        time_steps=config['data'].get('num_timesteps', 16),
+        lambda_class = config.loss.get('lambda_class', 1.0),
+        alpha = config.loss.get('alpha', 0.5),
+        beta = config.loss.get('beta', 0.5),
+        time_steps=config.data.get('num_timesteps', 16),
     )
 
     loss_fn.add_fire_rate_loss(model, 
-                               lambda_fire=config['loss'].get('lambda_fire', 0.1), 
-                               target_rate=config['loss'].get('target_rate', 0.05))
+                               lambda_fire=config.loss.get('lambda_fire', 0.1), 
+                               target_rate=config.loss.get('target_rate', 0.05))
 
     loss_fn.to(device)
 
@@ -526,8 +527,8 @@ def phase_three(config, model, device, train_loader, val_loader, writer, checkpo
     start_epoch = 0
     best_acc = 0.0
     best_dice = 0.0
-    epochs = config['training']['phase_3_epochs']
-    accumulation_steps = config['training'].get('accumulation_steps', 1)
+    epochs = config.training.phase_3_epochs
+    accumulation_steps = config.training.get('accumulation_steps', 1)
     
     optimizer = create_optimizer(model, loss_fn, config, low_encoder_lr=True)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -554,19 +555,19 @@ phase_handles = {
 def run_training(config, model, device, phase, resume, loso=None, subj=None, checkpoint=None):
 
     if loso:
-        run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_loso{loso}"
+        run_name = f"{config.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_loso{loso}"
     else:
-        run_name = f"{config['experiment_name']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_subj{subj}"
-    checkpoint_dir = os.path.join(config['data'].get('save_path', ''), "saved_models", f"phase{phase}", run_name)
+        run_name = f"{config.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_subj{subj}"
+    checkpoint_dir = os.path.join(config.data.get('save_path', ''), "saved_models", f"phase{phase}", run_name)
     
     
     os.makedirs(checkpoint_dir, exist_ok=True)
     wandb.init(
-        project=config['logging']['project_name'],
-        name=config['logging']['run_name'],
+        project=config.logging.project_name,
+        name=config.logging.run_name,
         config=config,
-        tags=config['logging']['tags'],
-        mode="disabled" if config['logging'].get('offline') else "online",
+        tags=config.logging.tags,
+        mode="disabled" if config.logging.get('offline') else "online",
         settings=wandb.Settings(_disable_stats=True, _disable_meta=True) 
     )
     
@@ -574,7 +575,7 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     writer = SummaryWriter(log_dir=log_dir)
     print(f"Initializing TensorBoard: {log_dir}")
 
-    masks = torch.load(os.path.join(config['data']['dataset_path'],'masks.pt')).to(device)
+    masks = torch.load(os.path.join(config.data.dataset_path,'masks.pt')).to(device)
     density = masks.sum() / masks.numel()
     print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
 
@@ -605,21 +606,21 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         prototypes=masks
     )
 
-    num_workers = config['data'].get('num_workers', 0)
-    prefetch = config['data'].get('prefetch_factor', 2) if num_workers > 0 else None
+    num_workers = config.data.get('num_workers', 0)
+    prefetch = config.data.get('prefetch_factor', 2) if num_workers > 0 else None
     persist = num_workers > 0  # Only use persistent_workers if num_workers > 0
     
     train_loader = DataLoader(train_set, 
                               batch_sampler=PKSampler(train_set, 
-                                                      batch_size=config['training']['batch_size'], 
-                                                      n_classes=config['model'].get('n_emotions', 5)),
+                                                      batch_size=config.training.batch_size, 
+                                                      n_classes=config.model.get('n_emotions', 5)),
                               num_workers=num_workers,
                               prefetch_factor=prefetch,
                               persistent_workers=persist,
                               pin_memory=True)
     
     val_loader = DataLoader(val_set, 
-                            batch_size=config['training']['batch_size'], 
+                            batch_size=config.training.batch_size, 
                             shuffle=False, 
                             num_workers=num_workers,
                             prefetch_factor=prefetch,

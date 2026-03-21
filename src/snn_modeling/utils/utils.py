@@ -48,7 +48,7 @@ def generate_masks(config, subject_id):
     print(f"--- GENERATING MASKS USING MAHALANOBIS (STATISTICAL SALIENCE) FOR SUBJECT {subject_id} ---")
     
     # 1. Load Index
-    df = pd.read_csv(os.path.join(config['data']['dataset_path'], "index.csv"))
+    df = pd.read_csv(os.path.join(config.data.dataset_path, "index.csv"))
     df = df[df['filename'].str.startswith(f"{subject_id}_")]
     
     if len(df) == 0: raise ValueError(f"No data found for Subject {subject_id}")
@@ -56,17 +56,17 @@ def generate_masks(config, subject_id):
     # 2. Welford's Online Algorithm for Mean/Std Calculation
     # We need accurate pixel-wise STD to punish noisy bands.
     n = 0
-    mean = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
-    m2 = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size']) # Sum of squares of differences
+    mean = torch.zeros(5, config.data.grid_size, config.data.grid_size)
+    m2 = torch.zeros(5, config.data.grid_size, config.data.grid_size) # Sum of squares of differences
     
     # We also need to accumulate class-specific sums
-    class_sums = torch.zeros(5, 5, config['data']['grid_size'], config['data']['grid_size'])
+    class_sums = torch.zeros(5, 5, config.data.grid_size, config.data.grid_size)
     class_counts = torch.zeros(5)
 
     print("Scanning Dataset for Statistics...")
     # NOTE: To save time, you can sample 20% of data, but full scan is better for GT.
     for _, row in tqdm(df.iterrows(), total=len(df)):
-        fpath = os.path.join(config['data']['dataset_path'], row['filename'])
+        fpath = os.path.join(config.data.dataset_path, row['filename'])
         try:
             # Load [T, 5, 32, 32] -> Mean over Time -> [5, 32, 32]
             # We treat the *Trial Average* as the data point.
@@ -99,7 +99,7 @@ def generate_masks(config, subject_id):
             class_prototypes[i] = class_sums[i] / class_counts[i]
 
     # 3. Compute Salience Masks (Z-Score Energy)
-    final_masks = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
+    final_masks = torch.zeros(5, config.data.grid_size, config.data.grid_size)
     
     print("Computing Z-Score Energy Maps...")
     for i in range(5):
@@ -504,7 +504,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
     model.eval()
     model.to(device)
     
-    df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
+    df = pd.read_csv(config.data.dataset_path + "/index.csv")
     
     all_subjects = df['filename'].str.split('_').str[0].unique()
     
@@ -522,7 +522,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
         
         with torch.no_grad():
             for fname in df_subj['filename']:
-                path = os.path.join(config['data']['dataset_path'], fname)
+                path = os.path.join(config.data.dataset_path, fname)
                 try:
                     data = torch.load(path).float()   
                     data = data.unsqueeze(0).to(device).permute(1,0,2,3,4)  # [T, 1, C, H, W]
@@ -566,7 +566,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
 def run_bio_audit(config, device='cpu', samples=300):
     print("--- STARTING BIOLOGICAL AUDIT (MODEL-FREE, MAHALANOBIS) ---")
 
-    df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
+    df = pd.read_csv(config.data.dataset_path + "/index.csv")
     all_subjects = sorted(df['filename'].str.split('_').str[0].unique(), key=int)
 
     subject_maps = {}
@@ -584,7 +584,7 @@ def run_bio_audit(config, device='cpu', samples=300):
             count = 0
             
             for fname in subset['filename']:
-                path = os.path.join(config['data']['dataset_path'], fname)
+                path = os.path.join(config.data.dataset_path, fname)
                 try:
                     data = torch.load(path).float().permute(1,0,2,3).numpy() 
        
