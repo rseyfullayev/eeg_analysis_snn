@@ -253,11 +253,19 @@ class SWEEPDataset(Dataset):
     def __getitem__(self, idx):
         bag_id, files, label_idx = self.samples[idx]
 
-        # 1. Subsample random independent windows from across the entire trial.
-        # This ensures the MIL bag captures a representative distribution of the whole movie,
-        # maximizing the chance we include the transient 300ms emotional spike!
+        # 1. Stratified Strided Sampling (Binning).
+        # We divide the trial into 'bag_size_limit' equal temporal bins,
+        # and randomly select exactly ONE window from each bin.
+        # This guarantees we sample from the beginning, middle, and end of the movie.
         if len(files) > self.bag_size_limit:
-            selected_files = random.sample(files, self.bag_size_limit)
+            bin_size = len(files) / self.bag_size_limit
+            selected_files = []
+            for i in range(self.bag_size_limit):
+                start_idx = int(i * bin_size)
+                end_idx = int((i + 1) * bin_size)
+                # Randomly pick ONE window from inside this bin
+                chosen_idx = random.randint(start_idx, max(start_idx, end_idx - 1))
+                selected_files.append(files[chosen_idx])
         else:
             selected_files = files
         

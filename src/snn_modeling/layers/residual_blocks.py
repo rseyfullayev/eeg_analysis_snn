@@ -2,6 +2,7 @@ import torch.nn as nn
 import snntorch as snn
 from .neurons import TimeDistributed, TemporalShift, TemporalOrderFix, ODConv2d
 from torchvision.ops import StochasticDepth
+from .activations import instantiate_activation, is_alif
 
 
 class ConvSpiking(nn.Module):
@@ -37,12 +38,12 @@ class ConvSpiking(nn.Module):
                                               groups=groups))
         
         layer_params = neuron_params.copy()
-        if spike_model.__name__ == 'ALIF':
+        if is_alif(spike_model):
             layer_params['num_channels'] = out_channels
 
         self.norm = TemporalOrderFix(nn.InstanceNorm3d(out_channels, affine=True)) if use_norm else nn.Identity()
 
-        self.spike = spike_model(**layer_params)
+        self.spike = instantiate_activation(spike_model, **layer_params)
 
     def forward(self, x):
         x = self.conv(x)
@@ -114,10 +115,10 @@ class SpikingResBlock(nn.Module):
             self.downsample = nn.Identity()
 
         layer_params = neuron_params.copy()
-        if spike_model.__name__ == 'ALIF':
+        if is_alif(spike_model):
             layer_params['num_channels'] = out_channels
             
-        self.final_spike = spike_model(**layer_params)
+        self.final_spike = instantiate_activation(spike_model, **layer_params)
         self.drop_path = StochasticDepth(p=p_path, mode='row')
 
     def forward(self, x):

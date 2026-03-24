@@ -1,0 +1,32 @@
+defaults:
+  - data: seed_v_local
+  - encoder: analog
+  - decoder: spiking        
+  - architecture: phase1_swiglu 
+  - training: phase1
+  - _self_
+
+experiment_name: "MobileNet_SWIGLU"
+description: "Phase 1 with MobileNet Encoder and SwiGLU Attention Heads"
+
+mask:
+  type: "Differential"
+  sigma: 0.25
+  radius: 0.7
+
+loss:
+  smooth: 0.0
+  lambda_seg: 0.0
+  lambda_con: 0.0
+  lambda_class: 1.0
+  lambda_fire: 0.0
+  target_rate: 0.1
+  alpha: 0.3
+  beta: 0.7
+
+logging:
+  project_name: "snn-encoding-showdown"
+  run_name: "MobileNet_SWIGLU"
+  tags: ["mobilenet", "swiglu", "con", "tsm", "mil"]
+  offline: false
+  log_interval: 1

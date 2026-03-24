@@ -2,10 +2,13 @@ import torch.nn as nn
 import snntorch as snn
 from ..layers.residual_blocks import SpikingResBlock, ConvSpiking
 from ..layers.stem import TemporalViTBlock, TemporalGCBlock
+from ..layers.activations import instantiate_activation, resolve_activation, is_alif
 
 class SpikingMobileNetEncoder(nn.Module):
     def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=False, gc=False, spike_model=snn.Leaky, **neuron_params):
         super(SpikingMobileNetEncoder, self).__init__()
+        
+        spike_model = resolve_activation(spike_model)
 
 
         def _make_stage(in_c, out_c, stride, dilation, blocks, odconv, **params):
@@ -40,11 +43,11 @@ class SpikingMobileNetEncoder(nn.Module):
             use_norm=True)
         
         no_norm_layer_params = neuron_params.copy()
-        if spike_model.__name__ == 'ALIF':
+        if is_alif(spike_model):
             no_norm_layer_params['batch_norm'] = False
 
         last_layer_params = no_norm_layer_params.copy()
-        if spike_model.__name__ == 'ALIF':
+        if is_alif(spike_model):
             last_layer_params['return_mem'] = True
 
         self.stage1 = _make_stage(20, 32, stride=2, dilation=1, blocks=2, odconv=False, **no_norm_layer_params)

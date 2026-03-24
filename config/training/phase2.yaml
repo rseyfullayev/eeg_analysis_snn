@@ -1,0 +1,8 @@
+warmup_epochs: 0
+phase_1_epochs: 0
+phase_2_epochs: 50
+phase_3_epochs: 0
+batch_size: 64
+learning_rate: 0.001
+weight_decay: 0.01
+accumulation_steps: 1

@@ -394,11 +394,16 @@ def training_loop(phase,
 
 def phase_one(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
     print("=== Phase One: Training Encoder Only ===")
-    enc_class = SpikingResNetClassifier(
-        encoder_backbone = model.encoder,
-        num_classes=config.model.get('num_classes', 5),
-        use_swiglu=config.model.get('use_swiglu', False)
-    ).to(device)
+    
+    if isinstance(model, SpikingResNetClassifier):
+        enc_class = model
+    else:
+        # Fallback for old style config!
+        enc_class = SpikingResNetClassifier(
+            encoder_backbone = model.encoder,
+            num_classes=config.model.get('num_classes', 5),
+            use_swiglu=config.model.get('use_swiglu', False)
+        ).to(device)
 
     initialize_network(enc_class, train_loader, device)
     """loss_fn = FullHybridLoss(

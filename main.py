@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from generate_dataset import run_data_setup
 from train import run_training, validate
-from test import test
+
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.utils.model_builder import build_model
 from src.snn_modeling.utils.utils import run_bio_audit, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject, generate_masks, calibrate_params
@@ -44,8 +44,8 @@ def main():
     config_path = args.config
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not os.path.exists(args.config):
-        raise FileNotFoundError(f"Config file not found: {args.config}")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
     
     if args.resume and args.checkpoint is None:
         parser.error("When using --resume, you MUST specify --checkpoint.")
@@ -53,26 +53,40 @@ def main():
     if args.loso and args.subj:
         parser.error("You CANNOT specify both --loso and --subj at the same time.")
     
-    
-    # Load base config
-    base_config = OmegaConf.load(config_path)
-    # Parse any unknown args from CLI as OmegaConf overrides (e.g. data.batch_size=64)
-    # argparse ignores `key=value` by default if not added via add_argument, but we can capture them:
+    # We now use true Hydra resolution so we can combine folders (dataset/, model/) dynamically!
     import sys
-    cli_args = [arg for arg in sys.argv[1:] if '=' in arg]
-    cli_config = OmegaConf.from_cli(cli_args)
+    from hydra import initialize_config_dir, compose
     
-    config = OmegaConf.merge(base_config, cli_config)
+    cli_args = [arg for arg in sys.argv[1:] if '=' in arg]
+    config_dir = os.path.abspath(os.path.dirname(config_path))
+    config_name = os.path.basename(config_path).replace('.yaml', '')
+    
+    with initialize_config_dir(version_base="1.3", config_dir=config_dir):
+        config = compose(config_name=config_name, overrides=cli_args)
+        
+    # BACKWARD COMPATIBILITY HACK: 
+    # Our scripts currently look for `config.model` but we renamed it to `config.architecture`
+    # Let's map it so existing data loaders don't crash
+    from omegaconf import open_dict
+    with open_dict(config):
+        if hasattr(config, 'architecture'):
+            config.model = config.architecture
 
     if args.mode == 'test':
         if args.checkpoint is None:
             parser.error("You MUST specify --checkpoint for test.")
         model = build_model(config).to(device)
-        enc_class = SpikingResNetClassifier(
-            encoder_backbone = model.encoder,
-            num_classes=config.model.get('num_classes', 5),
-            use_swiglu=config.model.get('use_swiglu', False)
-        ).to(device)
+        
+        if isinstance(model, SpikingResNetClassifier):
+            enc_class = model
+        else:
+            # Fallback for old configs
+            enc_class = SpikingResNetClassifier(
+                encoder_backbone = model.encoder,
+                num_classes=config.model.get('num_classes', 5),
+                use_swiglu=config.model.get('use_swiglu', False)
+            ).to(device)
+            
         checkpoint = torch.load(args.checkpoint, map_location=device)
         print(f"Loaded checkpoint from {args.checkpoint}.")
         enc_class.load_state_dict(checkpoint['model_state_dict'])
@@ -139,6 +153,7 @@ def main():
 
     elif args.setup_data:
         print("Running dataset setup...")
+        '''
         if not args.raw_path or not args.coords_path or not args.output_path:
             parser.error("When using --setup_data, you MUST specify --raw_path, --coords_path, and --output_path.")
         config.data.raw_path = args.raw_path
@@ -147,7 +162,7 @@ def main():
         print(f"   Raw Source: {args.raw_path}")
         print(f"   Coordinates: {args.coords_path}")
         print(f"   Target: {args.output_path}")
-        
+        '''
         # Execute Setup
         run_data_setup(config)
         
@@ -162,7 +177,7 @@ def main():
             print(f"Loaded checkpoint from {args.checkpoint}.")
         
         model = build_model(config).to(device)
-        if args.phase == 1:
+        if args.phase == 1 and not isinstance(model, SpikingResNetClassifier):
             model = SpikingResNetClassifier(
                                             encoder_backbone = model.encoder,
                                             num_classes=config.model.get('num_classes', 5),
@@ -232,11 +247,14 @@ def main():
         model = build_model(config).to(device)
 
         if args.find_repr:
-            enc_class = SpikingResNetClassifier(
-            encoder_backbone = model.encoder,
-            num_classes=config.model.get('num_classes', 5),
-            use_swiglu=config.model.get('use_swiglu', False)
-            ).to(device)
+            if isinstance(model, SpikingResNetClassifier):
+                enc_class = model
+            else:
+                enc_class = SpikingResNetClassifier(
+                    encoder_backbone = model.encoder,
+                    num_classes=config.model.get('num_classes', 5),
+                    use_swiglu=config.model.get('use_swiglu', False)
+                ).to(device)
             
             enc_class.load_state_dict(checkpoint['model_state_dict'])
             find_representative_subject(enc_class, config, device, samples_per_subject=500)

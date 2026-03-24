@@ -2,16 +2,9 @@
 import snntorch as snn
 from ..models.unet import SpikingUNet, UNet
 from ..models.encoders import SpikingMobileNetEncoder
+from hydra.utils import instantiate
 import inspect
-from ..layers.neurons import ALIF
-
-
-SPIKE_MODEL_MAP = {
-    "snn.Leaky": snn.Leaky,
-    "snn.Synaptic": snn.Synaptic,
-    "snn.Alpha": snn.Alpha,
-    "ALIF": ALIF
-}
+from ..layers.activations import ACTIVATION_MAP
 
 def get_filtered_neuron_params(neuron_class, full_config_params):
     """
@@ -31,6 +24,11 @@ def get_filtered_neuron_params(neuron_class, full_config_params):
 
 
 def build_model(config):
+    # 1. Native Hydra Instantiation! (The clean way)
+    if hasattr(config.model, '_target_'):
+        return instantiate(config.model, _recursive_=True)
+
+    # 2. Legacy / Fallback manually building the model 
     model_type = config.model.type
     
     if model_type == "SpikingUNet":
@@ -38,7 +36,7 @@ def build_model(config):
             encoder = SpikingMobileNetEncoder
         else:
             raise ValueError(f"Unknown encoder type: {config.model.encoder_type}")
-        spike_model_class = SPIKE_MODEL_MAP[config.neuron_params.spike_model]
+        spike_model_class = ACTIVATION_MAP[config.neuron_params.spike_model]
         snn_params = {
             'alpha': config.neuron_params.get('alpha', 0.5),
             'beta': config.neuron_params.get('beta', 0.9),
@@ -70,7 +68,7 @@ def build_model(config):
             pass
         else:
             raise ValueError(f"Unknown encoder type: {config.model.encoder_type}")
-        spike_model_class = SPIKE_MODEL_MAP[config.neuron_params.spike_model]
+        spike_model_class = ACTIVATION_MAP[config.neuron_params.spike_model]
 
         model = UNet(
             encoder=encoder,
