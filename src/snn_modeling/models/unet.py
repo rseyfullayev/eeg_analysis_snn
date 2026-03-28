@@ -96,11 +96,8 @@ class SpikingResNetClassifier(nn.Module):
                 top_k_val = min(5, K) 
                 _, topk_indices = torch.topk(magnitudes, k=top_k_val, dim=1) # [B, 5]
                 
-                master_vectors = []
-                for b in range(B):
-                    # 3. Gather highest magnitude vectors and average them BEFORE projection
-                    loudest_embeds = out[b, topk_indices[b], :] # [5, C_dim]
-                    master_vectors.append(loudest_embeds.mean(dim=0))
+                gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, out.size(-1))
+                master_vectors = torch.gather(out, dim=1, index=gather_indices) # [B, min(5, K), C_dim]
                     
                 out = torch.stack(master_vectors, dim=0) # [B, C_dim]
         # ============================

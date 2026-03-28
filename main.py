@@ -72,6 +72,20 @@ def main():
         if hasattr(config, 'architecture'):
             config.model = config.architecture
 
+    # Map missing args from config
+    if args.phase is None and hasattr(config, 'training'):
+        args.phase = config.training.get('phase')
+    if args.loso is None and hasattr(config, 'data'):
+        args.loso = config.data.get('loso')
+    if args.subj is None and hasattr(config, 'data'):
+        args.subj = config.data.get('subj')
+    if args.raw_path is None and hasattr(config, 'data'):
+        args.raw_path = config.data.get('raw_path')
+    if args.coords_path is None and hasattr(config, 'data'):
+        args.coords_path = config.data.get('coords_path')
+    if args.output_path is None and hasattr(config, 'data'):
+        args.output_path = config.data.get('dataset_path')
+
     if args.mode == 'test':
         if args.checkpoint is None:
             parser.error("You MUST specify --checkpoint for test.")
@@ -101,7 +115,7 @@ def main():
 
     elif args.calibrate:
         if args.phase != 2:
-            parser.error("You MUST specify --phase 2 for calibration.")
+            parser.error("You MUST specify phase 2 for calibration (either config or CLI).")
         if args.checkpoint is None:
             parser.error("You MUST specify --checkpoint for calibration.")
 
@@ -153,16 +167,16 @@ def main():
 
     elif args.setup_data:
         print("Running dataset setup...")
-        '''
+        
         if not args.raw_path or not args.coords_path or not args.output_path:
-            parser.error("When using --setup_data, you MUST specify --raw_path, --coords_path, and --output_path.")
+            parser.error("When using --setup_data, you MUST specify raw_path, coords_path, and output_path (either config or CLI).")
         config.data.raw_path = args.raw_path
         config.data.coords_path = args.coords_path
         config.data.dataset_path = args.output_path
         print(f"   Raw Source: {args.raw_path}")
         print(f"   Coordinates: {args.coords_path}")
         print(f"   Target: {args.output_path}")
-        '''
+        
         # Execute Setup
         run_data_setup(config)
         
@@ -189,10 +203,10 @@ def main():
             print("No checkpoint provided; using untrained model.")
 
         if not args.phase:
-            parser.error("You MUST specify --phase for validation.")
+            parser.error("You MUST specify phase for validation (either config or CLI).")
         
         if not args.loso and not args.subj:
-            parser.error("You MUST specify --loso or --subj for validation.")
+            parser.error("You MUST specify loso or subj for validation (either config or CLI).")
         
         masks = torch.load(os.path.join(config.data.dataset_path,'masks.pt')).to(device)
         val_set = SWEEPDataset(
@@ -262,10 +276,10 @@ def main():
             exit(0)
         
         if not args.phase:
-            parser.error("You MUST specify --phase for training/testing.")
+            parser.error("You MUST specify phase for training/testing (either config or CLI).")
         
         if not args.loso and not args.subj:
-            parser.error("You MUST specify --loso or --subj for training/testing.")
+            parser.error("You MUST specify loso or subj for training/testing (either config or CLI).")
         
         
         run_training(config, model, device, phase=args.phase, resume=args.resume, loso=args.loso, subj=args.subj, checkpoint=checkpoint)

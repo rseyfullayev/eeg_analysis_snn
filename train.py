@@ -23,7 +23,7 @@ from src.snn_modeling.utils.utils import initialize_network
 from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingResNetClassifier
-
+from omegaconf import OmegaConf
 # Ignore the specific sklearn warning about missing classes
 warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
 warnings.filterwarnings("ignore", message="A single label was found in 'y_true' and 'y_pred'. For the confusion matrix to have the correct shape, use the 'labels' parameter to pass all known labels.")
@@ -567,11 +567,12 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     
     
     os.makedirs(checkpoint_dir, exist_ok=True)
+    
     wandb.init(
         project=config.logging.project_name,
         name=config.logging.run_name,
-        config=config,
-        tags=config.logging.tags,
+        config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
+        tags=list(config.logging.tags),
         mode="disabled" if config.logging.get('offline') else "online",
         settings=wandb.Settings(_disable_stats=True, _disable_meta=True) 
     )

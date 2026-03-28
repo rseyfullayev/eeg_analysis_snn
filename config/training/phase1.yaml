@@ -1,3 +1,4 @@
+phase: 1
 warmup_epochs: 0
 phase_1_epochs: 300
 phase_2_epochs: 0
