@@ -129,12 +129,13 @@ class ContrastiveLoss(nn.Module):
         Returns:
             dice_matrix: (C, C) tensor of pairwise Dice scores.
         """
+        print(prototypes.shape)
         C = prototypes.shape[0]
         binary = (prototypes > threshold).long()  # (C, H, W)
 
         # Build all C×C pairs: pred[i*C+j] = mask_i, target[i*C+j] = mask_j
-        pred   = binary.unsqueeze(1).expand(C, C, -1, -1).reshape(C * C, *binary.shape[1:])
-        target = binary.unsqueeze(0).expand(C, C, -1, -1).reshape(C * C, *binary.shape[1:])
+        pred   = binary.unsqueeze(1).expand(C, C, -1, -1).reshape(C * C, 1, *binary.shape[1:])
+        target = binary.unsqueeze(0).expand(C, C, -1, -1).reshape(C * C, 1, *binary.shape[1:])
 
         tp, fp, fn, tn = smp.metrics.get_stats(pred, target, mode='binary')
         f1 = smp.metrics.f1_score(tp, fp, fn, tn, reduction='none')  # (C*C,)

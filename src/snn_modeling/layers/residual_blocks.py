@@ -41,7 +41,7 @@ class ConvSpiking(nn.Module):
         if is_alif(spike_model):
             layer_params['num_channels'] = out_channels
 
-        self.norm = TemporalOrderFix(nn.InstanceNorm3d(out_channels, affine=True)) if use_norm else nn.Identity()
+        self.norm = TimeDistributed(nn.GroupNorm(1, out_channels)) if use_norm else nn.Identity() #TemporalOrderFix(nn.InstanceNorm3d(out_channels, affine=True))
 
         self.spike = instantiate_activation(spike_model, **layer_params)
 
