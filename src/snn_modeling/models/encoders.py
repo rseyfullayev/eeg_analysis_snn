@@ -31,6 +31,7 @@ class SpikingMobileNetEncoder(nn.Module):
             return nn.Sequential(*layers)
 
         self.vit = vit
+        self.vit_p_drop = vit_p_drop
         self.stem = ConvSpiking(
             in_channels,
             20,

@@ -30,9 +30,7 @@ def parse_metadata(filename):
         session_id = "unknown"
 
     
-    trial_unique_id = clean_name 
-    
-    return subject_id, trial_unique_id
+    return subject_id
 
 def run_data_setup(config=None):
     print("Initializing Pipeline...")
@@ -72,6 +70,7 @@ def run_data_setup(config=None):
 
     registry = []
     sample_global_id = 0
+    bag_id = 0
     class_counts = {i: 0 for i in range(len(SELECTED_EMOTIONS))}
     total_collected = 0
     GPU_BATCH_SIZE = 16 
@@ -79,8 +78,8 @@ def run_data_setup(config=None):
     print(f"Processing {len(dataset_reader)} raw files...")
     
     for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader)): 
-        
-        subject_id, trial_id = parse_metadata(orig_filename)
+        bag_id += 1
+        subject_id = parse_metadata(orig_filename)
 
         if use_sampling_limit and total_collected >= TOTAL_TARGET: break
 
@@ -137,13 +136,13 @@ def run_data_setup(config=None):
 
                 for k in range(video_batch.shape[0]):
                     # Unique filename for the window
-                    fname = f"{subject_id}_{trial_id}_s{sample_global_id}.pt"
+                    fname = f"{subject_id}_{bag_id}_s{sample_global_id}.pt"
                     save_path = os.path.join(OUTPUT_FOLDER, fname)
                     
                     torch.save(video_batch[k].clone(), save_path)
                     
-                    # trial_id -> Acts as our Bag ID (The unique Movie Clip)
-                    registry.append(f"{fname},{trial_id},{emotion_id}")
+                    # bag_id -> Acts as our Bag ID (The unique Movie Clip)
+                    registry.append(f"{fname},{bag_id},{emotion_id}")
                     sample_global_id += 1
                 
             torch.cuda.empty_cache()

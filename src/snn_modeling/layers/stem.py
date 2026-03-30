@@ -89,5 +89,5 @@ class TemporalGCBlock(nn.Module):
         mask = self.conv_mask(x_ctx)
         attn = self.softmax(mask)
         context = torch.matmul(x_ctx, attn.permute(0, 2, 1))
-        context = self.transform(context).permute(2,0,1).view(1,B,C,1,1)
-        return x + context
+        context = self.transform(context).permute(2,0,1).view(B,C)
+        return context
