@@ -44,14 +44,20 @@ def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, t
     print(f"Calibrated Threshold: {thresh:.4f}, Beta: {beta:.4f}, Decay Adapt: {decay_adapt:.4f}, Gamma Adapt: {gamma_adapt:.4f}")
 
  
-def generate_masks(config, subject_id):
-    print(f"--- GENERATING MASKS USING MAHALANOBIS (STATISTICAL SALIENCE) FOR SUBJECT {subject_id} ---")
+def generate_masks(config, subject_id=None, loso_subject_id=None):
+
+    subj_id = subject_id if subject_id is not None else loso_subject_id
+    loso = loso_subject_id is not None
+    if subj_id is None:
+        raise ValueError("Either subject_id or loso_subject_id must be provided.")
+    
+    print(f"--- GENERATING MASKS USING MAHALANOBIS (STATISTICAL SALIENCE) {"EXCEPT" if loso else ""} FOR SUBJECT {subj_id} ---")
     
     # 1. Load Index
     df = pd.read_csv(os.path.join(config.data.dataset_path, "index.csv"))
-    df = df[df['filename'].str.startswith(f"{subject_id}_")]
+    df = df[df['filename'].str.split('_').str[0] != str(subj_id)] if loso else df[df['filename'].str.split('_').str[0] == str(subj_id)]
     
-    if len(df) == 0: raise ValueError(f"No data found for Subject {subject_id}")
+    if len(df) == 0: raise ValueError(f"No data found for Subject {subj_id}")
 
     # 2. Welford's Online Algorithm for Mean/Std Calculation
     # We need accurate pixel-wise STD to punish noisy bands.
@@ -122,7 +128,7 @@ def generate_masks(config, subject_id):
         final_masks[i] = energy_map
 
     # 4. Save
-    save_path = f"evidence/subject{subject_id}_statistical_GT.pt"
+    save_path = f"evidence/subject{"_loso_" if loso else ""}{subj_id}.pt"
     torch.save(final_masks, save_path)
     
     # Visualization (Optional but recommended)
@@ -134,7 +140,7 @@ def generate_masks(config, subject_id):
         axes[i].set_title(f"{emotions[i]}\nZ-Energy Mask")
         axes[i].axis('off')
     plt.colorbar(im, ax=axes.ravel().tolist())
-    plt.savefig(f"evidence/subject{subject_id}_statistical_GT.png")
+    plt.savefig(f"evidence/subject{"_loso_" if loso else ""}{subj_id}.png")
     print(f"Ground Truth saved to {save_path}")
 
 
@@ -423,14 +429,39 @@ def run_bn_warmup(model, loader, device, num_batches=10):
     model.to(device)
     
     with torch.no_grad():
-        for i, (inputs, *_rest) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
+        for i, (batch, *_rest) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
             if i >= num_batches:
                 break
-            inputs = inputs.to(device)
-            if inputs.dim() == 5:
-                inputs = inputs.permute(1, 0, 2, 3, 4)
+            batch = batch.to(device)
+            # Handle both augmented (5 items) and non-augmented (4 items) returns
+            if len(batch) == 5:
+                inp1, inp2, targets, targets_c, _ = batch
+                if 1 == 1:
+                    # Contrastive: concatenate both views
+                    inp1, inp2 = inp1.to(device), inp2.to(device)
+                    inputs = torch.cat([inp1, inp2], dim=0)
+                else:
+                    # Non-contrastive phases: just use first view
+                    inputs = inp1.to(device)
+            else:
+                inputs, targets, targets_c, _ = batch
+                inputs = inputs.to(device)
+                
+            targets, targets_c = targets.to(device), targets_c.to(device)
             
-            _ = model(inputs)
+            # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
+            K_bag = None
+            if inputs.dim() == 6:
+                B, K_bag, T, C, H, W = inputs.shape
+                # Flatten Bags into Batch dimension for the SNN Encoder
+                inputs = inputs.view(B * K_bag, T, C, H, W)
+            else:
+                B, T, C, H, W = inputs.shape
+            
+            # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
+            inputs = inputs.permute(1,0,2,3,4) 
+            _ = model(inputs, K=K_bag)
+            
             del inputs  # Free memory after each batch
     
     # Clear CUDA cache after warmup

@@ -38,7 +38,7 @@ def main():
     parser.add_argument('--calculate_stat', action='store_true', help='Draw Distribution of dataset')
     parser.add_argument('--find_repr', action='store_true', help='Find the most representative subject in the dataset')
     parser.add_argument('--audit_bio', action='store_true', help='Run Biological Audit (Model-Free)')
-    parser.add_argument('--masks', type=int, help='Derive masks from Subject')
+    parser.add_argument('--masks', action='store_true', help='Derive masks from Subject')
     parser.add_argument('--calibrate', action='store_true', help='Calibrate optimal ALIF parameters')
     args = parser.parse_args()
     config_path = args.config
@@ -147,8 +147,8 @@ def main():
         
         calibrate_params(model.encoder, val_loader, device)
     
-    elif args.masks is not None:
-        generate_masks(config, subject_id=args.masks)
+    elif args.masks:
+        generate_masks(config, subject_id=args.subj, loso_subject_id=args.loso)
 
     elif args.calculate_stat:
         dataset = SWEEPDataset(

@@ -16,4 +16,4 @@ num_workers: 4
 prefetch_factor: 4
 preload_ram: false
 n_emotions: 5
-mil_bag_size: 60
+mil_bag_size: 2

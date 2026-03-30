@@ -28,5 +28,5 @@ logging:
   project_name: "snn-encoding-showdown"
   run_name: "MobileNet_SWIGLU"
   tags: ["mobilenet", "swiglu", "con", "tsm", "mil"]
-  offline: false
+  offline: true
   log_interval: 1

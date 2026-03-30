@@ -405,7 +405,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
             use_swiglu=config.model.get('use_swiglu', False)
         ).to(device)
 
-    initialize_network(enc_class, train_loader, device)
+    #initialize_network(enc_class, train_loader, device)
     """loss_fn = FullHybridLoss(
         smooth = 0.,
         lambda_seg = config.loss.get('lambda_seg', 1.0),

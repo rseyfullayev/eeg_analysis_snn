@@ -40,6 +40,7 @@ class ProjectionHead(nn.Module):
         )
     def forward(self, features):
         B, D = features.shape
+        features = features.reshape(B, D, 1, 1)  # Reshape to (B, D, 1, 1) for Conv2d
         proj = self.supcon_head(features)
         embedding = F.normalize(proj.view(B, -1), dim=1, eps=1e-6)
         return embedding

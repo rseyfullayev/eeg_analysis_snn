@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import snntorch as snn
 from .decoders import ResNetDecoder, SpikingResNetDecoder
-from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead, TemporalViTBlock
+from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead, TemporalGCBlock
 from ..layers.neurons import ALIF, TimeDistributed, SwiGLU
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
@@ -54,7 +54,7 @@ class SpikingResNetClassifier(nn.Module):
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
-        self.avg_pool = self.temporal = TemporalViTBlock(512, num_heads=8, p_drop=encoder_backbone.vit_p_drop) #TimeDistributed(nn.AdaptiveAvgPool2d((1,1)))
+        self.avg_pool = self.temporal = TemporalGCBlock(feature_dim) #TimeDistributed(nn.AdaptiveAvgPool2d((1,1)))
         self.use_swiglu = use_swiglu
         
         # --- SwiGLU MIL Attention Heads (Optional) ---
