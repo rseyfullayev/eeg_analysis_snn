@@ -198,7 +198,11 @@ class SWEEPDataset(Dataset):
             # Maintain chronological order of files (s0, s1, s2, ...)
             # Ensure proper string/int casting for consistent sorting if needed, but for now we expect the filenames to be chronological or we can just list them
             files = group_df['filename'].tolist()
-            self.samples.append((bag_id, files, emotion_idx))
+            try:
+                subject_idx = int(str(files[0]).split('_')[0])
+            except Exception:
+                subject_idx = -1
+            self.samples.append((bag_id, files, emotion_idx, subject_idx))
 
         print(f"[{split.upper()}] Initialized with {len(self.samples)} Bags (Total Windows: {len(df_slice)})")
 
@@ -251,7 +255,7 @@ class SWEEPDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        bag_id, files, label_idx = self.samples[idx]
+        bag_id, files, label_idx, subject_idx = self.samples[idx]
 
         # 1. Stratified Strided Sampling (Binning).
         # We divide the trial into 'bag_size_limit' equal temporal bins,
@@ -304,21 +308,35 @@ class SWEEPDataset(Dataset):
             # Note: you may need to apply augmentations over the batch dimension K safely
             video1 = self.augmentations(bag_video)
             video2 = self.augmentations(bag_video)
-            return video1, video2, target_map, label_idx, bag_id
+            return video1, video2, target_map, label_idx, subject_idx, bag_id
 
         return bag_video, target_map, label_idx, bag_id
 
 class PKSampler(Sampler):
-    def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None):
-        # Access labels directly from dataset.samples: (bag_id, files, emotion_idx)
+    def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None, subject_diverse_k=True):
+        # Access labels directly from dataset.samples: (bag_id, files, emotion_idx, subject_idx)
         self.labels = [s[2] for s in dataset.samples]
+        self.subjects = [s[3] for s in dataset.samples]
         print(f"PKSampler: {len(self.labels)} samples")
         
         self.labels = torch.tensor(self.labels).long()
+        self.subjects = torch.tensor(self.subjects).long()
         self.label_set = list(set(self.labels.numpy()))
+        self.subject_diverse_k = subject_diverse_k
         
         self.label_to_indices = {label: np.where(self.labels.numpy() == label)[0]
                                  for label in self.label_set}
+
+        # Per-class subject buckets for subject-diverse K sampling
+        self.label_subject_to_indices = {}
+        for label in self.label_set:
+            class_indices = self.label_to_indices[label]
+            subject_map = collections.defaultdict(list)
+            for idx in class_indices:
+                subject_map[int(self.subjects[idx].item())].append(int(idx))
+            for subject in subject_map:
+                random.shuffle(subject_map[subject])
+            self.label_subject_to_indices[label] = subject_map
         
         for l in self.label_set:
             np.random.shuffle(self.label_to_indices[l])
@@ -345,15 +363,49 @@ class PKSampler(Sampler):
             indices = []
             
             for class_ in classes:
-                indices.extend(self.label_to_indices[class_][
-                               self.used_label_indices_count[class_]:
-                               self.used_label_indices_count[class_] + self.n_samples_per_class])
-                
-                self.used_label_indices_count[class_] += self.n_samples_per_class
-                
-                if self.used_label_indices_count[class_] + self.n_samples_per_class > len(self.label_to_indices[class_]):
-                    np.random.shuffle(self.label_to_indices[class_])
-                    self.used_label_indices_count[class_] = 0
+                if self.subject_diverse_k:
+                    selected = []
+                    subject_map = self.label_subject_to_indices[class_]
+                    available_subjects = list(subject_map.keys())
+                    random.shuffle(available_subjects)
+
+                    # First pass: pick at most one sample per subject.
+                    for subj in available_subjects:
+                        if len(selected) >= self.n_samples_per_class:
+                            break
+                        bucket = subject_map[subj]
+                        if not bucket:
+                            continue
+                        selected.append(bucket.pop())
+
+                    # Refill emptied buckets from class pool to keep sampling renewable.
+                    if len(selected) < self.n_samples_per_class:
+                        class_pool = list(self.label_to_indices[class_])
+                        random.shuffle(class_pool)
+                        for idx in class_pool:
+                            if len(selected) >= self.n_samples_per_class:
+                                break
+                            if idx not in selected:
+                                selected.append(int(idx))
+
+                    # Replenish empty subject buckets from current class indices.
+                    for subj in available_subjects:
+                        if len(subject_map[subj]) == 0:
+                            refill = [int(i) for i in self.label_to_indices[class_] if int(self.subjects[i].item()) == subj]
+                            random.shuffle(refill)
+                            subject_map[subj].extend(refill)
+
+                    indices.extend(selected[:self.n_samples_per_class])
+                else:
+                    indices.extend(self.label_to_indices[class_][
+                                   self.used_label_indices_count[class_]:
+                                   self.used_label_indices_count[class_] + self.n_samples_per_class])
+                    
+                    self.used_label_indices_count[class_] += self.n_samples_per_class
+                    
+                    if self.used_label_indices_count[class_] + self.n_samples_per_class > len(self.label_to_indices[class_]):
+                        np.random.shuffle(self.label_to_indices[class_])
+                        self.used_label_indices_count[class_] = 0
                     
             yield indices
             self.count += self.batch_size

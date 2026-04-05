@@ -25,3 +25,4 @@ MNIST/
 sanity/
 evidence/
 code_ingest_cache.json
+outputs/

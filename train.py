@@ -3,11 +3,13 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss
+from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss, SupMoCoLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
+from src.snn_modeling.utils.supmoco import SupMoCoState, build_momentum_encoder, momentum_update
 import os
 import gc
 from datetime import datetime
@@ -266,7 +268,11 @@ def training_loop(phase,
                   scheduler, 
                   writer, 
                   checkpoint_dir,
-                  freeze_bn=False):
+                  freeze_bn=False,
+                  use_supmoco=False,
+                  moco_momentum=0.999,
+                  momentum_model=None,
+                  supmoco_state=None):
     
     
     #temp_mix = TemporalMix()
@@ -280,49 +286,98 @@ def training_loop(phase,
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
             # Handle both augmented (5 items) and non-augmented (4 items) returns
-            if len(batch) == 5:
+            if len(batch) == 6:
+                inp1, inp2, targets, targets_c, subject_labels, _ = batch
+                if phase == 1:
+                    inp1, inp2 = inp1.to(device), inp2.to(device)
+                    subject_labels = subject_labels.to(device)
+                    if use_supmoco:
+                        q_inputs = inp1
+                        k_inputs = inp2
+                    else:
+                        # Contrastive baseline: concatenate both views
+                        inputs = torch.cat([inp1, inp2], dim=0)
+            elif len(batch) == 5:
                 inp1, inp2, targets, targets_c, _ = batch
                 if phase == 1:
-                    # Contrastive: concatenate both views
+                    if use_supmoco:
+                        raise ValueError("SupMoCo requires augmented batches that include subject labels (len(batch) == 6).")
                     inp1, inp2 = inp1.to(device), inp2.to(device)
-                    inputs = torch.cat([inp1, inp2], dim=0)
+                    if use_supmoco:
+                        q_inputs = inp1
+                        k_inputs = inp2
+                    else:
+                        inputs = torch.cat([inp1, inp2], dim=0)
                 else:
                     # Non-contrastive phases: just use first view
                     inputs = inp1.to(device)
             else:
                 inputs, targets, targets_c, _ = batch
                 inputs = inputs.to(device)
+                if phase == 1 and use_supmoco:
+                    raise ValueError("SupMoCo requires dual-view augmented batches (len(batch) == 5).")
                 
             targets, targets_c = targets.to(device), targets_c.to(device)
             
-            # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
-            K_bag = None
-            if inputs.dim() == 6:
-                B, K_bag, T, C, H, W = inputs.shape
-                # Flatten Bags into Batch dimension for the SNN Encoder
-                inputs = inputs.view(B * K_bag, T, C, H, W)
-            else:
-                B, T, C, H, W = inputs.shape
-            
-            # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
-            inputs = inputs.permute(1,0,2,3,4) 
-            outputs = model(inputs, K=K_bag)
+            if phase == 1 and use_supmoco:
+                def _prepare_view(view):
+                    K_local = None
+                    if view.dim() == 6:
+                        B_local, K_local, T_local, C_local, H_local, W_local = view.shape
+                        view = view.view(B_local * K_local, T_local, C_local, H_local, W_local)
+                    else:
+                        B_local, T_local, C_local, H_local, W_local = view.shape
+                    view = view.permute(1, 0, 2, 3, 4)
+                    return view, B_local, K_local
 
-            # If the model didn't internally reduce K (e.g. Phase 2 UNet)
-            if K_bag is not None and outputs.shape[0] == B * K_bag:
-                # Average all windows in the bag so it matches the B targets
-                outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
+                q_inputs, B, K_bag = _prepare_view(q_inputs)
+                k_inputs, _, _ = _prepare_view(k_inputs)
 
-            if phase == 1:
-                f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)
-                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-                loss = loss_fn(features, targets_c) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
+                outputs = model(q_inputs, K=K_bag)
+                if K_bag is not None and outputs.shape[0] == B * K_bag:
+                    outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
+
+                with torch.no_grad():
+                    key_features = momentum_model(k_inputs, K=K_bag)
+                    if K_bag is not None and key_features.shape[0] == B * K_bag:
+                        key_features = key_features.view(B, K_bag, *key_features.shape[1:]).mean(dim=1)
+                    key_features = F.normalize(key_features, dim=1, eps=1e-6)
+
+                queue_features, queue_labels, queue_subject_labels = supmoco_state.get_queue()
+                loss = loss_fn(outputs, key_features, targets_c, subject_labels, queue_features, queue_labels, queue_subject_labels)
             else:
-                loss = loss_fn(outputs, targets, targets_c)
+                # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
+                K_bag = None
+                if inputs.dim() == 6:
+                    B, K_bag, T, C, H, W = inputs.shape
+                    # Flatten Bags into Batch dimension for the SNN Encoder
+                    inputs = inputs.view(B * K_bag, T, C, H, W)
+                else:
+                    B, T, C, H, W = inputs.shape
+                
+                # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
+                inputs = inputs.permute(1,0,2,3,4) 
+                outputs = model(inputs, K=K_bag)
+
+                # If the model didn't internally reduce K (e.g. Phase 2 UNet)
+                if K_bag is not None and outputs.shape[0] == B * K_bag:
+                    # Average all windows in the bag so it matches the B targets
+                    outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
+
+                if phase == 1:
+                    f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)
+                    features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                    loss = loss_fn(features, targets_c)
+                else:
+                    loss = loss_fn(outputs, targets, targets_c)
            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            if phase == 1 and use_supmoco:
+                momentum_update(model, momentum_model, moco_momentum)
+                with torch.no_grad():
+                    supmoco_state.enqueue(key_features, targets_c, subject_labels)
             optimizer.zero_grad(set_to_none=True)
             if phase > 1:
                 with torch.no_grad():
@@ -333,7 +388,11 @@ def training_loop(phase,
             train_loop.set_postfix(loss=loss.item())
             
             # Explicit cleanup to prevent memory accumulation
-            del inputs, targets_c, outputs, loss
+            if phase == 1 and use_supmoco:
+                del q_inputs, k_inputs, key_features, queue_features, queue_labels
+            else:
+                del inputs
+            del targets_c, outputs, loss
 
         # Periodic memory cleanup after each epoch
         if torch.cuda.is_available():
@@ -366,6 +425,12 @@ def training_loop(phase,
             f"Phase{phase}/Val/Balanced_Accuracy": val_bal_acc,
             "LR": current_lr
         }
+        if phase == 1 and use_supmoco and supmoco_state is not None:
+            queue_len = int(supmoco_state.queue_filled.item())
+            log_dict.update({
+                f"Phase{phase}/Train/QueueSize": queue_len,
+                f"Phase{phase}/Train/QueueFillRatio": queue_len / float(max(1, supmoco_state.queue_size)),
+            })
         if phase != 1:
             log_dict.update({
                 f"Phase{phase}/Val/Dice": val_dice,
@@ -416,7 +481,28 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         time_steps=config.data.get('num_timesteps', 16),
     )"""
 
-    loss_fn = ContrastiveLoss(train_loader.dataset.prototypes) #nn.CrossEntropyLoss(label_smoothing=0.1)
+    iic_enabled = config.loss.get('iic_enabled', False)
+    iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
+    iic_inter_weight = config.loss.get('iic_inter_weight', 1.0)
+    con_temp = config.loss.get('temperature', 0.07)
+    use_supmoco = config.training.get('use_supmoco', False)
+
+    if use_supmoco:
+        loss_fn = SupMoCoLoss(
+            train_loader.dataset.prototypes,
+            temperature=con_temp,
+            iic_enabled=iic_enabled,
+            iic_intra_weight=iic_intra_weight,
+            iic_inter_weight=iic_inter_weight,
+        )
+    else:
+        loss_fn = ContrastiveLoss(
+            train_loader.dataset.prototypes,
+            temperature=con_temp,
+            iic_enabled=iic_enabled,
+            iic_intra_weight=iic_intra_weight,
+            iic_inter_weight=iic_inter_weight,
+        )
 
     loss_fn.to(device)
 
@@ -428,6 +514,15 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     accumulation_steps = config.training.get('accumulation_steps', 1)
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+
+    momentum_model = None
+    supmoco_state = None
+    if use_supmoco:
+        momentum_model = build_momentum_encoder(enc_class).to(device)
+        supmoco_state = SupMoCoState(
+            queue_size=config.training.get('supmoco_queue_size', 4096),
+            feature_dim=config.training.get('supmoco_feature_dim', 128),
+        ).to(device)
     '''
     SequentialLR(optimizer, [
         LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs),
@@ -444,7 +539,26 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         best_dice = checkpoint['dice']
         print(f"Resuming training from epoch {start_epoch}...")
 
-    training_loop(1, start_epoch, epochs, best_acc, best_dice, enc_class, device, train_loader, val_loader, loss_fn, optimizer, scheduler, writer, checkpoint_dir)
+    training_loop(
+        1,
+        start_epoch,
+        epochs,
+        best_acc,
+        best_dice,
+        enc_class,
+        device,
+        train_loader,
+        val_loader,
+        loss_fn,
+        optimizer,
+        scheduler,
+        writer,
+        checkpoint_dir,
+        use_supmoco=use_supmoco,
+        moco_momentum=config.training.get('supmoco_momentum', 0.999),
+        momentum_model=momentum_model,
+        supmoco_state=supmoco_state,
+    )
    
     
     
@@ -619,7 +733,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     train_loader = DataLoader(train_set, 
                               batch_sampler=PKSampler(train_set, 
                                                       batch_size=config.training.batch_size, 
-                                                      n_classes=config.model.get('n_emotions', 5)),
+                                                      n_classes=config.model.get('n_emotions', 5),
+                                                      subject_diverse_k=config.training.get('pk_subject_diverse_k', True)),
                               num_workers=num_workers,
                               prefetch_factor=prefetch,
                               persistent_workers=persist,

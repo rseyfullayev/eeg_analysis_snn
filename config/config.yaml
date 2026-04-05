@@ -18,6 +18,10 @@ loss:
   smooth: 0.0
   lambda_seg: 0.0
   lambda_con: 0.0
+  temperature: 0.07
+  iic_enabled: true
+  iic_intra_weight: 3.0
+  iic_inter_weight: 0.5
   lambda_class: 1.0
   lambda_fire: 0.0
   target_rate: 0.1
@@ -27,6 +31,6 @@ loss:
 logging:
   project_name: "snn-encoding-showdown"
   run_name: "MobileNet_SWIGLU"
-  tags: ["mobilenet", "swiglu", "con", "tsm", "mil"]
+  tags: ["mobilenet", "swiglu", "supmoco", "tsm", "mil"]
   offline: true
   log_interval: 1

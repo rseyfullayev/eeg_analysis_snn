@@ -113,9 +113,17 @@ class ContrastiveLoss(nn.Module):
     }
     """
     
-    def __init__(self, masks, temperature=0.07):
+    def __init__(self,
+                 masks,
+                 temperature=0.07,
+                 iic_enabled=False,
+                 iic_intra_weight=1.0,
+                 iic_inter_weight=1.0):
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature
+        self.iic_enabled = iic_enabled
+        self.iic_intra_weight = iic_intra_weight
+        self.iic_inter_weight = iic_inter_weight
         sim_score = self.compute_mask_dice_matrix(masks)  # (C, C) precomputed similarity between prototype masks
         self.register_buffer('sim_score', sim_score)  # (C, C) buffer for efficient lookup
 
@@ -172,8 +180,15 @@ class ContrastiveLoss(nn.Module):
         label_flat = labels.squeeze(1)                                     # (2N,)
         dice_pair = self.sim_score[label_flat][:, label_flat]   # (2N, 2N)
         neg_mask = logits_mask - mask                                      # 1 for negatives, 0 for positives/self
-        # Negatives weighted by (1 + dice), positives by 1, self by 0
-        denom_weights = logits_mask + neg_mask * dice_pair
+        # Baseline uses Dice-weighted negatives; IIC additionally reweights both
+        # intra-class positives and inter-class negatives.
+        if self.iic_enabled:
+            pos_weights = mask * self.iic_intra_weight
+            neg_weights = neg_mask * (1.0 + self.iic_inter_weight * dice_pair)
+            denom_weights = pos_weights + neg_weights
+        else:
+            # Negatives weighted by (1 + dice), positives by 1, self by 0
+            denom_weights = logits_mask + neg_mask * dice_pair
 
         # Numerical Stability: subtract max for LogSumExp
         logits_max, _ = torch.max(similarity_matrix * logits_mask, dim=1, keepdim=True)
@@ -187,10 +202,100 @@ class ContrastiveLoss(nn.Module):
         mask_sum = mask.sum(1)
         # Avoid division by zero for samples with no positives
         mask_sum = torch.clamp(mask_sum, min=1.0)
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
+        if self.iic_enabled:
+            weighted_pos = mask * self.iic_intra_weight
+            weighted_pos_sum = torch.clamp(weighted_pos.sum(1), min=1.0)
+            mean_log_prob_pos = (weighted_pos * log_prob).sum(1) / weighted_pos_sum
+        else:
+            mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
         
         loss = -mean_log_prob_pos.mean()
         return loss
+
+
+class SupMoCoLoss(ContrastiveLoss):
+    """Decoupled supervised MoCo objective with Dice-derived bounded weights.
+
+    Decoupled means positives are excluded from the denominator partition.
+    """
+
+    def __init__(self,
+                 masks,
+                 temperature=0.07,
+                 iic_enabled=False,
+                 iic_intra_weight=1.0,
+                 iic_inter_weight=1.0):
+        super().__init__(
+            masks=masks,
+            temperature=temperature,
+            iic_enabled=iic_enabled,
+            iic_intra_weight=iic_intra_weight,
+            iic_inter_weight=iic_inter_weight,
+        )
+
+    def forward(self,
+                query_features,
+                key_features,
+                labels,
+                subject_labels,
+                queue_features=None,
+                queue_labels=None,
+                queue_subject_labels=None):
+        device = query_features.device
+        q = F.normalize(query_features, dim=1, eps=1e-6)
+        k = F.normalize(key_features, dim=1, eps=1e-6)
+        labels = labels.contiguous().view(-1)
+        subject_labels = subject_labels.contiguous().view(-1)
+
+        candidate_features = [k]
+        candidate_labels = [labels]
+        candidate_subject_labels = [subject_labels]
+
+        if queue_features is not None and queue_labels is not None and queue_features.numel() > 0:
+            valid = queue_labels >= 0
+            if valid.any():
+                q_feat = F.normalize(queue_features[valid].to(device), dim=1, eps=1e-6)
+                q_lbl = queue_labels[valid].to(device)
+                candidate_features.append(q_feat)
+                candidate_labels.append(q_lbl)
+                if queue_subject_labels is not None:
+                    q_subj = queue_subject_labels[valid].to(device)
+                else:
+                    q_subj = torch.full_like(q_lbl, -1)
+                candidate_subject_labels.append(q_subj)
+
+        all_features = torch.cat(candidate_features, dim=0)  # (M, D)
+        all_labels = torch.cat(candidate_labels, dim=0)      # (M,)
+        all_subject_labels = torch.cat(candidate_subject_labels, dim=0)  # (M,)
+        
+
+        logits = torch.matmul(q, all_features.T) / self.temperature  # (B, M)
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
+
+        pos_mask = (labels.unsqueeze(1) == all_labels.unsqueeze(0)).float()
+        neg_mask = 1.0 - pos_mask
+        same_subj_mask = (subject_labels.unsqueeze(1) == all_subject_labels.unsqueeze(0)).float()
+
+        # Weight same-emotion positives differently depending on whether the subject matches.
+        subj_weight = torch.where(
+            same_subj_mask.bool(),
+            torch.ones_like(same_subj_mask),
+            torch.full_like(same_subj_mask, self.iic_intra_weight),
+        )
+        pos_weights = pos_mask * subj_weight
+
+        # Reuse prototype-Dice pair weights for bounded negatives.
+        dice_pair = self.sim_score[labels][:, all_labels]
+        neg_weights = neg_mask * torch.clamp(dice_pair * self.iic_inter_weight, min=1e-6, max=1.0)
+
+        # Decoupled denominator: negatives only (no positive terms in partition).
+        neg_partition = torch.clamp((torch.exp(logits) * neg_weights).sum(dim=1, keepdim=True), min=1e-8)
+        pos_log_prob = logits - torch.log(neg_partition)
+
+        pos_weight_sum = torch.clamp(pos_weights.sum(dim=1), min=1e-8)
+        mean_log_prob_pos = (pos_weights * pos_log_prob).sum(dim=1) / pos_weight_sum
+        return -mean_log_prob_pos.mean()
 
 
 class FullHybridLoss(nn.Module):
