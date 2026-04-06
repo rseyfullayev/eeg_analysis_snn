@@ -1,0 +1,17 @@
+phase: "1a"
+warmup_epochs: 0
+phase_1_epochs: 300
+phase_2_epochs: 0
+phase_3_epochs: 0
+batch_size: 8
+learning_rate: 0.001
+weight_decay: 0.01
+accumulation_steps: 1
+bagging: false
+use_supmoco: true
+supmoco_queue_size: 256
+supmoco_feature_dim: 128
+supmoco_momentum: 0.999
+temporal_decay_enabled: false
+temporal_decay_factor: 0.999
+pk_subject_diverse_k: false

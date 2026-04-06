@@ -224,7 +224,9 @@ class SupMoCoLoss(ContrastiveLoss):
                  temperature=0.07,
                  iic_enabled=False,
                  iic_intra_weight=1.0,
-                 iic_inter_weight=1.0):
+                 iic_inter_weight=1.0,
+                 temporal_decay_enabled=False,
+                 temporal_decay_factor=0.999):
         super().__init__(
             masks=masks,
             temperature=temperature,
@@ -232,6 +234,8 @@ class SupMoCoLoss(ContrastiveLoss):
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
         )
+        self.temporal_decay_enabled = temporal_decay_enabled
+        self.temporal_decay_factor = temporal_decay_factor
 
     def forward(self,
                 query_features,
@@ -240,7 +244,8 @@ class SupMoCoLoss(ContrastiveLoss):
                 subject_labels,
                 queue_features=None,
                 queue_labels=None,
-                queue_subject_labels=None):
+                queue_subject_labels=None,
+                queue_ages=None):
         device = query_features.device
         q = F.normalize(query_features, dim=1, eps=1e-6)
         k = F.normalize(key_features, dim=1, eps=1e-6)
@@ -250,6 +255,8 @@ class SupMoCoLoss(ContrastiveLoss):
         candidate_features = [k]
         candidate_labels = [labels]
         candidate_subject_labels = [subject_labels]
+        # Current batch negative samples have age 0
+        candidate_ages = [torch.zeros_like(labels, dtype=torch.float32, device=device)]
 
         if queue_features is not None and queue_labels is not None and queue_features.numel() > 0:
             valid = queue_labels >= 0
@@ -263,10 +270,16 @@ class SupMoCoLoss(ContrastiveLoss):
                 else:
                     q_subj = torch.full_like(q_lbl, -1)
                 candidate_subject_labels.append(q_subj)
+                
+                if queue_ages is not None:
+                    candidate_ages.append(queue_ages[valid].float().to(device))
+                else:
+                    candidate_ages.append(torch.zeros_like(q_lbl, dtype=torch.float32, device=device))
 
         all_features = torch.cat(candidate_features, dim=0)  # (M, D)
         all_labels = torch.cat(candidate_labels, dim=0)      # (M,)
         all_subject_labels = torch.cat(candidate_subject_labels, dim=0)  # (M,)
+        all_ages = torch.cat(candidate_ages, dim=0)          # (M,)
         
 
         logits = torch.matmul(q, all_features.T) / self.temperature  # (B, M)
@@ -288,6 +301,11 @@ class SupMoCoLoss(ContrastiveLoss):
         # Reuse prototype-Dice pair weights for bounded negatives.
         dice_pair = self.sim_score[labels][:, all_labels]
         neg_weights = neg_mask * torch.clamp(dice_pair * self.iic_inter_weight, min=1e-6, max=1.0)
+        
+        if self.temporal_decay_enabled:
+            # Apply temporal decay: w_temporal = temporal_decay_factor ^ age
+            temporal_weights = self.temporal_decay_factor ** all_ages  # (M,)
+            neg_weights = neg_weights * temporal_weights.unsqueeze(0)
 
         # Decoupled denominator: negatives only (no positive terms in partition).
         neg_partition = torch.clamp((torch.exp(logits) * neg_weights).sum(dim=1, keepdim=True), min=1e-8)

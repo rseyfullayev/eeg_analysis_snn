@@ -76,5 +76,12 @@ class SupMoCoState(nn.Module):
     def get_queue(self):
         filled = int(self.queue_filled.item())
         if filled <= 0:
-            return self.queue[:0], self.queue_labels[:0], self.queue_subject_labels[:0]
-        return self.queue[:filled], self.queue_labels[:filled], self.queue_subject_labels[:filled]
+            return self.queue[:0], self.queue_labels[:0], self.queue_subject_labels[:0], torch.zeros(0, dtype=torch.long, device=self.queue.device)
+        
+        ptr = int(self.queue_ptr.item())
+        indices = torch.arange(filled, device=self.queue.device)
+        # The newest element is at (ptr - 1) % filled.
+        # Its age should be 0. We can compute age generally as:
+        queue_ages = (ptr - 1 - indices) % filled
+        
+        return self.queue[:filled], self.queue_labels[:filled], self.queue_subject_labels[:filled], queue_ages

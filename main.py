@@ -24,7 +24,7 @@ def main():
     parser.add_argument('--loso', type=int, help='The integer ID of the subject to hold out for testing (1-16).')
     parser.add_argument('--subj', type=int, help='The integer ID of the subject (1-16).')
 
-    parser.add_argument('--phase', type=int, help='Specify training phase (1, 2, 3, or 4)')
+    parser.add_argument('--phase', type=str, help='Specify training phase (1a, 1b, 2, 3, or 4)')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
     parser.add_argument('--val', action='store_true', help='Validation mode')
     parser.add_argument('--checkpoint', type=str, help='Path to checkpoint')
@@ -86,6 +86,9 @@ def main():
     if args.output_path is None and hasattr(config, 'data'):
         args.output_path = config.data.get('dataset_path')
 
+    if args.phase is not None:
+        args.phase = str(args.phase).lower()
+
     if args.mode == 'test':
         if args.checkpoint is None:
             parser.error("You MUST specify --checkpoint for test.")
@@ -114,7 +117,7 @@ def main():
         run_bio_audit(config, device=torch.device('cuda'), samples=300)
 
     elif args.calibrate:
-        if args.phase != 2:
+        if args.phase != '2':
             parser.error("You MUST specify phase 2 for calibration (either config or CLI).")
         if args.checkpoint is None:
             parser.error("You MUST specify --checkpoint for calibration.")
@@ -191,7 +194,7 @@ def main():
             print(f"Loaded checkpoint from {args.checkpoint}.")
         
         model = build_model(config).to(device)
-        if args.phase == 1 and not isinstance(model, SpikingResNetClassifier):
+        if args.phase in ['1', '1a', '1b'] and not isinstance(model, SpikingResNetClassifier):
             model = SpikingResNetClassifier(
                                             encoder_backbone = model.encoder,
                                             num_classes=config.model.get('num_classes', 5),
@@ -239,10 +242,10 @@ def main():
 
         loss_fn.class_loss.masks = val_loader.dataset.prototypes
 
-        if args.phase == 1: loss_fn = nn.CrossEntropyLoss()
+        if args.phase in ['1', '1a', '1b']: loss_fn = nn.CrossEntropyLoss()
 
-        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=args.phase==1)
-        if args.phase == 1:
+        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=args.phase in ['1', '1a', '1b'])
+        if args.phase in ['1', '1a', '1b']:
             print(f"Phase {args.phase} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         else:
             print(f"Phase {args.phase} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "

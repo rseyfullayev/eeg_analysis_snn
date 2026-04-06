@@ -272,13 +272,24 @@ def training_loop(phase,
                   use_supmoco=False,
                   moco_momentum=0.999,
                   momentum_model=None,
-                  supmoco_state=None):
+                  supmoco_state=None,
+                  unfreeze_epoch=-1,
+                  accumulation_steps=1):
     
     
     #temp_mix = TemporalMix()
 
     for epoch in range(start_epoch, epochs):
         model.train()
+
+        if unfreeze_epoch > 0:
+            if epoch < unfreeze_epoch:
+                for param in model.encoder.parameters():
+                    param.requires_grad = False
+            elif epoch == unfreeze_epoch:
+                print("--- Unfreezing Encoder ---")
+                for param in model.encoder.parameters():
+                    param.requires_grad = True
 
         if freeze_bn:
             model.encoder.apply(freeze_bn_stats)
@@ -288,7 +299,7 @@ def training_loop(phase,
             # Handle both augmented (5 items) and non-augmented (4 items) returns
             if len(batch) == 6:
                 inp1, inp2, targets, targets_c, subject_labels, _ = batch
-                if phase == 1:
+                if phase in [1, '1a', '1b']:
                     inp1, inp2 = inp1.to(device), inp2.to(device)
                     subject_labels = subject_labels.to(device)
                     if use_supmoco:
@@ -299,7 +310,7 @@ def training_loop(phase,
                         inputs = torch.cat([inp1, inp2], dim=0)
             elif len(batch) == 5:
                 inp1, inp2, targets, targets_c, _ = batch
-                if phase == 1:
+                if phase in [1, '1a', '1b']:
                     if use_supmoco:
                         raise ValueError("SupMoCo requires augmented batches that include subject labels (len(batch) == 6).")
                     inp1, inp2 = inp1.to(device), inp2.to(device)
@@ -314,12 +325,12 @@ def training_loop(phase,
             else:
                 inputs, targets, targets_c, _ = batch
                 inputs = inputs.to(device)
-                if phase == 1 and use_supmoco:
+                if phase in [1, '1a', '1b'] and use_supmoco:
                     raise ValueError("SupMoCo requires dual-view augmented batches (len(batch) == 5).")
                 
             targets, targets_c = targets.to(device), targets_c.to(device)
             
-            if phase == 1 and use_supmoco:
+            if phase in [1, '1a', '1b'] and use_supmoco:
                 def _prepare_view(view):
                     K_local = None
                     if view.dim() == 6:
@@ -343,8 +354,8 @@ def training_loop(phase,
                         key_features = key_features.view(B, K_bag, *key_features.shape[1:]).mean(dim=1)
                     key_features = F.normalize(key_features, dim=1, eps=1e-6)
 
-                queue_features, queue_labels, queue_subject_labels = supmoco_state.get_queue()
-                loss = loss_fn(outputs, key_features, targets_c, subject_labels, queue_features, queue_labels, queue_subject_labels)
+                queue_features, queue_labels, queue_subject_labels, queue_ages = supmoco_state.get_queue()
+                loss = loss_fn(outputs, key_features, targets_c, subject_labels, queue_features, queue_labels, queue_subject_labels, queue_ages)
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
@@ -364,22 +375,30 @@ def training_loop(phase,
                     # Average all windows in the bag so it matches the B targets
                     outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
 
-                if phase == 1:
+                if phase in [1, '1a', '1b']:
                     f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)
                     features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
                     loss = loss_fn(features, targets_c)
                 else:
                     loss = loss_fn(outputs, targets, targets_c)
            
+            loss = loss / accumulation_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            if phase == 1 and use_supmoco:
-                momentum_update(model, momentum_model, moco_momentum)
+            
+            is_step = ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(train_loader))
+
+            if is_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                if phase in [1, '1a', '1b'] and use_supmoco:
+                    momentum_update(model, momentum_model, moco_momentum)
+                optimizer.zero_grad(set_to_none=True)
+
+            if phase in [1, '1a', '1b'] and use_supmoco:
                 with torch.no_grad():
                     supmoco_state.enqueue(key_features, targets_c, subject_labels)
-            optimizer.zero_grad(set_to_none=True)
-            if phase > 1:
+            
+            if phase not in [1, '1a', '1b']:
                 with torch.no_grad():
                     for name, param in model.decoder.named_parameters():
                         if 'threshold' in name:
@@ -388,8 +407,8 @@ def training_loop(phase,
             train_loop.set_postfix(loss=loss.item())
             
             # Explicit cleanup to prevent memory accumulation
-            if phase == 1 and use_supmoco:
-                del q_inputs, k_inputs, key_features, queue_features, queue_labels
+            if phase in [1, '1a', '1b'] and use_supmoco:
+                del q_inputs, k_inputs, key_features, queue_features, queue_labels, queue_ages
             else:
                 del inputs
             del targets_c, outputs, loss
@@ -401,14 +420,14 @@ def training_loop(phase,
 
         avg_train_loss = train_loss / len(train_loader)
           
-        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase == 1)
+        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase in [1, '1a', '1b'])
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_temp.pt") 
         os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_last.pt")
         
-        if phase == 1:
+        if phase in [1, '1a', '1b']:
             print(f"Phase {phase} Epoch {epoch} | LR: {current_lr:.2e} | "
                   f"Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"Val Acc: {val_acc:.4f}")
@@ -425,13 +444,13 @@ def training_loop(phase,
             f"Phase{phase}/Val/Balanced_Accuracy": val_bal_acc,
             "LR": current_lr
         }
-        if phase == 1 and use_supmoco and supmoco_state is not None:
+        if phase in [1, '1a', '1b'] and use_supmoco and supmoco_state is not None:
             queue_len = int(supmoco_state.queue_filled.item())
             log_dict.update({
                 f"Phase{phase}/Train/QueueSize": queue_len,
                 f"Phase{phase}/Train/QueueFillRatio": queue_len / float(max(1, supmoco_state.queue_size)),
             })
-        if phase != 1:
+        if phase not in [1, '1a', '1b']:
             log_dict.update({
                 f"Phase{phase}/Val/Dice": val_dice,
                 f"Phase{phase}/Val/IoU": val_iou,
@@ -442,8 +461,8 @@ def training_loop(phase,
         
         for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
 
-        if (-1 if phase==1 else 1)  * val_acc > (-1 if phase==1 else 1) * best_acc:
-            best_acc = avg_train_loss if phase == 1 else val_acc
+        if (-1 if phase in [1, '1a', '1b'] else 1)  * val_acc > (-1 if phase in [1, '1a', '1b'] else 1) * best_acc:
+            best_acc = avg_train_loss if phase in [1, '1a', '1b'] else val_acc
             best_dice = val_dice
             save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_best.pt") #_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}
             wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
@@ -457,29 +476,23 @@ def training_loop(phase,
         wandb.log(log_dict, step=epoch)
 
 
-def phase_one(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
-    print("=== Phase One: Training Encoder Only ===")
+def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
+    print("=== Phase 1A: Training Encoder Only (Old Style, No MIL/Bagging, No SwiGLU) ===")
     
+    if config.training.get('bagging', False):
+        print("WARNING: 'bagging' is set to True in config, but Phase 1A enforces old-style 1s windows. Ensure dataset complies!")
+
     if isinstance(model, SpikingResNetClassifier):
         enc_class = model
+        # Try to forcefully disable SwiGLU if it was constructed with it
+        if hasattr(enc_class, 'use_swiglu') and enc_class.use_swiglu:
+             print("WARNING: Model initialized with SwiGLU, but Phase 1A enforces use_swiglu=False. Overriding where possible.")
     else:
-        # Fallback for old style config!
         enc_class = SpikingResNetClassifier(
             encoder_backbone = model.encoder,
             num_classes=config.model.get('num_classes', 5),
-            use_swiglu=config.model.get('use_swiglu', False)
+            use_swiglu=False  # FORCE FALSE
         ).to(device)
-
-    #initialize_network(enc_class, train_loader, device)
-    """loss_fn = FullHybridLoss(
-        smooth = 0.,
-        lambda_seg = config.loss.get('lambda_seg', 1.0),
-        lambda_con = config.loss.get('lambda_con', 0.0),
-        lambda_class = config.loss.get('lambda_class', 1.0),
-        alpha = 0.,
-        beta = 0.,
-        time_steps=config.data.get('num_timesteps', 16),
-    )"""
 
     iic_enabled = config.loss.get('iic_enabled', False)
     iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
@@ -494,6 +507,8 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
             iic_enabled=iic_enabled,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
+            temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
+            temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
         )
     else:
         loss_fn = ContrastiveLoss(
@@ -512,6 +527,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
     epochs = config.training.phase_1_epochs
     warmup_epochs = config.training.get('warmup_epochs', 0)
     accumulation_steps = config.training.get('accumulation_steps', 1)
+    
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
 
@@ -523,14 +539,8 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
             queue_size=config.training.get('supmoco_queue_size', 4096),
             feature_dim=config.training.get('supmoco_feature_dim', 128),
         ).to(device)
-    '''
-    SequentialLR(optimizer, [
-        LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs),
-        CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
-    ], milestones=[warmup_epochs])
-    '''
     
-    if resume:
+    if resume and checkpoint is not None:
         enc_class.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -540,7 +550,7 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         print(f"Resuming training from epoch {start_epoch}...")
 
     training_loop(
-        1,
+        '1a',
         start_epoch,
         epochs,
         best_acc,
@@ -558,9 +568,117 @@ def phase_one(config, model, device, train_loader, val_loader, writer, checkpoin
         moco_momentum=config.training.get('supmoco_momentum', 0.999),
         momentum_model=momentum_model,
         supmoco_state=supmoco_state,
+        unfreeze_epoch=-1,
+        accumulation_steps=accumulation_steps
     )
    
+
+def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
+    print("=== Phase 1B: Training Encoder with MIL/Bagging & Arch Upgrades ===")
     
+    if isinstance(model, SpikingResNetClassifier):
+        enc_class = model
+    else:
+        enc_class = SpikingResNetClassifier(
+            encoder_backbone = model.encoder,
+            num_classes=config.model.get('num_classes', 5),
+            use_swiglu=config.model.get('use_swiglu', True)
+        ).to(device)
+
+    iic_enabled = config.loss.get('iic_enabled', False)
+    iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
+    iic_inter_weight = config.loss.get('iic_inter_weight', 1.0)
+    con_temp = config.loss.get('temperature', 0.07)
+    use_supmoco = config.training.get('use_supmoco', False)
+
+    if use_supmoco:
+        loss_fn = SupMoCoLoss(
+            train_loader.dataset.prototypes,
+            temperature=con_temp,
+            iic_enabled=iic_enabled,
+            iic_intra_weight=iic_intra_weight,
+            iic_inter_weight=iic_inter_weight,
+            temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
+            temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
+        )
+    else:
+        loss_fn = ContrastiveLoss(
+            train_loader.dataset.prototypes,
+            temperature=con_temp,
+            iic_enabled=iic_enabled,
+            iic_intra_weight=iic_intra_weight,
+            iic_inter_weight=iic_inter_weight,
+        )
+
+    loss_fn.to(device)
+
+    start_epoch = 0
+    best_acc = 100.0
+    best_dice = 0.0
+    epochs = config.training.phase_1_epochs
+    warmup_epochs = config.training.get('warmup_epochs', 0)
+    accumulation_steps = config.training.get('accumulation_steps', 1)
+    
+    unfreeze_epoch = config.training.get('freeze_encoder_epochs', 0)
+    
+    # In 1B, if resuming, normal resume.
+    # If not resuming but checkpoint provided, it's a backbone transfer!
+    if resume and checkpoint is not None:
+        enc_class.load_state_dict(checkpoint['model_state_dict'])
+        # Optimizer and scheduler loads handled later...
+        start_epoch = checkpoint['epoch'] + 1
+        best_acc = checkpoint['accuracy']
+        best_dice = checkpoint['dice']
+        print(f"Resuming training from epoch {start_epoch}...")
+    elif not resume and checkpoint is not None:
+        print("Transferring pretrained weights from checkpoint as Backbone...")
+        enc_class.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+    # Initialize optimizer WITH requires_grad=True across the board so that
+    # the optimizer recognizes the params.
+    for param in enc_class.parameters():
+        param.requires_grad = True
+
+    # Note: lower encoder LR
+    optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=True)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+
+    momentum_model = None
+    supmoco_state = None
+    if use_supmoco:
+        momentum_model = build_momentum_encoder(enc_class).to(device)
+        supmoco_state = SupMoCoState(
+            queue_size=config.training.get('supmoco_queue_size', 4096),
+            feature_dim=config.training.get('supmoco_feature_dim', 128),
+        ).to(device)
+    
+    if resume and checkpoint is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    training_loop(
+        '1b',
+        start_epoch,
+        epochs,
+        best_acc,
+        best_dice,
+        enc_class,
+        device,
+        train_loader,
+        val_loader,
+        loss_fn,
+        optimizer,
+        scheduler,
+        writer,
+        checkpoint_dir,
+        use_supmoco=use_supmoco,
+        moco_momentum=config.training.get('supmoco_momentum', 0.999),
+        momentum_model=momentum_model,
+        supmoco_state=supmoco_state,
+        unfreeze_epoch=unfreeze_epoch,
+        accumulation_steps=accumulation_steps
+    )
+
     
 def phase_two(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint):
     print("=== Phase Two: Training Rest Only ===")
@@ -594,7 +712,7 @@ def phase_two(config, model, device, train_loader, val_loader, writer, checkpoin
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
 
-    if resume:
+    if resume and checkpoint is not None:
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -603,7 +721,7 @@ def phase_two(config, model, device, train_loader, val_loader, writer, checkpoin
         best_dice = checkpoint['dice']
         print(f"Resuming training from epoch {start_epoch}...")
     
-    training_loop(2, start_epoch, epochs, best_acc, best_dice, model, device, train_loader, val_loader, loss_fn, optimizer, scheduler, writer, checkpoint_dir)
+    training_loop('2', start_epoch, epochs, best_acc, best_dice, model, device, train_loader, val_loader, loss_fn, optimizer, scheduler, writer, checkpoint_dir, unfreeze_epoch=-1, accumulation_steps=accumulation_steps)
 
 
 def phase_three(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint):  
@@ -652,7 +770,7 @@ def phase_three(config, model, device, train_loader, val_loader, writer, checkpo
     optimizer = create_optimizer(model, loss_fn, config, low_encoder_lr=True)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
-    if resume:
+    if resume and checkpoint is not None:
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -661,13 +779,15 @@ def phase_three(config, model, device, train_loader, val_loader, writer, checkpo
         best_dice = checkpoint['dice']
         print(f"Resuming training from epoch {start_epoch}...")
     
-    training_loop(3, start_epoch, epochs, best_acc, best_dice, model, device, train_loader, val_loader, loss_fn, optimizer, scheduler, writer, checkpoint_dir)
+    training_loop('3', start_epoch, epochs, best_acc, best_dice, model, device, train_loader, val_loader, loss_fn, optimizer, scheduler, writer, checkpoint_dir, unfreeze_epoch=-1, accumulation_steps=accumulation_steps)
 
     
 phase_handles = {
-    1: phase_one,
-    2: phase_two,
-    3: phase_three,
+    '1a': phase_one_a,
+    '1b': phase_one_b,
+    '1': phase_one_a, # fallback for configs specifying '1'
+    '2': phase_two,
+    '3': phase_three,
 }
 
 
