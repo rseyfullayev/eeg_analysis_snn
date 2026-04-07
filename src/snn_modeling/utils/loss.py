@@ -305,6 +305,9 @@ class SupMoCoLoss(ContrastiveLoss):
         dice_pair = self.sim_score[labels][:, all_labels]
         neg_weights = neg_mask * (1.0 + torch.clamp(dice_pair * self.iic_inter_weight, min=0.0, max=self.iic_inter_weight-1.0))
         
+
+    
+
         if self.temporal_decay_enabled:
             # Apply temporal decay: w_temporal = temporal_decay_factor ^ age
             temporal_weights = self.temporal_decay_factor ** all_ages  # (M,)
@@ -317,7 +320,29 @@ class SupMoCoLoss(ContrastiveLoss):
 
         pos_weight_sum = torch.clamp(pos_weights.sum(dim=1), min=1e-8)
         mean_log_prob_pos = (pos_weights * pos_log_prob).sum(dim=1) / pos_weight_sum
-        return -mean_log_prob_pos.mean()
+        loss_val = -mean_log_prob_pos.mean()
+        
+        current_epoch = getattr(self, 'current_epoch', 0)
+        if current_epoch >= 300 and getattr(self, 'step_count', 0) % 100 == 0:
+            with torch.no_grad():
+                raw_dots = torch.matmul(q, all_features.T) # No temperature scaling
+                pos_dots = (raw_dots * pos_mask).sum() / (pos_mask.sum() + 1e-6)
+                neg_dots = (raw_dots * neg_mask).sum() / (neg_mask.sum() + 1e-6)
+
+                mean_pos_weight = pos_weights[pos_mask.bool()].mean()
+                mean_neg_weight = neg_weights[neg_mask.bool()].mean()
+
+                print(f"\n--- Loss Diagnostics (Epoch {current_epoch}) ---")
+                print(f"Mean Pos Dot Product: {pos_dots.item():.4f}")
+                print(f"Mean Neg Dot Product: {neg_dots.item():.4f}")
+                print(f"Mean Pos Weight: {mean_pos_weight.item():.4f}")
+                print(f"Mean Neg Weight: {mean_neg_weight.item():.4f}")
+                print(f"Max Logit (shifted): {logits_max.mean().item():.4f}")
+                print(f"Denominator (Exp Neg Sum): {neg_partition.mean().item():.4f}")
+                print(f"Final Loss: {loss_val.item():.4f}\n")
+                
+        self.step_count = getattr(self, 'step_count', 0) + 1
+        return loss_val
 
 
 class FullHybridLoss(nn.Module):

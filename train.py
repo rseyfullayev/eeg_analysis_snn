@@ -281,6 +281,7 @@ def training_loop(phase,
 
     for epoch in range(start_epoch, epochs):
         model.train()
+        loss_fn.current_epoch = epoch
 
         if unfreeze_epoch > 0:
             if epoch < unfreeze_epoch:
