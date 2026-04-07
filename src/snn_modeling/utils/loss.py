@@ -213,6 +213,30 @@ class ContrastiveLoss(nn.Module):
         mean_log_prob_pos = (pos_weights * log_prob).sum(1) / pos_weight_sum
         
         loss = -mean_log_prob_pos.mean()
+        
+        current_epoch = getattr(self, 'current_epoch', 0)
+        step_count = getattr(self, 'step_count', 0)
+        if step_count == 500:
+            with torch.no_grad():
+                raw_dots = torch.matmul(features, features.T) 
+                pos_dots = (raw_dots * mask).sum() / (mask.sum() + 1e-6)
+                neg_dots = (raw_dots * neg_mask).sum() / (neg_mask.sum() + 1e-6)
+
+                mean_pos_weight = pos_weights[mask.bool()].mean()
+                mean_neg_weight = neg_weights[neg_mask.bool()].mean()
+                
+                denom_val = exp_logits.sum(1).mean().item()
+
+                print(f"\n--- Loss Diagnostics (Epoch {current_epoch} | Batch {step_count}) ---")
+                print(f"Mean Pos Dot Product: {pos_dots.item():.4f}")
+                print(f"Mean Neg Dot Product: {neg_dots.item():.4f}")
+                print(f"Mean Pos Weight: {mean_pos_weight.item():.4f}")
+                print(f"Mean Neg Weight: {mean_neg_weight.item():.4f}")
+                print(f"Max Logit (shifted): {logits_max.mean().item():.4f}")
+                print(f"Denominator (Exp Neg Sum): {denom_val:.4f}")
+                print(f"Final Loss: {loss.item():.4f}\n")
+                
+        self.step_count = step_count + 1
         return loss
 
 
@@ -332,7 +356,7 @@ class SupMoCoLoss(ContrastiveLoss):
         
         current_epoch = getattr(self, 'current_epoch', 0)
         step_count = getattr(self, 'step_count', 0)
-        if step_count >= 500 and step_count % 100 == 0:
+        if step_count == 500:
             with torch.no_grad():
                 raw_dots = torch.matmul(q, all_features.T) # No temperature scaling
                 pos_dots = (raw_dots * pos_mask).sum() / (pos_mask.sum() + 1e-6)

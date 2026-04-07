@@ -282,6 +282,7 @@ def training_loop(phase,
     for epoch in range(start_epoch, epochs):
         model.train()
         loss_fn.current_epoch = epoch
+        loss_fn.step_count = 0
 
         if unfreeze_epoch > 0:
             if epoch < unfreeze_epoch:
@@ -855,15 +856,25 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     prefetch = config.data.get('prefetch_factor', 2) if num_workers > 0 else None
     persist = num_workers > 0  # Only use persistent_workers if num_workers > 0
     
-    train_loader = DataLoader(train_set, 
-                              batch_sampler=PKSampler(train_set, 
-                                                      batch_size=config.training.batch_size, 
-                                                      n_classes=config.model.get('n_emotions', 5),
-                                                      subject_diverse_k=config.training.get('pk_subject_diverse_k', True)),
-                              num_workers=num_workers,
-                              prefetch_factor=prefetch,
-                              persistent_workers=persist,
-                              pin_memory=True)
+    use_pk_sampler = config.training.get('use_pk_sampler', True)
+    if use_pk_sampler:
+        train_loader = DataLoader(train_set, 
+                                  batch_sampler=PKSampler(train_set, 
+                                                          batch_size=config.training.batch_size, 
+                                                          n_classes=config.model.get('n_emotions', 5),
+                                                          subject_diverse_k=config.training.get('pk_subject_diverse_k', True)),
+                                  num_workers=num_workers,
+                                  prefetch_factor=prefetch,
+                                  persistent_workers=persist,
+                                  pin_memory=True)
+    else:
+        train_loader = DataLoader(train_set, 
+                                  batch_size=config.training.batch_size,
+                                  shuffle=True, 
+                                  num_workers=num_workers,
+                                  prefetch_factor=prefetch,
+                                  persistent_workers=persist,
+                                  pin_memory=True)
     
     val_loader = DataLoader(val_set, 
                             batch_size=config.training.batch_size, 

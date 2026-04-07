@@ -14,4 +14,5 @@ supmoco_feature_dim: 128
 supmoco_momentum: 0.9
 temporal_decay_enabled: false
 temporal_decay_factor: 0.999
+use_pk_sampler: true
 pk_subject_diverse_k: true
