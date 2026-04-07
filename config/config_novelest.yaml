@@ -11,11 +11,11 @@ encoder:
 
 training:
   use_pk_sampler: true
-  temporal_decay_enabled: true
+  temporal_decay_enabled: false
   temporal_decay_factor: 0.99
   use_supmoco: true
-  supmoco_momentum: 0.999
-  supmoco_queue_size: 2048
+  supmoco_momentum: 0.9
+  supmoco_queue_size: 512
   
 
 
@@ -31,11 +31,11 @@ loss:
   smooth: 0.0
   lambda_seg: 0.0
   lambda_con: 0.0
-  temperature: 0.07
+  temperature: 0.1
   iic_enabled: true
   decoupled: true
-  iic_intra_weight: 0.5
-  iic_inter_weight: 3.0
+  iic_intra_weight: 1.0
+  iic_inter_weight: 1.0
   lambda_class: 1.0
   lambda_fire: 0.0
   target_rate: 0.1

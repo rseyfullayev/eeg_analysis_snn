@@ -54,7 +54,6 @@ class SpikingResNetClassifier(nn.Module):
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
-        self.avg_pool = self.temporal = TemporalGCBlock(feature_dim) #TimeDistributed(nn.AdaptiveAvgPool2d((1,1)))
         self.use_swiglu = use_swiglu
         
         # --- SwiGLU MIL Attention Heads (Optional) ---
@@ -70,7 +69,11 @@ class SpikingResNetClassifier(nn.Module):
 
     def forward(self, x, K=None):
         features, _ = self.encoder(x)
-        out = self.avg_pool(features)#.mean(dim=0).squeeze(-1).squeeze(-1)  # B x C x 1 x 1 -> B x C
+        # Spatiotemporal GAP: (T, B, C, H, W) -> (B, C)
+        if features.dim() == 5:
+            out = features.mean(dim=[0, 3, 4])  # mean over T, H, W
+        else:
+            out = features.mean(dim=[-2, -1])   # mean over H, W if already collapsed
 
         # === HYBRID MIL: Pre-Normalized RTFM Gating (or SwiGLU) ===
         if K is not None and K > 1:

@@ -185,7 +185,7 @@ class ContrastiveLoss(nn.Module):
         
         if self.iic_enabled:
             pos_weights = mask * self.iic_intra_weight
-            neg_weights = neg_mask * (1.0 + self.iic_inter_weight * dice_pair)
+            neg_weights = neg_mask * (1.0 + dice_pair)
         else:
             pos_weights = mask.clone()
             neg_weights = neg_mask.clone()
@@ -322,7 +322,7 @@ class SupMoCoLoss(ContrastiveLoss):
         logits = logits - logits_max.detach()
 
         if self.iic_enabled:
-            # Weight same-emotion positives differently depending on whether the subject matches.
+            # Cross-subject positives get iic_intra_weight; same-subject get baseline 1.0.
             subj_weight = torch.where(
                 same_subj_mask.bool(),
                 torch.ones_like(same_subj_mask),
@@ -330,9 +330,9 @@ class SupMoCoLoss(ContrastiveLoss):
             )
             pos_weights = pos_mask * subj_weight
 
-            # Reuse prototype-Dice pair weights for bounded negatives.
+            # Negatives weighted strictly by 1 + Dice overlap.
             dice_pair = self.sim_score[labels][:, all_labels]
-            neg_weights = neg_mask * (1.0 + torch.clamp(dice_pair * self.iic_inter_weight, min=0.0, max=max(0.0, self.iic_inter_weight - 1.0)))
+            neg_weights = neg_mask * (1.0 + dice_pair)
         else:
             pos_weights = pos_mask.clone()
             neg_weights = neg_mask.clone()
