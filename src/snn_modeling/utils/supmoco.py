@@ -15,9 +15,14 @@ def build_momentum_encoder(model):
 
 @torch.no_grad()
 def momentum_update(online_model, momentum_model, momentum):
-    for p_online, p_momentum in zip(online_model.parameters(), momentum_model.parameters()):
-        p_momentum.data.mul_(momentum).add_(p_online.data, alpha=1.0 - momentum)
-
+    online_dict = online_model.state_dict()
+    momentum_dict = momentum_model.state_dict()
+    for key in momentum_dict.keys():
+        if torch.is_floating_point(momentum_dict[key]):
+            momentum_dict[key].data.mul_(momentum).add_(online_dict[key].data, alpha=1.0 - momentum)
+        else:
+            # For integer buffers (e.g. num_batches_tracked), just copy them
+            momentum_dict[key].data.copy_(online_dict[key].data)
 
 class SupMoCoState(nn.Module):
     def __init__(self, queue_size=4096, feature_dim=128):

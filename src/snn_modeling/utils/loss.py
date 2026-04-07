@@ -283,12 +283,15 @@ class SupMoCoLoss(ContrastiveLoss):
         
 
         logits = torch.matmul(q, all_features.T) / self.temperature  # (B, M)
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits = logits - logits_max.detach()
 
         pos_mask = (labels.unsqueeze(1) == all_labels.unsqueeze(0)).float()
         neg_mask = 1.0 - pos_mask
         same_subj_mask = (subject_labels.unsqueeze(1) == all_subject_labels.unsqueeze(0)).float()
+
+        # Mask out positives so they don't skew the max shift (decoupled partition)
+        mask_for_max = torch.where(pos_mask.bool(), torch.full_like(logits, -1e9), logits)
+        logits_max, _ = torch.max(mask_for_max, dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
 
         # Weight same-emotion positives differently depending on whether the subject matches.
         subj_weight = torch.where(
@@ -300,12 +303,13 @@ class SupMoCoLoss(ContrastiveLoss):
 
         # Reuse prototype-Dice pair weights for bounded negatives.
         dice_pair = self.sim_score[labels][:, all_labels]
-        neg_weights = neg_mask * torch.clamp(dice_pair * self.iic_inter_weight, min=1e-6, max=1.0)
+        neg_weights = neg_mask * (1.0 + torch.clamp(dice_pair * self.iic_inter_weight, min=0.0, max=self.iic_inter_weight-1.0))
         
         if self.temporal_decay_enabled:
             # Apply temporal decay: w_temporal = temporal_decay_factor ^ age
             temporal_weights = self.temporal_decay_factor ** all_ages  # (M,)
             neg_weights = neg_weights * temporal_weights.unsqueeze(0)
+            pos_weights = pos_weights * temporal_weights.unsqueeze(0)
 
         # Decoupled denominator: negatives only (no positive terms in partition).
         neg_partition = torch.clamp((torch.exp(logits) * neg_weights).sum(dim=1, keepdim=True), min=1e-8)
