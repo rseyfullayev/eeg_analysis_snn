@@ -293,17 +293,21 @@ class SupMoCoLoss(ContrastiveLoss):
         logits_max, _ = torch.max(mask_for_max, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
 
-        # Weight same-emotion positives differently depending on whether the subject matches.
-        subj_weight = torch.where(
-            same_subj_mask.bool(),
-            torch.ones_like(same_subj_mask),
-            torch.full_like(same_subj_mask, self.iic_intra_weight),
-        )
-        pos_weights = pos_mask * subj_weight
+        if self.iic_enabled:
+            # Weight same-emotion positives differently depending on whether the subject matches.
+            subj_weight = torch.where(
+                same_subj_mask.bool(),
+                torch.ones_like(same_subj_mask),
+                torch.full_like(same_subj_mask, self.iic_intra_weight),
+            )
+            pos_weights = pos_mask * subj_weight
 
-        # Reuse prototype-Dice pair weights for bounded negatives.
-        dice_pair = self.sim_score[labels][:, all_labels]
-        neg_weights = neg_mask * (1.0 + torch.clamp(dice_pair * self.iic_inter_weight, min=0.0, max=self.iic_inter_weight-1.0))
+            # Reuse prototype-Dice pair weights for bounded negatives.
+            dice_pair = self.sim_score[labels][:, all_labels]
+            neg_weights = neg_mask * (1.0 + torch.clamp(dice_pair * self.iic_inter_weight, min=0.0, max=max(0.0, self.iic_inter_weight - 1.0)))
+        else:
+            pos_weights = pos_mask.clone()
+            neg_weights = neg_mask.clone()
         
 
     
