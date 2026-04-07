@@ -1,0 +1,8 @@
+--- Loss Diagnostics (Epoch 0 | Batch 500) ---
+Mean Pos Dot Product: 0.9953
+Mean Neg Dot Product: 0.9953
+Mean Pos Weight: 0.5339
+Mean Neg Weight: 3.0000
+Max Logit (shifted): 9.9951
+Denominator (Exp Neg Sum): 1316.2933
+Final Loss: 7.2245
