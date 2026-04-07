@@ -6,6 +6,19 @@ defaults:
   - training: phase1a
   - _self_
 
+encoder:
+  use_odconv: true
+
+training:
+  use_pk_sampler: true
+  temporal_decay_enabled: true
+  temporal_decay_factor: 0.99
+  use_supmoco: true
+  supmoco_momentum: 0.999
+  supmoco_queue_size: 2048
+  
+
+
 experiment_name: "MobileNet_SWIGLU"
 description: "Phase 1 with MobileNet Encoder and SwiGLU Attention Heads"
 
@@ -19,7 +32,8 @@ loss:
   lambda_seg: 0.0
   lambda_con: 0.0
   temperature: 0.07
-  iic_enabled: false
+  iic_enabled: true
+  decoupled: true
   iic_intra_weight: 0.5
   iic_inter_weight: 3.0
   lambda_class: 1.0
