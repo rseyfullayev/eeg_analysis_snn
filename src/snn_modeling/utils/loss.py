@@ -323,7 +323,8 @@ class SupMoCoLoss(ContrastiveLoss):
         loss_val = -mean_log_prob_pos.mean()
         
         current_epoch = getattr(self, 'current_epoch', 0)
-        if current_epoch >= 300 and getattr(self, 'step_count', 0) % 100 == 0:
+        step_count = getattr(self, 'step_count', 0)
+        if step_count >= 500 and step_count % 100 == 0:
             with torch.no_grad():
                 raw_dots = torch.matmul(q, all_features.T) # No temperature scaling
                 pos_dots = (raw_dots * pos_mask).sum() / (pos_mask.sum() + 1e-6)
@@ -332,7 +333,7 @@ class SupMoCoLoss(ContrastiveLoss):
                 mean_pos_weight = pos_weights[pos_mask.bool()].mean()
                 mean_neg_weight = neg_weights[neg_mask.bool()].mean()
 
-                print(f"\n--- Loss Diagnostics (Epoch {current_epoch}) ---")
+                print(f"\n--- Loss Diagnostics (Epoch {current_epoch} | Batch {step_count}) ---")
                 print(f"Mean Pos Dot Product: {pos_dots.item():.4f}")
                 print(f"Mean Neg Dot Product: {neg_dots.item():.4f}")
                 print(f"Mean Pos Weight: {mean_pos_weight.item():.4f}")
@@ -341,7 +342,7 @@ class SupMoCoLoss(ContrastiveLoss):
                 print(f"Denominator (Exp Neg Sum): {neg_partition.mean().item():.4f}")
                 print(f"Final Loss: {loss_val.item():.4f}\n")
                 
-        self.step_count = getattr(self, 'step_count', 0) + 1
+        self.step_count = step_count + 1
         return loss_val
 
 
