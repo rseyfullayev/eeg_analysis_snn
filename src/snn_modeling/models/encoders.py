@@ -5,7 +5,7 @@ from ..layers.stem import TemporalViTBlock, TemporalGCBlock
 from ..layers.activations import instantiate_activation, resolve_activation, is_alif
 
 class SpikingMobileNetEncoder(nn.Module):
-    def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=False, gc=False, spike_model=snn.Leaky, **neuron_params):
+    def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=False, gc=False, spike_model=snn.Leaky, use_odconv=True, **neuron_params):
         super(SpikingMobileNetEncoder, self).__init__()
         
         spike_model = resolve_activation(spike_model)
@@ -53,8 +53,8 @@ class SpikingMobileNetEncoder(nn.Module):
 
         self.stage1 = _make_stage(20, 32, stride=2, dilation=1, blocks=2, odconv=False, **no_norm_layer_params)
         self.stage2 = _make_stage(32, 64, stride=2, dilation=1, blocks=3, odconv=False, **no_norm_layer_params)
-        self.stage3 = _make_stage(64, 128, stride=2, dilation=2, blocks=3, odconv=True, **no_norm_layer_params)
-        self.stage4 = _make_stage(128, 256, stride=2, dilation=4, blocks=2, odconv=True, **last_layer_params)
+        self.stage3 = _make_stage(64, 128, stride=2, dilation=2, blocks=3, odconv=use_odconv, **no_norm_layer_params)
+        self.stage4 = _make_stage(128, 256, stride=2, dilation=4, blocks=2, odconv=use_odconv, **last_layer_params)
 
 
         if vit:

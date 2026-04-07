@@ -498,6 +498,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     iic_enabled = config.loss.get('iic_enabled', False)
     iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
     iic_inter_weight = config.loss.get('iic_inter_weight', 1.0)
+    decoupled = config.loss.get('decoupled', False)
     con_temp = config.loss.get('temperature', 0.07)
     use_supmoco = config.training.get('use_supmoco', False)
 
@@ -518,6 +519,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
             iic_enabled=iic_enabled,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
+            decoupled=decoupled,
         )
 
     loss_fn.to(device)
@@ -589,6 +591,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
     iic_enabled = config.loss.get('iic_enabled', False)
     iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
     iic_inter_weight = config.loss.get('iic_inter_weight', 1.0)
+    decoupled = config.loss.get('decoupled', False)
     con_temp = config.loss.get('temperature', 0.07)
     use_supmoco = config.training.get('use_supmoco', False)
 
@@ -609,6 +612,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
             iic_enabled=iic_enabled,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
+            decoupled=decoupled,
         )
 
     loss_fn.to(device)

@@ -118,12 +118,14 @@ class ContrastiveLoss(nn.Module):
                  temperature=0.07,
                  iic_enabled=False,
                  iic_intra_weight=1.0,
-                 iic_inter_weight=1.0):
+                 iic_inter_weight=1.0,
+                 decoupled=False):
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature
         self.iic_enabled = iic_enabled
         self.iic_intra_weight = iic_intra_weight
         self.iic_inter_weight = iic_inter_weight
+        self.decoupled = decoupled
         sim_score = self.compute_mask_dice_matrix(masks)  # (C, C) precomputed similarity between prototype masks
         self.register_buffer('sim_score', sim_score)  # (C, C) buffer for efficient lookup
 
@@ -180,18 +182,26 @@ class ContrastiveLoss(nn.Module):
         label_flat = labels.squeeze(1)                                     # (2N,)
         dice_pair = self.sim_score[label_flat][:, label_flat]   # (2N, 2N)
         neg_mask = logits_mask - mask                                      # 1 for negatives, 0 for positives/self
-        # Baseline uses Dice-weighted negatives; IIC additionally reweights both
-        # intra-class positives and inter-class negatives.
+        
         if self.iic_enabled:
             pos_weights = mask * self.iic_intra_weight
             neg_weights = neg_mask * (1.0 + self.iic_inter_weight * dice_pair)
-            denom_weights = pos_weights + neg_weights
         else:
-            # Negatives weighted by (1 + dice), positives by 1, self by 0
-            denom_weights = logits_mask + neg_mask * dice_pair
+            pos_weights = mask.clone()
+            neg_weights = neg_mask.clone()
+
+        if self.decoupled:
+            denom_weights = neg_weights
+        else:
+            denom_weights = pos_weights + neg_weights
 
         # Numerical Stability: subtract max for LogSumExp
-        logits_max, _ = torch.max(similarity_matrix * logits_mask, dim=1, keepdim=True)
+        if self.decoupled:
+            mask_for_max = torch.where(mask.bool(), torch.full_like(similarity_matrix, -1e9), similarity_matrix)
+            logits_max, _ = torch.max(mask_for_max, dim=1, keepdim=True)
+        else:
+            logits_max, _ = torch.max(similarity_matrix * logits_mask, dim=1, keepdim=True)
+            
         logits = similarity_matrix - logits_max.detach()
         
         # Compute log softmax with dice-scaled denominator
@@ -199,15 +209,8 @@ class ContrastiveLoss(nn.Module):
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
         
         # Mean log-likelihood over positives
-        mask_sum = mask.sum(1)
-        # Avoid division by zero for samples with no positives
-        mask_sum = torch.clamp(mask_sum, min=1.0)
-        if self.iic_enabled:
-            weighted_pos = mask * self.iic_intra_weight
-            weighted_pos_sum = torch.clamp(weighted_pos.sum(1), min=1.0)
-            mean_log_prob_pos = (weighted_pos * log_prob).sum(1) / weighted_pos_sum
-        else:
-            mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
+        pos_weight_sum = torch.clamp(pos_weights.sum(1), min=1.0)
+        mean_log_prob_pos = (pos_weights * log_prob).sum(1) / pos_weight_sum
         
         loss = -mean_log_prob_pos.mean()
         return loss
@@ -233,6 +236,7 @@ class SupMoCoLoss(ContrastiveLoss):
             iic_enabled=iic_enabled,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
+            decoupled=True,
         )
         self.temporal_decay_enabled = temporal_decay_enabled
         self.temporal_decay_factor = temporal_decay_factor

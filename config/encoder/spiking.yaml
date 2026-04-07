@@ -4,6 +4,7 @@ p_drop: 0.2
 vit_p_drop: 0.25
 vit: false
 gc: false
+use_odconv: true
 spike_model: "ALIF"
 beta: 0.8825
 threshold: 0.9388
