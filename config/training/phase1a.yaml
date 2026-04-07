@@ -8,7 +8,7 @@ learning_rate: 0.001
 weight_decay: 0.01
 accumulation_steps: 1
 bagging: false
-use_supmoco: true
+use_supmoco: false
 supmoco_queue_size: 512
 supmoco_feature_dim: 128
 supmoco_momentum: 0.9

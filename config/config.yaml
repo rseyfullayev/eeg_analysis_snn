@@ -30,7 +30,7 @@ loss:
 
 logging:
   project_name: "snn-encoding-showdown"
-  run_name: "MobileNet_SWIGLU"
-  tags: ["mobilenet", "swiglu", "supmoco", "tsm", "mil"]
+  run_name: "MobileNet"
+  tags: ["mobilenet", "tsm", "phase1a"]
   offline: false
   log_interval: 1
