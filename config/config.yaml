@@ -1,9 +1,9 @@
 defaults:
-  - data: seed_v_local
+  - data: seed_v
   - encoder: analog
   - decoder: spiking        
   - architecture: phase1_swiglu 
-  - training: phase1
+  - training: phase1a
   - _self_
 
 experiment_name: "MobileNet_SWIGLU"
@@ -32,5 +32,5 @@ logging:
   project_name: "snn-encoding-showdown"
   run_name: "MobileNet_SWIGLU"
   tags: ["mobilenet", "swiglu", "supmoco", "tsm", "mil"]
-  offline: true
+  offline: false
   log_interval: 1
