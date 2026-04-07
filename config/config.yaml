@@ -18,7 +18,7 @@ loss:
   smooth: 0.0
   lambda_seg: 0.0
   lambda_con: 0.0
-  temperature: 0.07
+  temperature: 0.1
   iic_enabled: true
   iic_intra_weight: 0.5
   iic_inter_weight: 3.0

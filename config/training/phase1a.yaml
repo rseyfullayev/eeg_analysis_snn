@@ -9,9 +9,9 @@ weight_decay: 0.01
 accumulation_steps: 1
 bagging: false
 use_supmoco: true
-supmoco_queue_size: 1024
+supmoco_queue_size: 512
 supmoco_feature_dim: 128
-supmoco_momentum: 0.9995
+supmoco_momentum: 0.9
 temporal_decay_enabled: false
 temporal_decay_factor: 0.999
 pk_subject_diverse_k: true
