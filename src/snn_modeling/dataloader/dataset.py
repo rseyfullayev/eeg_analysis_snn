@@ -189,22 +189,36 @@ class SWEEPDataset(Dataset):
         
         # --- BAG LEVEL RESTRUCTURING ---
         self.bag_size_limit = config.data.get('mil_bag_size', 60) # Max windows per bag
-        
-        # Group by 'bag_id' (each trial clip is one bag)
-        grouped = df_slice.groupby('bag_id')
+        self.bagging = config.training.get('bagging', True) if hasattr(config, 'training') else True
         self.samples = []
-        for bag_id, group_df in grouped:
-            emotion_idx = group_df['emotion_id'].iloc[0]
-            # Maintain chronological order of files (s0, s1, s2, ...)
-            # Ensure proper string/int casting for consistent sorting if needed, but for now we expect the filenames to be chronological or we can just list them
-            files = group_df['filename'].tolist()
-            try:
-                subject_idx = int(str(files[0]).split('_')[0])
-            except Exception:
-                subject_idx = -1
-            self.samples.append((bag_id, files, emotion_idx, subject_idx))
 
-        print(f"[{split.upper()}] Initialized with {len(self.samples)} Bags (Total Windows: {len(df_slice)})")
+        if self.bagging:
+            # Group by 'bag_id' (each trial clip is one bag)
+            grouped = df_slice.groupby('bag_id')
+            for bag_id, group_df in grouped:
+                emotion_idx = group_df['emotion_id'].iloc[0]
+                # Maintain chronological order of files (s0, s1, s2, ...)
+                # Ensure proper string/int casting for consistent sorting if needed, but for now we expect the filenames to be chronological or we can just list them
+                files = group_df['filename'].tolist()
+                try:
+                    subject_idx = int(str(files[0]).split('_')[0])
+                except Exception:
+                    subject_idx = -1
+                self.samples.append((bag_id, files, emotion_idx, subject_idx))
+
+            print(f"[{split.upper()}] Initialized with {len(self.samples)} Bags (Total Windows: {len(df_slice)})")
+        else:
+            for idx, row in df_slice.iterrows():
+                emotion_idx = row['emotion_id']
+                files = [row['filename']]
+                bag_id = row.get('bag_id', f"no_bag_{idx}")
+                try:
+                    subject_idx = int(str(files[0]).split('_')[0])
+                except Exception:
+                    subject_idx = -1
+                self.samples.append((bag_id, files, emotion_idx, subject_idx))
+                
+            print(f"[{split.upper()}] Initialized with {len(self.samples)} Individual Windows (Bagging OFF)")
 
         if self.preload:
             print("Preloading data into RAM...")
@@ -261,7 +275,7 @@ class SWEEPDataset(Dataset):
         # We divide the trial into 'bag_size_limit' equal temporal bins,
         # and randomly select exactly ONE window from each bin.
         # This guarantees we sample from the beginning, middle, and end of the movie.
-        if len(files) > self.bag_size_limit:
+        if self.bagging and len(files) > self.bag_size_limit:
             bin_size = len(files) / self.bag_size_limit
             selected_files = []
             for i in range(self.bag_size_limit):
@@ -291,12 +305,16 @@ class SWEEPDataset(Dataset):
         bag_video = torch.stack(loaded_tensors, dim=0) 
 
         # 2. Pad if bag was smaller than the limit (to prevent collate_fn crash)
-        if bag_video.size(0) < self.bag_size_limit:
+        if self.bagging and bag_video.size(0) < self.bag_size_limit:
             pad_size = self.bag_size_limit - bag_video.size(0)
             pad_shape = list(bag_video.shape)
             pad_shape[0] = pad_size
             padding = torch.zeros(pad_shape, dtype=bag_video.dtype, device=bag_video.device)
             bag_video = torch.cat([bag_video, padding], dim=0)
+            
+        elif not self.bagging:
+            # If bagging is turned off, drop the K dimension
+            bag_video = bag_video.squeeze(0)
 
         # We keep the single prototype map for the whole bag
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
