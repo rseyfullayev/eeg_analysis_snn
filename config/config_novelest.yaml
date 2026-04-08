@@ -20,10 +20,10 @@ training:
 
 
 experiment_name: "MobileNet_SWIGLU"
-description: "Phase 1 with MobileNet Encoder and SwiGLU Attention Heads"
+description: "Phase 1 with MobileNet Encoder with Supervised MoCo and Differential Masking"
 
 mask:
-  type: "Differential"
+  type: "Statistical Mask"
   sigma: 0.25
   radius: 0.7
 
