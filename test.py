@@ -99,7 +99,7 @@ def test(config, loso, subj, device, model):
     print(f"Embeddings: {emb_all.shape} | Labels: {labels_all.shape}")
 
     # --- UMAP Projection ---
-    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
+    reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42)
     emb_2d = reducer.fit_transform(emb_all)
 
     # --- Clustering quality metric ---
@@ -131,12 +131,9 @@ def test(config, loso, subj, device, model):
     print(f"UMAP saved to {save_path}")
 
     # --- W&B Logging ---
-    if wandb.run is not None:
-        wandb.log({
-            f"Eval/UMAP_{id_label}": wandb.Image(save_path, caption=f"UMAP {id_label}"),
-            f"Eval/Silhouette_{id_label}": sil_score,
-            f"Eval/Num_Samples": len(labels_all),
-        })
-        print(f"Logged to W&B under Eval/ prefix.")
-    else:
-        print("W&B run not active — skipping remote logging.")
+    wandb.log({
+        f"Eval/UMAP_{id_label}": wandb.Image(save_path, caption=f"UMAP {id_label}"),
+        f"Eval/Silhouette_{id_label}": sil_score,
+        f"Eval/Num_Samples": len(labels_all),
+    })
+    print(f"Logged to W&B under Eval/ prefix.")

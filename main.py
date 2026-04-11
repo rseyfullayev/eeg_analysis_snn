@@ -3,6 +3,7 @@ from omegaconf import OmegaConf
 import os
 import torch
 import torch.nn as nn
+import wandb
 
 from generate_dataset import run_data_setup
 from train import run_training, validate
@@ -97,6 +98,17 @@ def main():
         if not args.loso and not args.subj:
             parser.error("You MUST specify --loso or --subj for test.")
 
+        # Init W&B for eval logging
+        id_label = f"loso{args.loso}" if args.loso else f"subj{args.subj}"
+        wandb.init(
+            project=config.logging.project_name,
+            name=f"eval-{config.logging.run_name}-{id_label}",
+            config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
+            tags=list(config.logging.tags) + ["eval"],
+            mode="disabled" if config.logging.get('offline') else "online",
+            settings=wandb.Settings(_disable_stats=True, _disable_meta=True)
+        )
+
         model = build_model(config).to(device)
         
         if isinstance(model, SpikingResNetClassifier):
@@ -113,9 +125,11 @@ def main():
         enc_class.load_state_dict(checkpoint_data['model_state_dict'])
 
         test(config, args.loso, args.subj, device, enc_class)
+        wandb.finish()
+        print("--- Test Complete ---")
+        exit(0)
 
-
-    if args.audit_bio:
+    elif args.audit_bio:
         run_bio_audit(config, device=torch.device('cuda'), samples=300)
 
     elif args.calibrate:

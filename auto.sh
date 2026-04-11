@@ -1,14 +1,30 @@
 #!/bin/bash
 
-# --- Configuration ---
-REPO_DIR="/home/temporaryuser3/Documents/ERO/"
-BRANCH="features/odconv" # Change this if you use 'master' or another branch
-SCRIPT_TO_RUN="python main.py --config configs/config.yaml --loso 1" # Replace with your actual command
-TEST_SCRIPT="python main.py --config configs/config.yaml --loso 1" # Replace with your actual command
-POLL_INTERVAL=60 # Checks every 60 seconds
-# ---------------------
+# ============================================================
+# CI/CD Auto-Runner: Monitors git for START/TEST trigger files
+#
+# START file format (one per line):
+#   config/config.yaml
+#   --phase 1a --loso 1
+#
+# TEST file format (one per line):
+#   config/config.yaml
+#   phase1a/MobileNet_20260410/checkpoint_best.pt
+#   --loso 1
+# ============================================================
 
-cd "$REPO_DIR" || exit
+# --- FILL THESE IN ---
+VENV_PATH="/home/temporaryuser3/Documents/ERO/venv/bin/activate"
+REPO_DIR="/home/temporaryuser3/Documents/ERO/"
+BRANCH="features/odconv"
+TEST_CHECKPOINT_BASE="/media/temporaryuser3/STORAGE/ERO/saved_models/"               # e.g. "/home/temporaryuser3/checkpoints"
+
+POLL_INTERVAL=60
+# ============================================================
+
+source "$VENV_PATH"
+
+cd "$REPO_DIR" || { echo "REPO_DIR not found: $REPO_DIR"; exit 1; }
 
 echo "Starting auto-runner. Monitoring branch: $BRANCH..."
 
@@ -18,35 +34,43 @@ while true; do
 
     CURRENT_COMMIT=$(git rev-parse HEAD)
 
-    # --- BLOCK 1: Handle START ---
+    # --- BLOCK 1: Handle START (Training) ---
     if [ -f "START" ]; then
         if [ ! -f ".last_run_commit" ] || [ "$(cat .last_run_commit)" != "$CURRENT_COMMIT" ]; then
             echo "$(date): New START file detected on commit $CURRENT_COMMIT."
             echo "$CURRENT_COMMIT" > .last_run_commit
-            
-            eval $SCRIPT_TO_RUN > run_log.txt 2>&1
-            echo "$(date): Run finished."
+
+            # Read config and args from START file
+            START_CONFIG=$(sed -n '1p' START)
+            START_ARGS=$(sed -n '2p' START)
+
+            echo "  Config: $START_CONFIG"
+            echo "  Args:   $START_ARGS"
+
+            python main.py --config "$START_CONFIG" $START_ARGS > run_log.txt 2>&1
+            echo "$(date): Training finished."
         fi
     fi
 
-    # --- BLOCK 2: Handle TEST ---
+    # --- BLOCK 2: Handle TEST (Evaluation) ---
     if [ -f "TEST" ]; then
         if [ ! -f ".last_test_commit" ] || [ "$(cat .last_test_commit)" != "$CURRENT_COMMIT" ]; then
             echo "$(date): New TEST file detected on commit $CURRENT_COMMIT."
             echo "$CURRENT_COMMIT" > .last_test_commit
-            
-            echo "Executing test script..."
-            eval $TEST_SCRIPT > test_log.txt 2>&1
-            
-            echo "Pushing PNG results back to repository..."
-            # Stage any newly generated PNG files
-            git add *.png
-            
-            # Commit and push. The || true prevents the script from crashing if no PNG was made
-            git commit -m "Auto-generated test plot from lab computer" || true
-            git push origin $BRANCH || true
-            
-            echo "$(date): Test finished and pushed."
+
+            # Read config, checkpoint rel path, and args from TEST file
+            TEST_CONFIG=$(sed -n '1p' TEST)
+            TEST_CHECKPOINT_REL=$(sed -n '2p' TEST)
+            TEST_ARGS=$(sed -n '3p' TEST)
+
+            FULL_CHECKPOINT="$TEST_CHECKPOINT_BASE/$TEST_CHECKPOINT_REL"
+
+            echo "  Config:     $TEST_CONFIG"
+            echo "  Checkpoint: $FULL_CHECKPOINT"
+            echo "  Args:       $TEST_ARGS"
+
+            python main.py --config "$TEST_CONFIG" --test --checkpoint "$FULL_CHECKPOINT" $TEST_ARGS > test_log.txt 2>&1
+            echo "$(date): Test finished."
         fi
     fi
 
