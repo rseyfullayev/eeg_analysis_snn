@@ -26,3 +26,7 @@ evidence/
 code_ingest_cache.json
 outputs/
 data/
+
+# Auto-runner state (local to lab machine)
+.last_run_commit
+.last_test_commit

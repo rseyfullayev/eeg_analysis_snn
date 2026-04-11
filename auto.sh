@@ -47,7 +47,7 @@ while true; do
             echo "  Config: $START_CONFIG"
             echo "  Args:   $START_ARGS"
 
-            python main.py --config "$START_CONFIG" $START_ARGS > run_log.txt 2>&1
+            python main.py --config "$START_CONFIG" $START_ARGS
             echo "$(date): Training finished."
         fi
     fi
@@ -69,7 +69,7 @@ while true; do
             echo "  Checkpoint: $FULL_CHECKPOINT"
             echo "  Args:       $TEST_ARGS"
 
-            python main.py --config "$TEST_CONFIG" --test --checkpoint "$FULL_CHECKPOINT" $TEST_ARGS > test_log.txt 2>&1
+            python main.py --config "$TEST_CONFIG" --test --checkpoint "$FULL_CHECKPOINT" $TEST_ARGS
             echo "$(date): Test finished."
         fi
     fi
