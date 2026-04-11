@@ -1,98 +1,142 @@
-
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss
-from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
-import re
+from src.snn_modeling.dataloader.dataset import SWEEPDataset
 import os
-import gc
-from datetime import datetime
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import balanced_accuracy_score
-import snntorch as snn
-import segmentation_models_pytorch as smp
-import wandb
+import numpy as np
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
-import numpy as np
+from sklearn.metrics import silhouette_score
 
-from tqdm import tqdm
-from src.snn_modeling.utils.utils import initialize_network
-from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing
-from src.snn_modeling.layers.neurons import ALIF
-from src.snn_modeling.models.unet import SpikingResNetClassifier
-from src.snn_modeling.models.encoders import SpikingResNet18Encoder
 import umap.umap_ as umap
 import matplotlib.pyplot as plt
 import seaborn as sns
+import wandb
 
-
-# Ignore the specific sklearn warning about missing classes
-warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
-warnings.filterwarnings("ignore", message="A single label was found in 'y_true' and 'y_pred'. For the confusion matrix to have the correct shape, use the 'labels' parameter to pass all known labels.")
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 
 def test(config, loso, subj, device, model):
+    """Extract encoder embeddings from the validation set and visualize with UMAP.
 
-    masks = torch.load(os.path.join(config['data']['dataset_path'],'masks.pt')).to(device)
+    Args:
+        config: OmegaConf config object.
+        loso: Leave-one-subject-out ID (int or None).
+        subj: Subject ID (int or None).
+        device: torch device.
+        model: A SpikingResNetClassifier (or anything with an .encoder attribute).
+    """
+
+    model.eval()
+
+    masks = torch.load(os.path.join(config.data.dataset_path, 'masks.pt'), weights_only=True).to(device)
 
     val_set = SWEEPDataset(
-    config, 
-    split='val',
-    #experiment=True,
-    loso=loso,
-    subj=subj,
-    prototypes=masks
+        config,
+        split='val',
+        loso=loso,
+        subj=subj,
+        prototypes=masks
     )
 
-    val_loader = DataLoader(val_set, 
-                            batch_size=config['training']['batch_size'], 
-                            shuffle=False, 
-                            pin_memory=True)
+    num_workers = config.data.get('num_workers', 0)
+    prefetch = config.data.get('prefetch_factor', 2) if num_workers > 0 else None
+    persist = num_workers > 0
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=config.training.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        prefetch_factor=prefetch,
+        persistent_workers=persist,
+        pin_memory=True
+    )
 
     embs = []
-    labels = []
+    labels_list = []
 
     with torch.no_grad():
-        for (vid, _, lbl, _) in val_loader:
+        for batch in val_loader:
+            # Handle both augmented (6-item) and non-augmented (4-item) returns
+            vid = batch[0]
+            lbl = batch[2] if len(batch) >= 4 else batch[1]
 
-            vid = vid.permute(1,0,2,3,4).to(device)
+            # Handle bag-level 6D inputs: [B, K, T, C, H, W]
+            K_bag = None
+            if vid.dim() == 6:
+                B, K_bag, T, C, H, W = vid.shape
+                vid = vid.view(B * K_bag, T, C, H, W)
+            else:
+                B, T, C, H, W = vid.shape
 
-            emb, _ = model.encoder(vid)
-            #print(emb.shape)
-            emb = emb.mean([0,3,4])
-            embs.append(emb)
-            labels.append(lbl)
+            # SNN requires Time as dimension 0: [T, Batch, C, H, W]
+            vid = vid.permute(1, 0, 2, 3, 4).to(device)
 
-        emb = torch.cat(embs, dim=0).cpu().numpy()
-        labels = torch.cat(labels, dim=0).cpu().numpy()
+            features, _ = model.encoder(vid)
 
-    print(emb.shape, labels.shape)
+            # Spatiotemporal GAP: (T, B, C, H, W) -> (B, C)
+            if features.dim() == 5:
+                emb = features.mean(dim=[0, 3, 4])
+            else:
+                emb = features.mean(dim=[-2, -1])
+
+            # If bagged, average across K windows per bag
+            if K_bag is not None and emb.shape[0] == B * K_bag:
+                emb = emb.view(B, K_bag, -1).mean(dim=1)
+
+            # L2-normalize embeddings for cosine UMAP
+            emb = F.normalize(emb, dim=1, eps=1e-6)
+
+            embs.append(emb.cpu())
+            labels_list.append(lbl)
+
+    emb_all = torch.cat(embs, dim=0).numpy()
+    labels_all = torch.cat(labels_list, dim=0).numpy()
+
+    print(f"Embeddings: {emb_all.shape} | Labels: {labels_all.shape}")
+
+    # --- UMAP Projection ---
     reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
-    emb_2d = reducer.fit_transform(emb)
+    emb_2d = reducer.fit_transform(emb_all)
 
-    plt.figure(figsize=(10,8))
-    palette = sns.color_palette("husl", 5)
+    # --- Clustering quality metric ---
+    sil_score = silhouette_score(emb_all, labels_all, metric='cosine') if len(set(labels_all)) > 1 else 0.0
+    print(f"Silhouette Score (cosine): {sil_score:.4f}")
+
+    os.makedirs('evidence', exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    palette = sns.color_palette("husl", config.model.get('num_classes', 5))
     sns.scatterplot(
-        x=emb_2d[:,0],
-        y=emb_2d[:,1],
-        hue=labels,
+        x=emb_2d[:, 0],
+        y=emb_2d[:, 1],
+        hue=labels_all,
         palette=palette,
         s=15,
-        alpha=.7
+        alpha=0.7,
+        ax=ax
     )
 
-    plt.title('UMAP Projection')
-    plt.legend(title='Emotion', bbox_to_anchor=(1.05,1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig('evidence/test.png')
+    id_label = f"LOSO {loso}" if loso else f"Subj {subj}"
+    ax.set_title(f"UMAP — {id_label}  |  Silhouette: {sil_score:.3f}")
+    ax.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
+    fig.tight_layout()
 
-    
+    save_path = f"evidence/umap_loso{loso}.png" if loso else f"evidence/umap_subj{subj}.png"
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"UMAP saved to {save_path}")
 
-    
+    # --- W&B Logging ---
+    if wandb.run is not None:
+        wandb.log({
+            f"Eval/UMAP_{id_label}": wandb.Image(save_path, caption=f"UMAP {id_label}"),
+            f"Eval/Silhouette_{id_label}": sil_score,
+            f"Eval/Num_Samples": len(labels_all),
+        })
+        print(f"Logged to W&B under Eval/ prefix.")
+    else:
+        print("W&B run not active — skipping remote logging.")

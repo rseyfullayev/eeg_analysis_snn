@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from generate_dataset import run_data_setup
 from train import run_training, validate
+from test import test
 
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from src.snn_modeling.utils.model_builder import build_model
@@ -27,6 +28,7 @@ def main():
     parser.add_argument('--phase', type=str, help='Specify training phase (1a, 1b, 2, 3, or 4)')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
     parser.add_argument('--val', action='store_true', help='Validation mode')
+    parser.add_argument('--test', action='store_true', help='Test mode: extract embeddings and generate UMAP')
     parser.add_argument('--checkpoint', type=str, help='Path to checkpoint')
 
     parser.add_argument('--setup_data', action='store_true', help='Setup data before training')
@@ -89,28 +91,28 @@ def main():
     if args.phase is not None:
         args.phase = str(args.phase).lower()
 
-    if args.mode == 'test':
+    if args.mode == 'test' or args.test:
         if args.checkpoint is None:
             parser.error("You MUST specify --checkpoint for test.")
+        if not args.loso and not args.subj:
+            parser.error("You MUST specify --loso or --subj for test.")
+
         model = build_model(config).to(device)
         
         if isinstance(model, SpikingResNetClassifier):
             enc_class = model
         else:
-            # Fallback for old configs
             enc_class = SpikingResNetClassifier(
                 encoder_backbone = model.encoder,
                 num_classes=config.model.get('num_classes', 5),
                 use_swiglu=config.model.get('use_swiglu', False)
             ).to(device)
             
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+        checkpoint_data = torch.load(args.checkpoint, map_location=device, weights_only=False)
         print(f"Loaded checkpoint from {args.checkpoint}.")
-        enc_class.load_state_dict(checkpoint['model_state_dict'])
+        enc_class.load_state_dict(checkpoint_data['model_state_dict'])
 
         test(config, args.loso, args.subj, device, enc_class)
-
-
 
 
     if args.audit_bio:
