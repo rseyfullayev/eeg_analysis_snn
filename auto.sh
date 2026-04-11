@@ -14,8 +14,8 @@
 # ============================================================
 
 # --- FILL THESE IN ---
-VENV_PATH="/home/temporaryuser3/Documents/ERO/venv/bin/activate"
-REPO_DIR="/home/temporaryuser3/Documents/ERO/"
+VENV_PATH="/home/temporaryuser3/Documents/ERO/eeg_analysis_snn/venv/bin/activate"
+REPO_DIR="/home/temporaryuser3/Documents/ERO/eeg_analysis_snn/"
 BRANCH="features/odconv"
 TEST_CHECKPOINT_BASE="/media/temporaryuser3/STORAGE/ERO/saved_models/"               # e.g. "/home/temporaryuser3/checkpoints"
 
