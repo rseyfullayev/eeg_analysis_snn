@@ -9,7 +9,7 @@ from sklearn.exceptions import UndefinedMetricWarning
 from sklearn.metrics import silhouette_score, balanced_accuracy_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics.pairwise import cosine_similarity
 
 import umap.umap_ as umap
@@ -22,14 +22,16 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 
-def _knn_accuracy(emb, labels, k_values=(1, 3, 5, 10), n_folds=5):
-    """Stratified k-fold k-NN accuracy for multiple k values."""
+def _knn_accuracy(emb, labels, groups, k_values=(1, 3, 5, 10), n_folds=5):
+    """Stratified Group k-fold k-NN accuracy to prevent leakage."""
     results = {}
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    
+    # Use StratifiedGroupKFold to prevent session/window leakage
+    sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
     for k in k_values:
         preds_all, labels_all = [], []
-        for train_idx, test_idx in skf.split(emb, labels):
+        for train_idx, test_idx in sgkf.split(emb, labels, groups=groups):
             clf = KNeighborsClassifier(n_neighbors=k, metric='cosine')
             clf.fit(emb[train_idx], labels[train_idx])
             preds_all.append(clf.predict(emb[test_idx]))
@@ -43,12 +45,12 @@ def _knn_accuracy(emb, labels, k_values=(1, 3, 5, 10), n_folds=5):
     return results
 
 
-def _linear_probe_accuracy(emb, labels, n_folds=5):
-    """Stratified k-fold logistic regression linear probe."""
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+def _linear_probe_accuracy(emb, labels, groups, n_folds=5):
+    """Stratified Group k-fold logistic regression linear probe to prevent leakage."""
+    sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=42)
     preds_all, labels_all = [], []
 
-    for train_idx, test_idx in skf.split(emb, labels):
+    for train_idx, test_idx in sgkf.split(emb, labels, groups=groups):
         clf = LogisticRegression(
             max_iter=1000,
             solver='lbfgs',
@@ -141,12 +143,14 @@ def test(config, loso, subj, device, model):
 
     embs = []
     labels_list = []
+    groups_list = []
 
     with torch.no_grad():
         for batch in val_loader:
             # Handle both augmented (6-item) and non-augmented (4-item) returns
             vid = batch[0]
             lbl = batch[2] if len(batch) >= 4 else batch[1]
+            bag_id = batch[-1]  # The dataset ALWAYS returns bag_id as the last element
 
             # Handle bag-level 6D inputs: [B, K, T, C, H, W]
             K_bag = None
@@ -176,9 +180,14 @@ def test(config, loso, subj, device, model):
 
             embs.append(emb.cpu())
             labels_list.append(lbl)
+            groups_list.extend(bag_id)  # bag_id is a tuple/list of strings
 
     emb_all = torch.cat(embs, dim=0).numpy()
     labels_all = torch.cat(labels_list, dim=0).numpy()
+    
+    # Map string bag_ids to integer groups for CV
+    unique_groups = {b_id: i for i, b_id in enumerate(set(groups_list))}
+    groups_all = np.array([unique_groups[b_id] for b_id in groups_list])
     num_classes = config.model.get('num_classes', 5)
     id_label = f"LOSO {loso}" if loso else f"Subj {subj}"
 
@@ -191,17 +200,17 @@ def test(config, loso, subj, device, model):
     print(f"Silhouette Score (cosine): {sil_score:.4f}")
 
     # =====================================================================
-    # 2. k-NN Accuracy
+    # 2. k-NN Accuracy (Grouped by bag_id to prevent leakage)
     # =====================================================================
-    knn_results = _knn_accuracy(emb_all, labels_all, k_values=(1, 3, 5, 10))
+    knn_results = _knn_accuracy(emb_all, labels_all, groups_all, k_values=(1, 3, 5, 10))
     print(f"\n--- k-NN Balanced Accuracy ({id_label}) ---")
     for k, acc in knn_results.items():
         print(f"  k={k:>2d}: {acc:.4f}")
 
     # =====================================================================
-    # 3. Linear Probe (Logistic Regression)
+    # 3. Linear Probe (Logistic Regression) (Grouped by bag_id to prevent leakage)
     # =====================================================================
-    lp_acc = _linear_probe_accuracy(emb_all, labels_all)
+    lp_acc = _linear_probe_accuracy(emb_all, labels_all, groups_all)
     print(f"\nLinear Probe Balanced Accuracy: {lp_acc:.4f}")
 
     # =====================================================================
