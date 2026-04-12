@@ -19,7 +19,7 @@ training:
   
 
 
-experiment_name: "MobileNet_SWIGLU"
+experiment_name: "MobileNet"
 description: "Phase 1 with MobileNet Encoder with Supervised MoCo and Differential Masking"
 
 mask:

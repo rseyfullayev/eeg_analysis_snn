@@ -34,7 +34,7 @@ class ProjectionHead(nn.Module):
 
         self.supcon_head = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, kernel_size=1),
-            nn.BatchNorm2d(feature_dim, affine=True),
+            nn.GroupNorm(1, feature_dim, affine=True),
             nn.SiLU(inplace=False),
             nn.Conv2d(feature_dim, head_dim, kernel_size=1)
         )

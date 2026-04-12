@@ -26,6 +26,7 @@ evidence/
 code_ingest_cache.json
 outputs/
 data/
+cicd/
 
 # Auto-runner state (local to lab machine)
 .last_run_commit
