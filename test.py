@@ -6,7 +6,11 @@ import os
 import numpy as np
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_score, balanced_accuracy_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics.pairwise import cosine_similarity
 
 import umap.umap_ as umap
 import matplotlib.pyplot as plt
@@ -18,8 +22,88 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 
+def _knn_accuracy(emb, labels, k_values=(1, 3, 5, 10), n_folds=5):
+    """Stratified k-fold k-NN accuracy for multiple k values."""
+    results = {}
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    for k in k_values:
+        preds_all, labels_all = [], []
+        for train_idx, test_idx in skf.split(emb, labels):
+            clf = KNeighborsClassifier(n_neighbors=k, metric='cosine')
+            clf.fit(emb[train_idx], labels[train_idx])
+            preds_all.append(clf.predict(emb[test_idx]))
+            labels_all.append(labels[test_idx])
+
+        preds_all = np.concatenate(preds_all)
+        labels_all = np.concatenate(labels_all)
+        bal_acc = balanced_accuracy_score(labels_all, preds_all)
+        results[k] = bal_acc
+
+    return results
+
+
+def _linear_probe_accuracy(emb, labels, n_folds=5):
+    """Stratified k-fold logistic regression linear probe."""
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    preds_all, labels_all = [], []
+
+    for train_idx, test_idx in skf.split(emb, labels):
+        clf = LogisticRegression(
+            max_iter=1000,
+            solver='lbfgs',
+            multi_class='multinomial',
+            C=1.0
+        )
+        clf.fit(emb[train_idx], labels[train_idx])
+        preds_all.append(clf.predict(emb[test_idx]))
+        labels_all.append(labels[test_idx])
+
+    preds_all = np.concatenate(preds_all)
+    labels_all = np.concatenate(labels_all)
+    return balanced_accuracy_score(labels_all, preds_all)
+
+
+def _class_cosine_matrix(emb, labels, num_classes=5):
+    """Compute intra-class (diagonal) and inter-class (off-diagonal) cosine similarity.
+    
+    Diagonal: mean pairwise cosine within each class (not trivial 1.0).
+    Off-diagonal: cosine between class centroids.
+    """
+    centroids = []
+    intra_sims = []
+
+    for c in range(num_classes):
+        mask = labels == c
+        class_emb = emb[mask]
+        if len(class_emb) < 2:
+            centroids.append(class_emb[0] if len(class_emb) == 1 else np.zeros(emb.shape[1]))
+            intra_sims.append(1.0)
+            continue
+
+        centroids.append(class_emb.mean(axis=0))
+        # Intra-class: mean pairwise cosine (sample up to 500 for speed)
+        if len(class_emb) > 500:
+            idx = np.random.choice(len(class_emb), 500, replace=False)
+            class_emb = class_emb[idx]
+        pair_sim = cosine_similarity(class_emb)
+        # Exclude self-similarity diagonal
+        np.fill_diagonal(pair_sim, 0.0)
+        n = pair_sim.shape[0]
+        intra_sims.append(pair_sim.sum() / (n * (n - 1)))
+
+    centroids = np.stack(centroids)
+    inter_matrix = cosine_similarity(centroids)  # (C, C)
+
+    # Replace diagonal with intra-class similarities
+    for c in range(num_classes):
+        inter_matrix[c, c] = intra_sims[c]
+
+    return inter_matrix
+
+
 def test(config, loso, subj, device, model):
-    """Extract encoder embeddings from the validation set and visualize with UMAP.
+    """Extract encoder embeddings from the validation set, compute metrics, and visualize.
 
     Args:
         config: OmegaConf config object.
@@ -95,45 +179,95 @@ def test(config, loso, subj, device, model):
 
     emb_all = torch.cat(embs, dim=0).numpy()
     labels_all = torch.cat(labels_list, dim=0).numpy()
+    num_classes = config.model.get('num_classes', 5)
+    id_label = f"LOSO {loso}" if loso else f"Subj {subj}"
 
     print(f"Embeddings: {emb_all.shape} | Labels: {labels_all.shape}")
 
-    # --- UMAP Projection ---
-    reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42)
-    emb_2d = reducer.fit_transform(emb_all)
-
-    # --- Clustering quality metric ---
+    # =====================================================================
+    # 1. Silhouette Score
+    # =====================================================================
     sil_score = silhouette_score(emb_all, labels_all, metric='cosine') if len(set(labels_all)) > 1 else 0.0
     print(f"Silhouette Score (cosine): {sil_score:.4f}")
 
+    # =====================================================================
+    # 2. k-NN Accuracy
+    # =====================================================================
+    knn_results = _knn_accuracy(emb_all, labels_all, k_values=(1, 3, 5, 10))
+    print(f"\n--- k-NN Balanced Accuracy ({id_label}) ---")
+    for k, acc in knn_results.items():
+        print(f"  k={k:>2d}: {acc:.4f}")
+
+    # =====================================================================
+    # 3. Linear Probe (Logistic Regression)
+    # =====================================================================
+    lp_acc = _linear_probe_accuracy(emb_all, labels_all)
+    print(f"\nLinear Probe Balanced Accuracy: {lp_acc:.4f}")
+
+    # =====================================================================
+    # 4. Class-wise Cosine Similarity Matrix
+    # =====================================================================
+    sim_matrix = _class_cosine_matrix(emb_all, labels_all, num_classes=num_classes)
+    print(f"\n--- Cosine Similarity Matrix ({id_label}) ---")
+    print("  Diagonal = intra-class mean pairwise, Off-diagonal = inter-class centroid")
+    print(np.array2string(sim_matrix, precision=3, suppress_small=True))
+
+    # =====================================================================
+    # 5. UMAP Projection
+    # =====================================================================
+    reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42)
+    emb_2d = reducer.fit_transform(emb_all)
+
     os.makedirs('evidence', exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    palette = sns.color_palette("husl", config.model.get('num_classes', 5))
+    # --- UMAP scatter ---
+    fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
+    palette = sns.color_palette("husl", num_classes)
     sns.scatterplot(
-        x=emb_2d[:, 0],
-        y=emb_2d[:, 1],
-        hue=labels_all,
-        palette=palette,
-        s=15,
-        alpha=0.7,
-        ax=ax
+        x=emb_2d[:, 0], y=emb_2d[:, 1],
+        hue=labels_all, palette=palette,
+        s=15, alpha=0.7, ax=ax_umap
     )
+    ax_umap.set_title(f"UMAP — {id_label}  |  Sil: {sil_score:.3f}  kNN-5: {knn_results[5]:.3f}  LP: {lp_acc:.3f}")
+    ax_umap.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
+    fig_umap.tight_layout()
 
-    id_label = f"LOSO {loso}" if loso else f"Subj {subj}"
-    ax.set_title(f"UMAP — {id_label}  |  Silhouette: {sil_score:.3f}")
-    ax.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
-    fig.tight_layout()
+    umap_path = f"evidence/umap_loso{loso}.png" if loso else f"evidence/umap_subj{subj}.png"
+    fig_umap.savefig(umap_path, dpi=150)
+    plt.close(fig_umap)
+    print(f"UMAP saved to {umap_path}")
 
-    save_path = f"evidence/umap_loso{loso}.png" if loso else f"evidence/umap_subj{subj}.png"
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-    print(f"UMAP saved to {save_path}")
+    # --- Cosine similarity heatmap ---
+    fig_sim, ax_sim = plt.subplots(figsize=(6, 5))
+    sns.heatmap(
+        sim_matrix, annot=True, fmt=".3f",
+        cmap="RdYlGn", vmin=-0.2, vmax=1.0,
+        xticklabels=range(num_classes),
+        yticklabels=range(num_classes),
+        ax=ax_sim
+    )
+    ax_sim.set_title(f"Cosine Similarity — {id_label}")
+    ax_sim.set_xlabel("Class")
+    ax_sim.set_ylabel("Class")
+    fig_sim.tight_layout()
 
-    # --- W&B Logging ---
-    wandb.log({
-        f"Eval/UMAP_{id_label}": wandb.Image(save_path, caption=f"UMAP {id_label}"),
-        f"Eval/Silhouette_{id_label}": sil_score,
+    sim_path = f"evidence/cossim_loso{loso}.png" if loso else f"evidence/cossim_subj{subj}.png"
+    fig_sim.savefig(sim_path, dpi=150)
+    plt.close(fig_sim)
+    print(f"Cosine similarity heatmap saved to {sim_path}")
+
+    # =====================================================================
+    # W&B Logging
+    # =====================================================================
+    log_dict = {
+        f"Eval/UMAP_{id_label}": wandb.Image(umap_path, caption=f"UMAP {id_label}"),
+        f"Eval/CosineSim_{id_label}": wandb.Image(sim_path, caption=f"Cosine Sim {id_label}"),
+        f"Eval/Silhouette": sil_score,
+        f"Eval/LinearProbe_BalAcc": lp_acc,
         f"Eval/Num_Samples": len(labels_all),
-    })
+    }
+    for k, acc in knn_results.items():
+        log_dict[f"Eval/kNN_k{k}_BalAcc"] = acc
+
+    wandb.log(log_dict)
     print(f"Logged to W&B under Eval/ prefix.")
