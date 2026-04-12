@@ -5,7 +5,7 @@ from ..layers.stem import TemporalViTBlock, TemporalGCBlock
 from ..layers.activations import instantiate_activation, resolve_activation, is_alif
 
 class SpikingMobileNetEncoder(nn.Module):
-    def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=False, gc=False, spike_model=snn.Leaky, use_odconv=True, **neuron_params):
+    def __init__(self, in_channels, p_drop=0.1, vit_p_drop=0.25, vit=False, gc=False, spike_model=snn.Leaky, use_odconv=True, use_batchnorm=False, **neuron_params):
         super(SpikingMobileNetEncoder, self).__init__()
         
         spike_model = resolve_activation(spike_model)
@@ -44,6 +44,7 @@ class SpikingMobileNetEncoder(nn.Module):
             use_norm=True)
         
         no_norm_layer_params = neuron_params.copy()
+        no_norm_layer_params['use_batchnorm'] = use_batchnorm
         if is_alif(spike_model):
             no_norm_layer_params['batch_norm'] = False
 
@@ -58,9 +59,9 @@ class SpikingMobileNetEncoder(nn.Module):
 
 
         if vit:
-            self.temporal = TemporalViTBlock(512, num_heads=8, p_drop=vit_p_drop)
+            self.temporal = TemporalViTBlock(512, num_heads=8, p_drop=vit_p_drop, use_batchnorm=use_batchnorm)
         elif gc:
-            self.temporal = TemporalGCBlock(512)
+            self.temporal = TemporalGCBlock(512, use_batchnorm=use_batchnorm)
         else:
             self.temporal = nn.Identity()
 

@@ -114,10 +114,13 @@ def main():
         if isinstance(model, SpikingResNetClassifier):
             enc_class = model
         else:
+            encoder_dict = getattr(config, 'encoder', {})
+            use_bn = encoder_dict.get('use_batchnorm', False) if isinstance(encoder_dict, dict) or hasattr(encoder_dict, 'get') else False
             enc_class = SpikingResNetClassifier(
                 encoder_backbone = model.encoder,
                 num_classes=config.model.get('num_classes', 5),
-                use_swiglu=config.model.get('use_swiglu', False)
+                use_swiglu=config.model.get('use_swiglu', False),
+                use_batchnorm=use_bn
             ).to(device)
             
         checkpoint_data = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -283,11 +286,14 @@ def main():
             if isinstance(model, SpikingResNetClassifier):
                 enc_class = model
             else:
-                enc_class = SpikingResNetClassifier(
-                    encoder_backbone = model.encoder,
-                    num_classes=config.model.get('num_classes', 5),
-                    use_swiglu=config.model.get('use_swiglu', False)
-                ).to(device)
+            encoder_dict = getattr(config, 'encoder', {})
+            use_bn = encoder_dict.get('use_batchnorm', False) if isinstance(encoder_dict, dict) or hasattr(encoder_dict, 'get') else False
+            enc_class = SpikingResNetClassifier(
+                encoder_backbone = model.encoder,
+                num_classes=config.model.get('num_classes', 5),
+                use_swiglu=config.model.get('use_swiglu', False),
+                use_batchnorm=use_bn
+            ).to(device)
             
             enc_class.load_state_dict(checkpoint['model_state_dict'])
             find_representative_subject(enc_class, config, device, samples_per_subject=500)

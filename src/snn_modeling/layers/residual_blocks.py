@@ -17,6 +17,7 @@ class ConvSpiking(nn.Module):
                  spike_model=snn.Leaky, 
                  use_norm = False,
                  odconv=False,
+                 use_batchnorm=False,
                  **neuron_params):
         super(ConvSpiking, self).__init__()
         #pad = dilation * (kernel_size - 1) // 2
@@ -26,7 +27,8 @@ class ConvSpiking(nn.Module):
                                               stride=stride, 
                                               padding=padding,
                                               dilation=dilation,
-                                              groups=groups) if odconv else 
+                                              groups=groups,
+                                              use_batchnorm=use_batchnorm) if odconv else 
 
                                               nn.Conv2d(in_channels, 
                                               out_channels, 
@@ -62,6 +64,7 @@ class SpikingResBlock(nn.Module):
                  spike_model=snn.Leaky, 
                  use_norm = False,
                  odconv=False,
+                 use_batchnorm=False,
                  **neuron_params):
         
         super(SpikingResBlock, self).__init__()
@@ -73,7 +76,7 @@ class SpikingResBlock(nn.Module):
             bias=False, 
             spike_model=nn.Identity, 
             use_norm=use_norm,
-
+            use_batchnorm=use_batchnorm
         )
 
         self.block2 = ConvSpiking(
@@ -88,6 +91,7 @@ class SpikingResBlock(nn.Module):
             groups=in_channels*2,
             use_norm=use_norm,
             odconv=odconv,
+            use_batchnorm=use_batchnorm,
             **neuron_params
         )
         
@@ -98,7 +102,7 @@ class SpikingResBlock(nn.Module):
             bias=False, 
             spike_model=nn.Identity, 
             use_norm=use_norm,
-
+            use_batchnorm=use_batchnorm
         )
         self.tsm = TemporalShift(8)
         self.drop = TemporalOrderFix(nn.Dropout3d(p=p_drop))
@@ -110,7 +114,8 @@ class SpikingResBlock(nn.Module):
                                           stride=stride, 
                                           bias=False, 
                                           spike_model=nn.Identity, 
-                                          use_norm=True)
+                                          use_norm=True,
+                                          use_batchnorm=use_batchnorm)
         else:
             self.downsample = nn.Identity()
 

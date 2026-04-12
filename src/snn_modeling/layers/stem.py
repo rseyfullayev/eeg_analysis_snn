@@ -29,12 +29,12 @@ class BottleneckBlock(nn.Module):
         return x
 
 class ProjectionHead(nn.Module):
-    def __init__(self, feature_dim=512, head_dim=128):
+    def __init__(self, feature_dim=512, head_dim=128, use_batchnorm=False):
         super(ProjectionHead, self).__init__()
 
         self.supcon_head = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, kernel_size=1),
-            nn.GroupNorm(1, feature_dim, affine=True),
+            nn.BatchNorm2d(feature_dim) if use_batchnorm else nn.GroupNorm(1, feature_dim, affine=True),
             nn.SiLU(inplace=False),
             nn.Conv2d(feature_dim, head_dim, kernel_size=1)
         )
@@ -48,37 +48,51 @@ class ProjectionHead(nn.Module):
 class TemporalViTBlock(nn.Module):
     def __init__(self, in_channels,
                  num_heads=8,
-                 p_drop=0.1):
+                 p_drop=0.1,
+                 use_batchnorm=False):
         super(TemporalViTBlock, self).__init__()
         self.in_channels = in_channels
-        self.norm1 = nn.LayerNorm(in_channels)
+        self.use_batchnorm = use_batchnorm
+        self.norm1 = nn.BatchNorm1d(in_channels) if use_batchnorm else nn.LayerNorm(in_channels)
         self.attn = nn.MultiheadAttention(embed_dim=in_channels,
                                           num_heads=num_heads,
                                           dropout=p_drop)
-        self.norm2 = nn.LayerNorm(in_channels)
+        self.norm2 = nn.BatchNorm1d(in_channels) if use_batchnorm else nn.LayerNorm(in_channels)
         self.mlp = SwiGLU(in_channels, p_drop=p_drop)
         self.dropout = nn.Dropout(p_drop)
         
     def forward(self, x):
         T, B, C, H, W = x.shape
         x_flat = x.mean(dim=[3,4])  # Average pool over spatial dimensions
-        src = self.norm1(x_flat)
+        
+        if self.use_batchnorm:
+            src = x_flat.permute(1, 2, 0) # [B, C, T] for BatchNorm1d
+            src = self.norm1(src).permute(2, 0, 1) # back to [T, B, C]
+        else:
+            src = self.norm1(x_flat)
+            
         attn_output, _ = self.attn(src, src, src)
         x_flat = x_flat + self.dropout(attn_output)
-        src = self.norm2(x_flat)
+        
+        if self.use_batchnorm:
+            src = x_flat.permute(1, 2, 0)
+            src = self.norm2(src).permute(2, 0, 1)
+        else:
+            src = self.norm2(x_flat)
+            
         mlp_output = self.mlp(src)
         x_flat = x_flat + mlp_output
         context = x_flat.view(T, B, C, 1, 1)
         return x + context
     
 class TemporalGCBlock(nn.Module):
-    def __init__(self, in_channels, reduction=16):
+    def __init__(self, in_channels, reduction=16, use_batchnorm=False):
         super(TemporalGCBlock, self).__init__()
         self.conv_mask = nn.Conv1d(in_channels, 1, kernel_size=1)
         self.softmax = nn.Softmax(dim=2)
         self.transform = nn.Sequential(
             nn.Conv1d(in_channels, in_channels // reduction, kernel_size=1),
-            nn.LayerNorm([in_channels // reduction, 1]),
+            nn.BatchNorm1d(in_channels // reduction) if use_batchnorm else nn.LayerNorm([in_channels // reduction, 1]),
             nn.SiLU(inplace=False),
             nn.Conv1d(in_channels // reduction, in_channels, kernel_size=1)
         )

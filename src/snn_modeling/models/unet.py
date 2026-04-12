@@ -49,7 +49,7 @@ class UNet(nn.Module):
         raise NotImplementedError("This is a placeholder for the ANN UNet.")
 
 class SpikingResNetClassifier(nn.Module):
-    def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False):
+    def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False, use_batchnorm=False):
         super().__init__()
 
         self.encoder = encoder_backbone 
@@ -63,7 +63,7 @@ class SpikingResNetClassifier(nn.Module):
                 nn.Linear(feature_dim, 1, bias=False)
             )
         
-        self.classifier = ProjectionHead(feature_dim, 128)
+        self.classifier = ProjectionHead(feature_dim, 128, use_batchnorm=use_batchnorm)
         
         
 
