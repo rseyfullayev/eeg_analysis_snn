@@ -38,7 +38,7 @@ def _knn_accuracy(emb_train, labels_train, emb_val, labels_val, k_values=(1, 3, 
 
 
 def _linear_probe_accuracy(emb_train, labels_train, emb_val, labels_val):
-    """Logistic regression linear probe trained on Train set, evaluated on Val set."""
+    """Logistic regression linear probe trained on one split, evaluated on another."""
     clf = LogisticRegression(
         max_iter=1000,
         solver='lbfgs',
@@ -49,6 +49,27 @@ def _linear_probe_accuracy(emb_train, labels_train, emb_val, labels_val):
     preds_val = clf.predict(emb_val)
 
     return balanced_accuracy_score(labels_val, preds_val)
+
+
+def _linear_probe_cv(emb, labels, groups, n_folds=5):
+    """Intra-split linear probe with StratifiedGroupKFold to prevent session leakage."""
+    sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    preds_all, labels_all = [], []
+
+    for train_idx, test_idx in sgkf.split(emb, labels, groups=groups):
+        clf = LogisticRegression(
+            max_iter=1000,
+            solver='lbfgs',
+            multi_class='multinomial',
+            C=1.0
+        )
+        clf.fit(emb[train_idx], labels[train_idx])
+        preds_all.append(clf.predict(emb[test_idx]))
+        labels_all.append(labels[test_idx])
+
+    preds_all = np.concatenate(preds_all)
+    labels_all = np.concatenate(labels_all)
+    return balanced_accuracy_score(labels_all, preds_all)
 
 
 def _class_cosine_matrix(emb, labels, num_classes=5):
@@ -144,11 +165,12 @@ def test(config, loso, subj, device, model):
     # ------------------
     from tqdm import tqdm
     def extract_embs(loader, desc="Extracting"):
-        embs, labels_list = [], []
+        embs, labels_list, groups_list = [], [], []
         with torch.no_grad():
             for batch in tqdm(loader, desc=desc):
                 vid = batch[0]
                 lbl = batch[2] if len(batch) >= 4 else batch[1]
+                bag_id = batch[-1]  # bag_id is always the last element
                 
                 K_bag = None
                 if vid.dim() == 6:
@@ -172,16 +194,20 @@ def test(config, loso, subj, device, model):
 
                 embs.append(emb.cpu())
                 labels_list.append(lbl)
+                groups_list.extend(bag_id)
 
         emb_all = torch.cat(embs, dim=0).numpy()
         labels_all = torch.cat(labels_list, dim=0).numpy()
-        return emb_all, labels_all
+        # Map string bag_ids to integer groups for CV
+        unique_groups = {b: i for i, b in enumerate(set(groups_list))}
+        groups_all = np.array([unique_groups[b] for b in groups_list])
+        return emb_all, labels_all, groups_all
 
     print("Extracting Validation Embeddings...")
-    emb_val, labels_val = extract_embs(val_loader)
+    emb_val, labels_val, groups_val = extract_embs(val_loader, desc="Val Embeddings")
     
     print("Extracting Train (Support) Embeddings...")
-    emb_train, labels_train = extract_embs(train_loader)
+    emb_train, labels_train, groups_train = extract_embs(train_loader, desc="Train Embeddings")
 
     num_classes = config.model.get('num_classes', 5)
     id_label = f"LOSO {loso}" if loso else f"Subj {subj}"
@@ -285,12 +311,39 @@ def test(config, loso, subj, device, model):
     # Train: fit probes on Val, evaluate on Train (symmetric sanity check)
     log_train = _evaluate_split(emb_train, labels_train, emb_val, labels_val, "Train", "EvalTrain")
 
+    # =================================================================
+    # 4-Way Linear Probe
+    # =================================================================
+    print(f"\n{'='*60}")
+    print(f"  4-Way Linear Probe  ({id_label})")
+    print(f"{'='*60}")
+
+    # 1. Train→Train (intra-split CV with bag_id groups)
+    lp_train_train = _linear_probe_cv(emb_train, labels_train, groups_train, n_folds=5)
+    print(f"  Train→Train (5-fold GroupCV): {lp_train_train:.4f}")
+
+    # 2. Val→Val (intra-split CV with bag_id groups)
+    lp_val_val = _linear_probe_cv(emb_val, labels_val, groups_val, n_folds=5)
+    print(f"  Val→Val   (5-fold GroupCV):   {lp_val_val:.4f}")
+
+    # 3. Train→Val (cross-split)
+    lp_train_val = _linear_probe_accuracy(emb_train, labels_train, emb_val, labels_val)
+    print(f"  Train→Val (cross-split):      {lp_train_val:.4f}")
+
+    # 4. Val→Train (cross-split)
+    lp_val_train = _linear_probe_accuracy(emb_val, labels_val, emb_train, labels_train)
+    print(f"  Val→Train (cross-split):      {lp_val_train:.4f}")
+
     # =====================================================================
     # W&B Logging
     # =====================================================================
     log_dict = {**log_val, **log_train}
     log_dict["Eval/Num_Train_Support_Samples"] = len(labels_train)
     log_dict["Eval/Num_Val_Samples"] = len(labels_val)
+    log_dict["Eval/LP_TrainTrain_CV"] = lp_train_train
+    log_dict["Eval/LP_ValVal_CV"] = lp_val_val
+    log_dict["Eval/LP_TrainVal"] = lp_train_val
+    log_dict["Eval/LP_ValTrain"] = lp_val_train
 
     wandb.log(log_dict)
     print(f"\nLogged to W&B under Eval/ and EvalTrain/ prefixes.")
