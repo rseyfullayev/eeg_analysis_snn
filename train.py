@@ -862,7 +862,7 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
                                   batch_sampler=PKSampler(train_set, 
                                                           batch_size=config.training.batch_size, 
                                                           n_classes=config.model.get('n_emotions', 5),
-                                                          subject_diverse_k=config.training.get('pk_subject_diverse_k', True)),
+                                                          subject_diverse_k=config.training.get('subject_diverse_k', True)),
                                   num_workers=num_workers,
                                   prefetch_factor=prefetch,
                                   persistent_workers=persist,

@@ -371,6 +371,15 @@ class PKSampler(Sampler):
         else:
             self.n_samples_per_class = n_samples_per_class
             
+        if self.subject_diverse_k:
+            min_subjects_per_class = min(len(subj_map) for subj_map in self.label_subject_to_indices.values())
+            if self.n_samples_per_class > min_subjects_per_class:
+                raise ValueError(
+                    f"PKSampler Error: subject_diverse_k is enabled, but n_samples_per_class (K={self.n_samples_per_class}) "
+                    f"exceeds the minimum number of unique subjects available for a single class ({min_subjects_per_class}).\n"
+                    f"Decrease your batch_size or explicit K parameter to prevent dimension/batch-size collapse during iteration!"
+                )
+            
         self.batch_size = self.n_samples_per_class * self.n_classes
         self.dataset_len = len(dataset)
 
@@ -387,7 +396,14 @@ class PKSampler(Sampler):
                     available_subjects = list(subject_map.keys())
                     random.shuffle(available_subjects)
 
-                    # First pass: pick at most one sample per subject.
+                    # Replenish empty subject buckets from current class indices.
+                    for subj in available_subjects:
+                        if len(subject_map[subj]) == 0:
+                            refill = [int(i) for i in self.label_to_indices[class_] if int(self.subjects[i].item()) == subj]
+                            random.shuffle(refill)
+                            subject_map[subj].extend(refill)
+
+                    # Pick EXACTLY one sample per subject until we reach n_samples_per_class
                     for subj in available_subjects:
                         if len(selected) >= self.n_samples_per_class:
                             break
@@ -396,24 +412,7 @@ class PKSampler(Sampler):
                             continue
                         selected.append(bucket.pop())
 
-                    # Refill emptied buckets from class pool to keep sampling renewable.
-                    if len(selected) < self.n_samples_per_class:
-                        class_pool = list(self.label_to_indices[class_])
-                        random.shuffle(class_pool)
-                        for idx in class_pool:
-                            if len(selected) >= self.n_samples_per_class:
-                                break
-                            if idx not in selected:
-                                selected.append(int(idx))
-
-                    # Replenish empty subject buckets from current class indices.
-                    for subj in available_subjects:
-                        if len(subject_map[subj]) == 0:
-                            refill = [int(i) for i in self.label_to_indices[class_] if int(self.subjects[i].item()) == subj]
-                            random.shuffle(refill)
-                            subject_map[subj].extend(refill)
-
-                    indices.extend(selected[:self.n_samples_per_class])
+                    indices.extend(selected)
                 else:
                     indices.extend(self.label_to_indices[class_][
                                    self.used_label_indices_count[class_]:

@@ -253,8 +253,8 @@ def test(config, loso, subj, device, model):
         print("  Diagonal = intra-class mean pairwise, Off-diagonal = inter-class centroid")
         print(np.array2string(sim, precision=3, suppress_small=True))
 
-        # 5. UMAP
-        reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42)
+        # 5. UMAP (Using all CPU cores since cuML GPU UMAP requires Linux/WSL)
+        reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
         emb_2d = reducer.fit_transform(emb)
 
         palette = sns.color_palette("husl", num_classes)

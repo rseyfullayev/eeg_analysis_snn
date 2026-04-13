@@ -8,10 +8,11 @@ defaults:
 
 encoder:
   use_odconv: true
-  use_batchnorm: true
+  use_batchnorm: false
 
 training:
   use_pk_sampler: true
+  subject_diverse_k: true
   temporal_decay_enabled: false
   temporal_decay_factor: 0.99
   use_supmoco: true

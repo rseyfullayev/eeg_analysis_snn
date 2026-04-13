@@ -315,30 +315,29 @@ class SupMoCoLoss(ContrastiveLoss):
         pos_mask = (labels.unsqueeze(1) == all_labels.unsqueeze(0)).float()
         neg_mask = 1.0 - pos_mask
         same_subj_mask = (subject_labels.unsqueeze(1) == all_subject_labels.unsqueeze(0)).float()
+        diff_subj_mask = 1.0 - same_subj_mask
 
-        # Mask out positives so they don't skew the max shift (decoupled partition)
+        # Mask out ALL positives (same class) from the max-shift so they don't skew the partition
         mask_for_max = torch.where(pos_mask.bool(), torch.full_like(logits, -1e9), logits)
         logits_max, _ = torch.max(mask_for_max, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
 
         if self.iic_enabled:
-            # Cross-subject positives get iic_intra_weight; same-subject get baseline 1.0.
-            subj_weight = torch.where(
-                same_subj_mask.bool(),
-                torch.ones_like(same_subj_mask),
-                torch.full_like(same_subj_mask, self.iic_intra_weight),
-            )
-            pos_weights = pos_mask * subj_weight
+            # 1. Domain Adaptation Positives: Labels equal, Subjects differ
+            pos_weights = pos_mask * diff_subj_mask
 
-            # Negatives weighted strictly by 1 + Dice overlap.
+            # 2. Hard Negatives: Labels differ, Subjects equal -> Weight = (1.0 + Dice)
+            #    Normal Negatives: Labels differ, Subjects differ -> Weight = 1.0
             dice_pair = self.sim_score[labels][:, all_labels]
-            neg_weights = neg_mask * (1.0 + dice_pair)
+            
+            hard_neg_mask = neg_mask * same_subj_mask
+            normal_neg_mask = neg_mask * diff_subj_mask
+            
+            neg_weights = (hard_neg_mask * (1.0 + dice_pair)) + normal_neg_mask
         else:
+            # Standard SupCon
             pos_weights = pos_mask.clone()
             neg_weights = neg_mask.clone()
-        
-
-    
 
         if self.temporal_decay_enabled:
             # Apply temporal decay: w_temporal = temporal_decay_factor ^ age
