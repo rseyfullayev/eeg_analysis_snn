@@ -63,6 +63,10 @@ class SpikingResNetClassifier(nn.Module):
                 nn.Linear(feature_dim, 1, bias=False)
             )
         
+        # Auto-detect if encoder uses batchnorm to sync the ProjectionHead
+        has_bn = any(isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) for m in self.encoder.modules())
+        use_batchnorm = use_batchnorm or has_bn
+
         self.classifier = ProjectionHead(feature_dim, 128, use_batchnorm=use_batchnorm)
         
         
