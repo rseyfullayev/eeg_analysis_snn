@@ -188,91 +188,109 @@ def test(config, loso, subj, device, model):
 
     print(f"Val Embeddings: {emb_val.shape} | Train Embeddings: {emb_train.shape}")
 
-    # =====================================================================
-    # 1. Silhouette Score (Only on Val Set)
-    # =====================================================================
-    sil_score = silhouette_score(emb_val, labels_val, metric='cosine') if len(set(labels_val)) > 1 else 0.0
-    print(f"Silhouette Score (cosine): {sil_score:.4f}")
-
-    # =====================================================================
-    # 2. k-NN Accuracy (Train -> Val)
-    # =====================================================================
-    knn_results = _knn_accuracy(emb_train, labels_train, emb_val, labels_val, k_values=(1, 3, 5, 10))
-    print(f"\n--- k-NN Balanced Accuracy ({id_label}) ---")
-    for k, acc in knn_results.items():
-        print(f"  k={k:>2d}: {acc:.4f}")
-
-    # =====================================================================
-    # 3. Linear Probe (Logistic Regression: Train -> Val)
-    # =====================================================================
-    lp_acc = _linear_probe_accuracy(emb_train, labels_train, emb_val, labels_val)
-    print(f"\nLinear Probe Balanced Accuracy: {lp_acc:.4f}")
-
-    # =====================================================================
-    # 4. Class-wise Cosine Similarity Matrix
-    # =====================================================================
-    sim_matrix = _class_cosine_matrix(emb_val, labels_val, num_classes=num_classes)
-    print(f"\n--- Cosine Similarity Matrix ({id_label}) ---")
-    print("  Diagonal = intra-class mean pairwise, Off-diagonal = inter-class centroid")
-    print(np.array2string(sim_matrix, precision=3, suppress_small=True))
-
-    # =====================================================================
-    # 5. UMAP Projection
-    # =====================================================================
-    reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42)
-    emb_2d = reducer.fit_transform(emb_val)
-
     os.makedirs('evidence', exist_ok=True)
 
-    # --- UMAP scatter ---
-    fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
-    palette = sns.color_palette("husl", num_classes)
-    sns.scatterplot(
-        x=emb_2d[:, 0], y=emb_2d[:, 1],
-        hue=labels_val, palette=palette,
-        s=15, alpha=0.7, ax=ax_umap
-    )
-    ax_umap.set_title(f"UMAP — {id_label}  |  Sil: {sil_score:.3f}  kNN-5: {knn_results[5]:.3f}  LP: {lp_acc:.3f}")
-    ax_umap.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
-    fig_umap.tight_layout()
+    # =================================================================
+    # Reusable evaluation for a single split
+    # =================================================================
+    def _evaluate_split(emb, labels, emb_support, labels_support, split_name, tag):
+        """Run all metrics for one split.
 
-    umap_path = f"evidence/umap_loso{loso}.png" if loso else f"evidence/umap_subj{subj}.png"
-    fig_umap.savefig(umap_path, dpi=150)
-    plt.close(fig_umap)
-    print(f"UMAP saved to {umap_path}")
+        Args:
+            emb / labels:                   embeddings & labels to evaluate ON.
+            emb_support / labels_support:   embeddings & labels to FIT probes ON
+                                            (for kNN / Linear Probe).
+            split_name:  human-readable name, e.g. "Val" or "Train".
+            tag:         W&B prefix, e.g. "Eval" or "EvalTrain".
+        """
+        print(f"\n{'='*60}")
+        print(f"  {split_name} Set Evaluation  ({id_label})")
+        print(f"{'='*60}")
 
-    # --- Cosine similarity heatmap ---
-    fig_sim, ax_sim = plt.subplots(figsize=(6, 5))
-    sns.heatmap(
-        sim_matrix, annot=True, fmt=".3f",
-        cmap="RdYlGn", vmin=-0.2, vmax=1.0,
-        xticklabels=range(num_classes),
-        yticklabels=range(num_classes),
-        ax=ax_sim
-    )
-    ax_sim.set_title(f"Cosine Similarity — {id_label}")
-    ax_sim.set_xlabel("Class")
-    ax_sim.set_ylabel("Class")
-    fig_sim.tight_layout()
+        # 1. Silhouette
+        sil = silhouette_score(emb, labels, metric='cosine') if len(set(labels)) > 1 else 0.0
+        print(f"Silhouette Score (cosine): {sil:.4f}")
 
-    sim_path = f"evidence/cossim_loso{loso}.png" if loso else f"evidence/cossim_subj{subj}.png"
-    fig_sim.savefig(sim_path, dpi=150)
-    plt.close(fig_sim)
-    print(f"Cosine similarity heatmap saved to {sim_path}")
+        # 2. k-NN
+        knn = _knn_accuracy(emb_support, labels_support, emb, labels, k_values=(1, 3, 5, 10))
+        print(f"\n--- k-NN Balanced Accuracy ---")
+        for k, acc in knn.items():
+            print(f"  k={k:>2d}: {acc:.4f}")
+
+        # 3. Linear Probe
+        lp = _linear_probe_accuracy(emb_support, labels_support, emb, labels)
+        print(f"\nLinear Probe Balanced Accuracy: {lp:.4f}")
+
+        # 4. Cosine Similarity Matrix
+        sim = _class_cosine_matrix(emb, labels, num_classes=num_classes)
+        print(f"\n--- Cosine Similarity Matrix ---")
+        print("  Diagonal = intra-class mean pairwise, Off-diagonal = inter-class centroid")
+        print(np.array2string(sim, precision=3, suppress_small=True))
+
+        # 5. UMAP
+        reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42)
+        emb_2d = reducer.fit_transform(emb)
+
+        palette = sns.color_palette("husl", num_classes)
+
+        fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
+        sns.scatterplot(
+            x=emb_2d[:, 0], y=emb_2d[:, 1],
+            hue=labels, palette=palette,
+            s=15, alpha=0.7, ax=ax_umap
+        )
+        ax_umap.set_title(f"UMAP {split_name} — {id_label}  |  Sil: {sil:.3f}  kNN-5: {knn[5]:.3f}  LP: {lp:.3f}")
+        ax_umap.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
+        fig_umap.tight_layout()
+
+        suffix = f"loso{loso}" if loso else f"subj{subj}"
+        umap_path = f"evidence/umap_{split_name.lower()}_{suffix}.png"
+        fig_umap.savefig(umap_path, dpi=150)
+        plt.close(fig_umap)
+        print(f"UMAP saved to {umap_path}")
+
+        fig_sim, ax_sim = plt.subplots(figsize=(6, 5))
+        sns.heatmap(
+            sim, annot=True, fmt=".3f",
+            cmap="RdYlGn", vmin=-0.2, vmax=1.0,
+            xticklabels=range(num_classes),
+            yticklabels=range(num_classes),
+            ax=ax_sim
+        )
+        ax_sim.set_title(f"Cosine Similarity {split_name} — {id_label}")
+        ax_sim.set_xlabel("Class")
+        ax_sim.set_ylabel("Class")
+        fig_sim.tight_layout()
+
+        sim_path = f"evidence/cossim_{split_name.lower()}_{suffix}.png"
+        fig_sim.savefig(sim_path, dpi=150)
+        plt.close(fig_sim)
+        print(f"Cosine similarity heatmap saved to {sim_path}")
+
+        return {
+            f"{tag}/UMAP_{id_label}": wandb.Image(umap_path, caption=f"UMAP {split_name} {id_label}"),
+            f"{tag}/CosineSim_{id_label}": wandb.Image(sim_path, caption=f"Cosine Sim {split_name} {id_label}"),
+            f"{tag}/Silhouette": sil,
+            f"{tag}/LinearProbe_BalAcc": lp,
+            f"{tag}/Num_Samples": len(labels),
+            **{f"{tag}/kNN_k{k}_BalAcc": acc for k, acc in knn.items()},
+        }
+
+    # =================================================================
+    # Run evaluation on BOTH splits
+    # =================================================================
+    # Val:   fit probes on Train, evaluate on Val
+    log_val = _evaluate_split(emb_val, labels_val, emb_train, labels_train, "Val", "Eval")
+
+    # Train: fit probes on Val, evaluate on Train (symmetric sanity check)
+    log_train = _evaluate_split(emb_train, labels_train, emb_val, labels_val, "Train", "EvalTrain")
 
     # =====================================================================
     # W&B Logging
     # =====================================================================
-    log_dict = {
-        f"Eval/UMAP_{id_label}": wandb.Image(umap_path, caption=f"UMAP {id_label}"),
-        f"Eval/CosineSim_{id_label}": wandb.Image(sim_path, caption=f"Cosine Sim {id_label}"),
-        f"Eval/Silhouette": sil_score,
-        f"Eval/LinearProbe_BalAcc": lp_acc,
-        f"Eval/Num_Val_Samples": len(labels_val),
-        f"Eval/Num_Train_Support_Samples": len(labels_train),
-    }
-    for k, acc in knn_results.items():
-        log_dict[f"Eval/kNN_k{k}_BalAcc"] = acc
+    log_dict = {**log_val, **log_train}
+    log_dict["Eval/Num_Train_Support_Samples"] = len(labels_train)
+    log_dict["Eval/Num_Val_Samples"] = len(labels_val)
 
     wandb.log(log_dict)
-    print(f"Logged to W&B under Eval/ prefix.")
+    print(f"\nLogged to W&B under Eval/ and EvalTrain/ prefixes.")
