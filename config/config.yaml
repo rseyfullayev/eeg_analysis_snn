@@ -47,6 +47,6 @@ loss:
 logging:
   project_name: "snn-encoding-showdown"
   run_name: "MobileNet"
-  tags: ["mobilenet", "tsm", "phase1a"]
+  tags: ["mobilenet", "tsm", "phase1a", "scda", "pk_sampler"]
   offline: false
   log_interval: 1
