@@ -1,0 +1,3 @@
+config/config.yaml
+phase1a/MobileNet_SWIGLU_20260408_201518_loso1/checkpoint_best.pt
+--loso 1
