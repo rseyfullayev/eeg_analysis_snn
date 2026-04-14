@@ -6,7 +6,9 @@ import os
 import numpy as np
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
-from sklearn.metrics import silhouette_score, balanced_accuracy_score
+from sklearn.cluster import KMeans
+
+from sklearn.metrics import silhouette_score, balanced_accuracy_score, normalized_mutual_info_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedGroupKFold
@@ -20,6 +22,18 @@ import wandb
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+
+
+def _nmi(emb_train, labels_train, emb_val, labels_val, num_classes):
+    kmeans = KMeans(n_clusters=num_classes, random_state=42)
+
+    cluster_train = kmeans.fit_predict(emb_train)
+    cluster_val = kmeans.predict(emb_val)
+
+    nmi_train = normalized_mutual_info_score(labels_train, cluster_train)
+    nmi_val = normalized_mutual_info_score(labels_val, cluster_val)
+
+    return nmi_train, nmi_val
 
 
 def _knn_accuracy(emb_train, labels_train, emb_val, labels_val, k_values=(1, 3, 5, 10)):
@@ -256,6 +270,13 @@ def test(config, loso, subj, device, model):
         # 5. UMAP (Using all CPU cores since cuML GPU UMAP requires Linux/WSL)
         reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
         emb_2d = reducer.fit_transform(emb)
+
+        # 6. Normalized Mutual Information
+        nmi_train, nmi_val = _nmi(emb_support, labels_support, emb, labels,  num_classes=num_classes)
+        print(f"\nNMI rato for validation is {nmi_val: .4f} and for train {nmi_train: .4f}")
+
+
+
 
         palette = sns.color_palette("husl", num_classes)
 
