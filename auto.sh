@@ -40,15 +40,17 @@ while true; do
             echo "$(date): New START file detected on commit $CURRENT_COMMIT."
             echo "$CURRENT_COMMIT" > .last_run_commit
 
-            # Read config and args from START file
             START_CONFIG=$(sed -n '1p' START)
             START_ARGS=$(sed -n '2p' START)
 
             echo "  Config: $START_CONFIG"
             echo "  Args:   $START_ARGS"
 
-            python main.py --config "$START_CONFIG" $START_ARGS
-            echo "$(date): Training finished."
+            # Launch in background (allows parallel jobs from different commits)
+            (
+                python main.py --config "$START_CONFIG" $START_ARGS
+                echo "$(date): Training finished (commit $CURRENT_COMMIT)."
+            ) &
         fi
     fi
 
@@ -58,7 +60,6 @@ while true; do
             echo "$(date): New TEST file detected on commit $CURRENT_COMMIT."
             echo "$CURRENT_COMMIT" > .last_test_commit
 
-            # Read config, checkpoint rel path, and args from TEST file
             TEST_CONFIG=$(sed -n '1p' TEST)
             TEST_CHECKPOINT_REL=$(sed -n '2p' TEST)
             TEST_ARGS=$(sed -n '3p' TEST)
@@ -69,8 +70,11 @@ while true; do
             echo "  Checkpoint: $FULL_CHECKPOINT"
             echo "  Args:       $TEST_ARGS"
 
-            python main.py --config "$TEST_CONFIG" --test --checkpoint "$FULL_CHECKPOINT" $TEST_ARGS
-            echo "$(date): Test finished."
+            # Launch in background (allows parallel jobs from different commits)
+            (
+                python main.py --config "$TEST_CONFIG" --test --checkpoint "$FULL_CHECKPOINT" $TEST_ARGS
+                echo "$(date): Test finished (commit $CURRENT_COMMIT)."
+            ) &
         fi
     fi
 

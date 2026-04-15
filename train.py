@@ -35,16 +35,20 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 #torch.autograd.set_detect_anomaly(True)
 torch.backends.cudnn.benchmark = True
-def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sweepnet.pt"):
-    torch.save({
+def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sweepnet.pt",
+                    momentum_model=None, supmoco_state=None):
+    payload = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'accuracy': acc,
-        'dice': dice
-    }, path)
-    print(f"New Record! Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
+        'dice': dice,
+        'momentum_model_state_dict': momentum_model.state_dict() if momentum_model is not None else None,
+        'supmoco_state_dict': supmoco_state.state_dict() if supmoco_state is not None else None,
+    }
+    torch.save(payload, path)
+    print(f"Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
 
 
 def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
@@ -253,6 +257,58 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
 
 
 
+@torch.no_grad()
+def compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5):
+    """Probe representation quality by kNN retrieval against the SupMoCo memory queue.
+    
+    For each val sample, find its k nearest neighbors in the queue via cosine
+    similarity, then majority-vote the label. Returns accuracy.
+    """
+    model.eval()
+    all_embeddings = []
+    all_labels = []
+
+    for batch in val_loader:
+        inputs, _, labels, _ = batch[:4]
+        inputs, labels = inputs.to(device), labels.to(device)
+
+        K_bag = None
+        if inputs.dim() == 6:
+            B, K_bag, T, C, H, W = inputs.shape
+            inputs = inputs.view(B * K_bag, T, C, H, W)
+        else:
+            B = inputs.shape[0]
+
+        inputs = inputs.permute(1, 0, 2, 3, 4)
+        features = model(inputs, K=K_bag)
+        if K_bag is not None and features.shape[0] == B * K_bag:
+            features = features.view(B, K_bag, *features.shape[1:]).mean(dim=1)
+        features = F.normalize(features, dim=1, eps=1e-6)
+
+        all_embeddings.append(features)
+        all_labels.append(labels)
+
+    val_emb = torch.cat(all_embeddings, dim=0)    # (N_val, D)
+    val_labels = torch.cat(all_labels, dim=0)      # (N_val,)
+
+    # Get filled queue
+    queue_feats, queue_labels, _, _ = supmoco_state.get_queue()
+    if queue_feats.shape[0] == 0:
+        return 0.0
+
+    queue_feats = F.normalize(queue_feats, dim=1, eps=1e-6)
+
+    # Cosine similarity: (N_val, Q)
+    sim = torch.matmul(val_emb, queue_feats.T)
+    _, topk_indices = sim.topk(k, dim=1)            # (N_val, k)
+    topk_labels = queue_labels[topk_indices]         # (N_val, k)
+
+    # Majority vote
+    preds = torch.mode(topk_labels, dim=1).values    # (N_val,)
+    acc = (preds == val_labels).float().mean().item()
+
+    return acc
+
 
 def training_loop(phase, 
                   start_epoch, 
@@ -276,7 +332,10 @@ def training_loop(phase,
                   unfreeze_epoch=-1,
                   accumulation_steps=1):
     
-    
+    # Phase 1A trackers
+    best_train_loss = float('inf') if phase == '1a' else None
+    best_knn_acc = 0.0
+
     #temp_mix = TemporalMix()
 
     for epoch in range(start_epoch, epochs):
@@ -426,7 +485,18 @@ def training_loop(phase,
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_temp.pt") 
+        # --- Queue-kNN Probe (Phase 1A only) ---
+        val_knn_acc = 0.0
+        if phase == '1a' and use_supmoco and supmoco_state is not None:
+            queue_filled = int(supmoco_state.queue_filled.item())
+            if queue_filled > 0:
+                val_knn_acc = compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5)
+                print(f"  Queue-kNN Val Accuracy (k=5): {val_knn_acc:.4f}")
+
+        # --- Checkpoint: checkpoint_last.pt (every epoch, atomic write) ---
+        save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
+                        f"{checkpoint_dir}/checkpoint_temp.pt",
+                        momentum_model=momentum_model, supmoco_state=supmoco_state) 
         os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_last.pt")
         
         if phase in [1, '1a', '1b']:
@@ -452,6 +522,8 @@ def training_loop(phase,
                 f"Phase{phase}/Train/QueueSize": queue_len,
                 f"Phase{phase}/Train/QueueFillRatio": queue_len / float(max(1, supmoco_state.queue_size)),
             })
+        if phase == '1a' and use_supmoco:
+            log_dict[f"Phase{phase}/Val/Queue_kNN_Acc"] = val_knn_acc
         if phase not in [1, '1a', '1b']:
             log_dict.update({
                 f"Phase{phase}/Val/Dice": val_dice,
@@ -460,20 +532,46 @@ def training_loop(phase,
                 f"Phase{phase}/Val/Recall": val_rec,
             })
 
-        
         for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
 
-        if (-1 if phase in [1, '1a', '1b'] else 1)  * val_acc > (-1 if phase in [1, '1a', '1b'] else 1) * best_acc:
-            best_acc = avg_train_loss if phase in [1, '1a', '1b'] else val_acc
-            best_dice = val_dice
-            save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_best.pt") #_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}
-            wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
-        
-        elif val_acc == best_acc and val_dice > best_dice:
-            best_dice = val_dice
-            save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice, f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
+        # --- Phase 1A: Three-tier checkpointing ---
+        if phase == '1a':
+            # checkpoint_best.pt: save when train loss decreases
+            if avg_train_loss < best_train_loss:
+                best_train_loss = avg_train_loss
+                best_acc = avg_train_loss  # Store loss in acc field for Phase 1A
+                save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
+                                f"{checkpoint_dir}/checkpoint_temp.pt",
+                                momentum_model=momentum_model, supmoco_state=supmoco_state)
+                os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best.pt")
+                wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
+            else:
+                print(f"Best Train Loss yet: {best_train_loss:.4f}")
+
+            # checkpoint_best_knn.pt: save when queue-kNN accuracy increases
+            if val_knn_acc > best_knn_acc:
+                best_knn_acc = val_knn_acc
+                save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
+                                f"{checkpoint_dir}/checkpoint_temp.pt",
+                                momentum_model=momentum_model, supmoco_state=supmoco_state)
+                os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best_knn.pt")
+                wandb.save(f"{checkpoint_dir}/checkpoint_best_knn.pt")
+                print(f"  New best Queue-kNN Acc: {best_knn_acc:.4f}")
         else:
-            print(f"Best Result yet: {best_acc:.4f}")
+            # Phase 2+: original acc/dice logic
+            if val_acc > best_acc:
+                best_acc = val_acc
+                best_dice = val_dice
+                save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
+                                f"{checkpoint_dir}/checkpoint_temp.pt")
+                os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best.pt")
+                wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
+            elif val_acc == best_acc and val_dice > best_dice:
+                best_dice = val_dice
+                save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
+                                f"{checkpoint_dir}/checkpoint_{epoch:03d}_{best_acc:.4f}_{best_dice:.4f}.pt")
+            else:
+                print(f"Best Result yet: {best_acc:.4f}")
 
         wandb.log(log_dict, step=epoch)
 
@@ -535,15 +633,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
 
-    momentum_model = None
-    supmoco_state = None
-    if use_supmoco:
-        momentum_model = build_momentum_encoder(enc_class).to(device)
-        supmoco_state = SupMoCoState(
-            queue_size=config.training.get('supmoco_queue_size', 4096),
-            feature_dim=config.training.get('supmoco_feature_dim', 128),
-        ).to(device)
-    
+    # Load model weights FIRST (before building momentum encoder)
     if resume and checkpoint is not None:
         enc_class.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -552,6 +642,24 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         best_acc = checkpoint['accuracy']
         best_dice = checkpoint['dice']
         print(f"Resuming training from epoch {start_epoch}...")
+
+    # Build momentum encoder AFTER loading weights so it inherits restored state
+    momentum_model = None
+    supmoco_state = None
+    if use_supmoco:
+        momentum_model = build_momentum_encoder(enc_class).to(device)
+        supmoco_state = SupMoCoState(
+            queue_size=config.training.get('supmoco_queue_size', 4096),
+            feature_dim=config.training.get('supmoco_feature_dim', 128),
+        ).to(device)
+        # Restore saved momentum/queue state if available
+        if resume and checkpoint is not None:
+            if checkpoint.get('momentum_model_state_dict') is not None:
+                momentum_model.load_state_dict(checkpoint['momentum_model_state_dict'])
+                print("  Restored momentum encoder weights from checkpoint.")
+            if checkpoint.get('supmoco_state_dict') is not None:
+                supmoco_state.load_state_dict(checkpoint['supmoco_state_dict'])
+                print(f"  Restored SupMoCo queue (filled={int(supmoco_state.queue_filled.item())}).")
 
     training_loop(
         '1a',
