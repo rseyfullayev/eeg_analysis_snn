@@ -52,6 +52,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
 
 
 def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
+    if only_classification:
+        return 0, 0, 0, 0, 0, 0, 0
    
     model.eval()
     val_loss = 0
@@ -82,34 +84,28 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             if K_bag is not None and outputs.shape[0] == B * K_bag:
                 outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
 
-            if only_classification:
-                #_,C,H,W = outputs.shape #(outputs * criterion.class_loss.masks).sum(dim=(2, 3))
-                loss = 0 #criterion(outputs, labels) #.unsqueeze(1).expand(-1, T).permute(1,0).reshape(-1).view(-1,1,1).expand(-1,4,4).long())
-                #energy_logits = outputs.view(T,B,C,H,W).mean(dim=[0,3,4])
-                return 0,0,0,0,0,0,0
-            else:
-                loss = criterion(outputs, targets, labels)
-                B, C, H, W = outputs.shape
-                
-                probs = torch.softmax(outputs, dim=1)
-                energy_logits = probs[:, 1:, :, :].sum(dim=(2, 3))
-                preds_map = torch.argmax(probs, dim=1)
-                tp, fp, fn, tn = smp.metrics.get_stats(
-                    preds_map,
-                    targets, 
-                    mode='multiclass', 
-                    num_classes=6
-                )
-                tp_tot += tp[:, 1:].sum().item()
-                fp_tot += fp[:, 1:].sum().item()
-                fn_tot += fn[:, 1:].sum().item()
-                tn_tot += tn[:, 1:].sum().item()
-                preds = energy_logits.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
+            loss = criterion(outputs, targets, labels)
+            B, C, H, W = outputs.shape
+            
+            probs = torch.softmax(outputs, dim=1)
+            energy_logits = probs[:, 1:, :, :].sum(dim=(2, 3))
+            preds_map = torch.argmax(probs, dim=1)
+            tp, fp, fn, tn = smp.metrics.get_stats(
+                preds_map,
+                targets, 
+                mode='multiclass', 
+                num_classes=6
+            )
+            tp_tot += tp[:, 1:].sum().item()
+            fp_tot += fp[:, 1:].sum().item()
+            fn_tot += fn[:, 1:].sum().item()
+            tn_tot += tn[:, 1:].sum().item()
+            preds = energy_logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
 
-                all_preds.extend(preds.cpu().numpy())
-                all_targets.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(labels.cpu().numpy())
 
 
             val_loss += loss.item()
@@ -119,8 +115,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             
             # Cleanup tensors to free memory
             del inputs, labels, outputs, loss, preds
-            if not only_classification:
-                del preds_map, targets, tp, fp, fn, tn
+            del preds_map, targets, tp, fp, fn, tn
                 
     # Clear CUDA cache after validation
     if torch.cuda.is_available():
