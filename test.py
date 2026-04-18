@@ -12,7 +12,25 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics.pairwise import cosine_similarity
 
-import umap.umap_ as umap
+try:
+    from cuml.manifold import UMAP as cuUMAP
+    _USE_CUML = True
+    print("[test.py] cuML UMAP detected — using GPU-accelerated UMAP.")
+except ImportError:
+    import umap.umap_ as umap
+    _USE_CUML = False
+    print("[test.py] cuML not available — falling back to CPU UMAP.")
+
+def make_umap(**kwargs):
+    """Factory that returns a UMAP reducer using cuML (GPU) if available, else CPU umap-learn."""
+    if _USE_CUML:
+        # cuML UMAP doesn't support n_jobs or 'cosine' via string the same way;
+        # it uses metric='cosine' fine, but no n_jobs param.
+        kwargs.pop('n_jobs', None)
+        return cuUMAP(**kwargs)
+    else:
+        return umap.UMAP(**kwargs)
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 import wandb
@@ -264,8 +282,8 @@ def test(config, loso, subj, device, model):
         print("  Diagonal = intra-class mean pairwise, Off-diagonal = inter-class centroid")
         print(np.array2string(sim, precision=3, suppress_small=True))
 
-        # 5. UMAP (Using all CPU cores since cuML GPU UMAP requires Linux/WSL)
-        reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
+        # 5. UMAP (cuML GPU if available, else CPU)
+        reducer = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
         emb_2d = reducer.fit_transform(emb)
 
         palette = sns.color_palette("husl", num_classes)
@@ -386,7 +404,7 @@ def test(config, loso, subj, device, model):
         print(f"  Subject-Heterogeneous UMAPs")
         print(f"{'='*60}")
 
-        train_reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
+        train_reducer = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
         emb_train_2d_subj = train_reducer.fit_transform(emb_train)
         
         unique_train_subjs = np.unique(subj_train)
