@@ -1,4 +1,3 @@
 config/config.yaml
---loso 1
---checkpoint /media/temporaryuser3/STORAGE/ERO/saved_models/phase1a/MobileNet_20260416_133433_loso1/checkpoint_last.pt
---resume
+--loso 1 --checkpoint /media/temporaryuser3/STORAGE/ERO/saved_models/phase1a/MobileNet_20260416_133433_loso1/checkpoint_last.pt --resume
+
