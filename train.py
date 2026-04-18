@@ -280,7 +280,7 @@ def compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5):
             B = inputs.shape[0]
 
         inputs = inputs.permute(1, 0, 2, 3, 4)
-        features = model.extract_features(inputs, K=K_bag)
+        features = model(inputs, K=K_bag)
         if K_bag is not None and features.shape[0] == B * K_bag:
             features = features.view(B, K_bag, *features.shape[1:]).mean(dim=1)
         features = F.normalize(features, dim=1, eps=1e-6)

@@ -163,9 +163,15 @@ def test(config, loso, subj, device, model):
     # ------------------
     # Extraction Helper
     # ------------------
+    # Pre-build a fast lookup dictionary: bag_id -> subject_idx
+    # In dataset.py, samples is a list of (bag_id, files, emotion_idx, subject_idx, ...)
+    val_bag_to_subj = {str(item[0]): item[3] for item in val_set.samples}
+    train_bag_to_subj = {str(item[0]): item[3] for item in train_set.samples}
+    bag_to_subj = {**train_bag_to_subj, **val_bag_to_subj}
+
     from tqdm import tqdm
     def extract_embs(loader, desc="Extracting"):
-        embs, labels_list, groups_list = [], [], []
+        embs, labels_list, groups_list, subjects_list = [], [], [], []
         with torch.no_grad():
             for batch in tqdm(loader, desc=desc):
                 vid = batch[0]
@@ -195,19 +201,24 @@ def test(config, loso, subj, device, model):
                 embs.append(emb.cpu())
                 labels_list.append(lbl)
                 groups_list.extend(bag_id)
+                
+                # Lookup subjects
+                subjects = [bag_to_subj.get(str(b), -1) for b in bag_id]
+                subjects_list.extend(subjects)
 
         emb_all = torch.cat(embs, dim=0).numpy()
         labels_all = torch.cat(labels_list, dim=0).numpy()
         # Map string bag_ids to integer groups for CV
         unique_groups = {b: i for i, b in enumerate(set(groups_list))}
         groups_all = np.array([unique_groups[b] for b in groups_list])
-        return emb_all, labels_all, groups_all
+        subjects_all = np.array(subjects_list)
+        return emb_all, labels_all, groups_all, subjects_all
 
     print("Extracting Validation Embeddings...")
-    emb_val, labels_val, groups_val = extract_embs(val_loader, desc="Val Embeddings")
+    emb_val, labels_val, groups_val, subj_val = extract_embs(val_loader, desc="Val Embeddings")
     
     print("Extracting Train (Support) Embeddings...")
-    emb_train, labels_train, groups_train = extract_embs(train_loader, desc="Train Embeddings")
+    emb_train, labels_train, groups_train, subj_train = extract_embs(train_loader, desc="Train Embeddings")
 
     num_classes = config.model.get('num_classes', 5)
     id_label = f"LOSO {loso}" if loso else f"Subj {subj}"
@@ -238,10 +249,10 @@ def test(config, loso, subj, device, model):
         print(f"Silhouette Score (cosine): {sil:.4f}")
 
         # 2. k-NN
-        knn = _knn_accuracy(emb_support, labels_support, emb, labels, k_values=(1, 3, 5, 10))
-        print(f"\n--- k-NN Balanced Accuracy ---")
-        for k, acc in knn.items():
-            print(f"  k={k:>2d}: {acc:.4f}")
+        knn = {} # _knn_accuracy(emb_support, labels_support, emb, labels, k_values=(1, 3, 5, 10))
+        # print(f"\n--- k-NN Balanced Accuracy ---")
+        # for k, acc in knn.items():
+        #     print(f"  k={k:>2d}: {acc:.4f}")
 
         # 3. Linear Probe
         lp = _linear_probe_accuracy(emb_support, labels_support, emb, labels)
@@ -265,7 +276,7 @@ def test(config, loso, subj, device, model):
             hue=labels, palette=palette,
             s=15, alpha=0.7, ax=ax_umap
         )
-        ax_umap.set_title(f"UMAP {split_name} — {id_label}  |  Sil: {sil:.3f}  kNN-5: {knn[5]:.3f}  LP: {lp:.3f}")
+        ax_umap.set_title(f"UMAP {split_name} — {id_label}")
         ax_umap.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
         fig_umap.tight_layout()
 
@@ -344,6 +355,82 @@ def test(config, loso, subj, device, model):
     log_dict["Eval/LP_ValVal_CV"] = lp_val_val
     log_dict["Eval/LP_TrainVal"] = lp_train_val
     log_dict["Eval/LP_ValTrain"] = lp_val_train
+    # =================================================================
+    # Proxy-A Subject ID Probe
+    # =================================================================
+    print(f"\n{'='*60}")
+    print(f"  Proxy-A Subject ID Probe  ({id_label})")
+    print(f"{'='*60}")
+    
+    if not np.all(subj_train == -1):
+        # 1. Evaluate predictability of Subject ID inside the Train set.
+        # High accuracy = Subject ID is highly preserved. Low accuracy = Subject ID destroyed.
+        subj_cv_acc = _linear_probe_cv(emb_train, subj_train, groups_train, n_folds=5)
+        print(f"  Subject ID Prediction (Train Support, 5-fold CV): {subj_cv_acc:.4f}")
+        
+        # 2. Fit on all Train subjects -> Predict on Test/Val set 
+        # (Sanity check: Accuracy will inevitably be low for an unseen test subject)
+        from sklearn.linear_model import LogisticRegression
+        clf = LogisticRegression(solver='lbfgs', max_iter=1000, multi_class='multinomial')
+        clf.fit(emb_train, subj_train)
+        subj_cross_acc = balanced_accuracy_score(subj_val, clf.predict(emb_val))
+        print(f"  Subject ID Prediction (Train->Val cross-split):   {subj_cross_acc:.4f}")
+        
+        log_dict["Eval/ProxyA_Subject_TrainCV"] = subj_cv_acc
+        log_dict["Eval/ProxyA_Subject_TrainVal"] = subj_cross_acc
 
+        # =================================================================
+        # Subject-Heterogeneous UMAP Generative Probes
+        # =================================================================
+        print(f"\n{'='*60}")
+        print(f"  Subject-Heterogeneous UMAPs")
+        print(f"{'='*60}")
+
+        train_reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
+        emb_train_2d_subj = train_reducer.fit_transform(emb_train)
+        
+        unique_train_subjs = np.unique(subj_train)
+        palette_subj_train = sns.color_palette("husl", len(unique_train_subjs))
+        
+        fig_subj_tr, ax_subj_tr = plt.subplots(figsize=(10, 8))
+        sns.scatterplot(
+            x=emb_train_2d_subj[:, 0], y=emb_train_2d_subj[:, 1],
+            hue=subj_train, palette=palette_subj_train,
+            s=15, alpha=0.7, ax=ax_subj_tr, legend='full'
+        )
+        ax_subj_tr.set_title(f"Train UMAP Colored by Subject ID — {id_label}")
+        ax_subj_tr.legend(title='Subject ID', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
+        fig_subj_tr.tight_layout()
+        
+        suffix = f"loso{loso}" if loso else f"subj{subj}"
+        train_subj_umap_path = f"evidence/umap_train_subject_{suffix}.png"
+        fig_subj_tr.savefig(train_subj_umap_path, dpi=150)
+        plt.close(fig_subj_tr)
+        log_dict["Eval/UMAP_Subject_Train"] = wandb.Image(train_subj_umap_path, caption=f"UMAP Train by Subject")
+        print(f"  Saved {train_subj_umap_path}")
+
+        # Transform Val using Train-fitted UMAP, colored by Val Subject IDs
+        emb_val_2d_subj = train_reducer.transform(emb_val)
+        unique_val_subjs = np.unique(subj_val)
+        palette_subj_val = sns.color_palette("husl", len(unique_val_subjs))
+        
+        fig_subj_val, ax_subj_val = plt.subplots(figsize=(10, 8))
+        sns.scatterplot(
+            x=emb_val_2d_subj[:, 0], y=emb_val_2d_subj[:, 1],
+            hue=subj_val, palette=palette_subj_val,
+            s=15, alpha=0.7, ax=ax_subj_val, legend='full'
+        )
+        ax_subj_val.set_title(f"Val UMAP (Train-Fitted) Colored by Subject ID — {id_label}")
+        ax_subj_val.legend(title='Subject ID', bbox_to_anchor=(1.05, 1), loc='upper left')
+        fig_subj_val.tight_layout()
+        
+        val_subj_umap_path = f"evidence/umap_val_subject_{suffix}.png"
+        fig_subj_val.savefig(val_subj_umap_path, dpi=150)
+        plt.close(fig_subj_val)
+        log_dict["Eval/UMAP_Subject_Val"] = wandb.Image(val_subj_umap_path, caption=f"UMAP Val by Subject (Train-Fitted trans.)")
+        print(f"  Saved {val_subj_umap_path}")
+        
+    else:
+        print("  Subject IDs not parsed. Skipping Proxy-A.")
     wandb.log(log_dict)
     print(f"\nLogged to W&B under Eval/ and EvalTrain/ prefixes.")
