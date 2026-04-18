@@ -289,7 +289,7 @@ def compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5):
     val_labels = torch.cat(all_labels, dim=0)      # (N_val,)
 
     # Get filled queue
-    queue_feats, queue_labels, _, _ = supmoco_state.get_queue()
+    queue_feats, queue_labels, _, _, _, _ = supmoco_state.get_queue()
     if queue_feats.shape[0] == 0:
         return 0.0
 
