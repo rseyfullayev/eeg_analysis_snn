@@ -170,7 +170,7 @@ def test(config, loso, subj, device, model):
             for batch in tqdm(loader, desc=desc):
                 vid = batch[0]
                 lbl = batch[2] if len(batch) >= 4 else batch[1]
-                bag_id = batch[-1]  # bag_id is always the last element
+                bag_id = batch[3]  # bag_id is always at index 3
                 
                 K_bag = None
                 if vid.dim() == 6:

@@ -16,8 +16,8 @@ training:
   temporal_decay_enabled: false
   temporal_decay_factor: 0.99
   use_supmoco: true
-  supmoco_momentum: 0.9
-  supmoco_queue_size: 512
+  supmoco_momentum: 0.99
+  supmoco_queue_size: 2048
   
 
 
@@ -43,6 +43,7 @@ loss:
   target_rate: 0.1
   alpha: 0.3
   beta: 0.7
+  min_temporal_distance: 0.0  # Seconds: mask out same-video negatives within this window (0.0 = disabled)
 
 logging:
   project_name: "snn-encoding-showdown"

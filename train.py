@@ -67,7 +67,8 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
 
     val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
     with torch.no_grad():
-        for batch_idx, (inputs, targets, labels, _) in enumerate(val_loop):
+        for batch_idx, batch in enumerate(val_loop):
+            inputs, targets, labels = batch[0], batch[1], batch[2]
             inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
             
             K_bag = None
@@ -140,7 +141,8 @@ def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
     
     try:
         data_iter = iter(val_loader)
-        inputs, targets, labels = next(data_iter)
+        batch = next(data_iter)
+        inputs, targets, labels = batch[0], batch[1], batch[2]
     except StopIteration:
         return 
 
@@ -264,7 +266,7 @@ def compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5):
     all_labels = []
 
     for batch in val_loader:
-        inputs, _, labels, _ = batch[:4]
+        inputs, labels = batch[0], batch[2]
         inputs, labels = inputs.to(device), labels.to(device)
 
         K_bag = None
@@ -352,9 +354,13 @@ def training_loop(phase,
         train_loss = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
-            # Handle both augmented (5 items) and non-augmented (4 items) returns
-            if len(batch) == 6:
-                inp1, inp2, targets, targets_c, subject_labels, _ = batch
+            # Handle both augmented (8 items) and non-augmented (6 items) returns
+            # Augmented: (inp1, inp2, targets, targets_c, subject_labels, bag_id, video_id, timestamp)
+            # Non-augmented: (inputs, targets, targets_c, bag_id, video_id, timestamp)
+            if len(batch) == 8:
+                inp1, inp2, targets, targets_c, subject_labels, _, video_ids, timestamps = batch
+                video_ids = video_ids.to(device)
+                timestamps = timestamps.to(device)
                 if phase in [1, '1a', '1b']:
                     inp1, inp2 = inp1.to(device), inp2.to(device)
                     subject_labels = subject_labels.to(device)
@@ -364,11 +370,13 @@ def training_loop(phase,
                     else:
                         # Contrastive baseline: concatenate both views
                         inputs = torch.cat([inp1, inp2], dim=0)
-            elif len(batch) == 5:
-                inp1, inp2, targets, targets_c, _ = batch
+            elif len(batch) == 7:
+                inp1, inp2, targets, targets_c, _, video_ids, timestamps = batch
+                video_ids = video_ids.to(device)
+                timestamps = timestamps.to(device)
                 if phase in [1, '1a', '1b']:
                     if use_supmoco:
-                        raise ValueError("SupMoCo requires augmented batches that include subject labels (len(batch) == 6).")
+                        raise ValueError("SupMoCo requires augmented batches that include subject labels (len(batch) == 8).")
                     inp1, inp2 = inp1.to(device), inp2.to(device)
                     if use_supmoco:
                         q_inputs = inp1
@@ -379,10 +387,12 @@ def training_loop(phase,
                     # Non-contrastive phases: just use first view
                     inputs = inp1.to(device)
             else:
-                inputs, targets, targets_c, _ = batch
+                inputs, targets, targets_c, _, video_ids, timestamps = batch
+                video_ids = video_ids.to(device)
+                timestamps = timestamps.to(device)
                 inputs = inputs.to(device)
                 if phase in [1, '1a', '1b'] and use_supmoco:
-                    raise ValueError("SupMoCo requires dual-view augmented batches (len(batch) == 5).")
+                    raise ValueError("SupMoCo requires dual-view augmented batches (len(batch) >= 7).")
                 
             targets, targets_c = targets.to(device), targets_c.to(device)
             
@@ -410,8 +420,11 @@ def training_loop(phase,
                         key_features = key_features.view(B, K_bag, *key_features.shape[1:]).mean(dim=1)
                     key_features = F.normalize(key_features, dim=1, eps=1e-6)
 
-                queue_features, queue_labels, queue_subject_labels, queue_ages = supmoco_state.get_queue()
-                loss = loss_fn(outputs, key_features, targets_c, subject_labels, queue_features, queue_labels, queue_subject_labels, queue_ages)
+                queue_features, queue_labels, queue_subject_labels, queue_ages, q_video_ids, q_timestamps = supmoco_state.get_queue()
+                loss = loss_fn(outputs, key_features, targets_c, subject_labels,
+                               queue_features, queue_labels, queue_subject_labels, queue_ages,
+                               query_video_ids=video_ids, query_timestamps=timestamps,
+                               queue_video_ids=q_video_ids, queue_timestamps=q_timestamps)
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
@@ -452,7 +465,8 @@ def training_loop(phase,
 
             if phase in [1, '1a', '1b'] and use_supmoco:
                 with torch.no_grad():
-                    supmoco_state.enqueue(key_features, targets_c, subject_labels)
+                    supmoco_state.enqueue(key_features, targets_c, subject_labels,
+                                          video_ids=video_ids, timestamps=timestamps)
             
             if phase not in [1, '1a', '1b']:
                 with torch.no_grad():
@@ -464,7 +478,7 @@ def training_loop(phase,
             
             # Explicit cleanup to prevent memory accumulation
             if phase in [1, '1a', '1b'] and use_supmoco:
-                del q_inputs, k_inputs, key_features, queue_features, queue_labels, queue_ages
+                del q_inputs, k_inputs, key_features, queue_features, queue_labels, queue_ages, q_video_ids, q_timestamps
             else:
                 del inputs
             del targets_c, outputs, loss
@@ -597,6 +611,11 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     use_supmoco = config.training.get('use_supmoco', False)
 
     if use_supmoco:
+        # Compute seconds_per_step from data config for temporal exclusion
+        _step_size = config.data.get('step_size', 128)
+        _sampling_rate = config.data.get('sampling_rate', 256)
+        _seconds_per_step = _step_size / _sampling_rate
+
         loss_fn = SupMoCoLoss(
             train_loader.dataset.prototypes,
             temperature=con_temp,
@@ -605,6 +624,8 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
             iic_inter_weight=iic_inter_weight,
             temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
             temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
+            min_temporal_distance=config.loss.get('min_temporal_distance', 0.0),
+            seconds_per_step=_seconds_per_step,
         )
     else:
         loss_fn = ContrastiveLoss(

@@ -204,7 +204,10 @@ class SWEEPDataset(Dataset):
                     subject_idx = int(str(files[0]).split('_')[0])
                 except Exception:
                     subject_idx = -1
-                self.samples.append((bag_id, files, emotion_idx, subject_idx))
+                # Parse video_id (= bag_id) and timestamps from filenames
+                video_id = int(bag_id)
+                timestamps = [self._parse_timestamp(f) for f in files]
+                self.samples.append((bag_id, files, emotion_idx, subject_idx, video_id, timestamps))
 
             print(f"[{split.upper()}] Initialized with {len(self.samples)} Bags (Total Windows: {len(df_slice)})")
         else:
@@ -216,14 +219,17 @@ class SWEEPDataset(Dataset):
                     subject_idx = int(str(files[0]).split('_')[0])
                 except Exception:
                     subject_idx = -1
-                self.samples.append((bag_id, files, emotion_idx, subject_idx))
+                # Parse video_id (= bag_id) and timestamp from filename
+                video_id = int(bag_id) if str(bag_id).isdigit() else -1
+                timestamp = self._parse_timestamp(files[0])
+                self.samples.append((bag_id, files, emotion_idx, subject_idx, video_id, timestamp))
                 
             print(f"[{split.upper()}] Initialized with {len(self.samples)} Individual Windows (Bagging OFF)")
 
         if self.preload:
             print("Preloading data into RAM...")
             # We must preload all possible files mentioned in any bag
-            for _, files, _, _ in self.samples:
+            for _, files, _, _, _, _ in self.samples:
                 for fname in files:
                     # Skip if already cached
                     if fname in self.cache: continue
@@ -247,6 +253,16 @@ class SWEEPDataset(Dataset):
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
     
+    @staticmethod
+    def _parse_timestamp(filename):
+        """Extract sample_global_id from filename format: {subject}_{bag}_s{id}.pt"""
+        try:
+            base = os.path.splitext(filename)[0]  # strip .pt
+            # The last part after 's' is the global sample id
+            s_part = base.split('_')[-1]  # e.g. 's123'
+            return int(s_part[1:])  # strip leading 's'
+        except Exception:
+            return -1
 
     @staticmethod
     def compute_prototypes(num_classes, grid_size, radius, sigma, device='cpu'):
@@ -269,7 +285,7 @@ class SWEEPDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        bag_id, files, label_idx, subject_idx = self.samples[idx]
+        bag_id, files, label_idx, subject_idx, video_id, timestamp_data = self.samples[idx]
 
         # 1. Stratified Strided Sampling (Binning).
         # We divide the trial into 'bag_size_limit' equal temporal bins,
@@ -326,9 +342,9 @@ class SWEEPDataset(Dataset):
             # Note: you may need to apply augmentations over the batch dimension K safely
             video1 = self.augmentations(bag_video)
             video2 = self.augmentations(bag_video)
-            return video1, video2, target_map, label_idx, subject_idx, bag_id
+            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data
 
-        return bag_video, target_map, label_idx, bag_id
+        return bag_video, target_map, label_idx, bag_id, video_id, timestamp_data
 
 class PKSampler(Sampler):
     def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None, subject_diverse_k=True):
