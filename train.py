@@ -759,7 +759,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
                 momentum_model.load_state_dict(checkpoint['momentum_model_state_dict'])
                 print("  Restored momentum encoder weights from checkpoint.")
             if checkpoint.get('supmoco_state_dict') is not None:
-                supmoco_state.load_state_dict(checkpoint['supmoco_state_dict'])
+                supmoco_state.load_state_dict(checkpoint['supmoco_state_dict'], strict=False)
                 print(f"  Restored SupMoCo queue (filled={int(supmoco_state.queue_filled.item())}).")
 
     # --- Online Linear Evaluator (decoupled from contrastive head) ---
