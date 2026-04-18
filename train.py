@@ -36,7 +36,8 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 #torch.autograd.set_detect_anomaly(True)
 torch.backends.cudnn.benchmark = True
 def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sweepnet.pt",
-                    momentum_model=None, supmoco_state=None):
+                    momentum_model=None, supmoco_state=None,
+                    online_evaluator=None, optimizer_eval=None):
     payload = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -46,6 +47,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
         'dice': dice,
         'momentum_model_state_dict': momentum_model.state_dict() if momentum_model is not None else None,
         'supmoco_state_dict': supmoco_state.state_dict() if supmoco_state is not None else None,
+        'online_evaluator_state_dict': online_evaluator.state_dict() if online_evaluator is not None else None,
+        'optimizer_eval_state_dict': optimizer_eval.state_dict() if optimizer_eval is not None else None,
     }
     torch.save(payload, path)
     print(f"Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
@@ -277,7 +280,7 @@ def compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5):
             B = inputs.shape[0]
 
         inputs = inputs.permute(1, 0, 2, 3, 4)
-        features = model(inputs, K=K_bag)
+        features = model.extract_features(inputs, K=K_bag)
         if K_bag is not None and features.shape[0] == B * K_bag:
             features = features.view(B, K_bag, *features.shape[1:]).mean(dim=1)
         features = F.normalize(features, dim=1, eps=1e-6)
@@ -307,6 +310,53 @@ def compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5):
     return acc
 
 
+def compute_linear_eval_accuracy(model, online_evaluator, val_loader, device):
+    """Online linear evaluation accuracy on the validation set.
+    
+    Extracts backbone features (detached from the contrastive graph),
+    pushes them through the online linear head, and returns balanced accuracy.
+    """
+    model.eval()
+    online_evaluator.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            inputs, labels = batch[0], batch[2]
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            K_bag = None
+            if inputs.dim() == 6:
+                B, K_bag, T, C, H, W = inputs.shape
+                inputs = inputs.view(B * K_bag, T, C, H, W)
+            else:
+                B = inputs.shape[0]
+
+            inputs = inputs.permute(1, 0, 2, 3, 4)
+            features = model.extract_features(inputs, K=K_bag)
+            if K_bag is not None and features.shape[0] == B * K_bag:
+                features = features.view(B, K_bag, *features.shape[1:]).mean(dim=1)
+
+            logits = online_evaluator(features)
+            preds = logits.argmax(dim=1)
+            all_preds.append(preds)
+            all_labels.append(labels)
+
+    all_preds = torch.cat(all_preds, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+
+    # Balanced accuracy: mean per-class recall
+    num_classes = logits.shape[1]
+    per_class_acc = []
+    for c in range(num_classes):
+        mask = all_labels == c
+        if mask.sum() > 0:
+            per_class_acc.append((all_preds[mask] == c).float().mean().item())
+    bal_acc = sum(per_class_acc) / max(len(per_class_acc), 1)
+    return bal_acc
+
+
 def training_loop(phase, 
                   start_epoch, 
                   epochs, 
@@ -327,11 +377,14 @@ def training_loop(phase,
                   momentum_model=None,
                   supmoco_state=None,
                   unfreeze_epoch=-1,
-                  accumulation_steps=1):
+                  accumulation_steps=1,
+                  online_evaluator=None,
+                  optimizer_eval=None,
+                  criterion_eval=None):
     
     # Phase 1A trackers
     best_train_loss = float('inf') if phase == '1a' else None
-    best_knn_acc = 0.0
+    best_linear_acc = 0.0
 
     #temp_mix = TemporalMix()
 
@@ -352,6 +405,8 @@ def training_loop(phase,
         if freeze_bn:
             model.encoder.apply(freeze_bn_stats)
         train_loss = 0.0
+        train_linear_correct = 0
+        train_linear_total = 0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
             # Handle both augmented (8 items) and non-augmented (6 items) returns
@@ -410,9 +465,11 @@ def training_loop(phase,
                 q_inputs, B, K_bag = _prepare_view(q_inputs)
                 k_inputs, _, _ = _prepare_view(k_inputs)
 
-                outputs = model(q_inputs, K=K_bag)
-                if K_bag is not None and outputs.shape[0] == B * K_bag:
-                    outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
+                # Extract backbone features, then project for contrastive loss
+                backbone_feats = model.extract_features(q_inputs, K=K_bag)
+                if K_bag is not None and backbone_feats.shape[0] == B * K_bag:
+                    backbone_feats = backbone_feats.view(B, K_bag, *backbone_feats.shape[1:]).mean(dim=1)
+                outputs = model.classifier(backbone_feats)
 
                 with torch.no_grad():
                     key_features = momentum_model(k_inputs, K=K_bag)
@@ -425,6 +482,16 @@ def training_loop(phase,
                                queue_features, queue_labels, queue_subject_labels, queue_ages,
                                query_video_ids=video_ids, query_timestamps=timestamps,
                                queue_video_ids=q_video_ids, queue_timestamps=q_timestamps)
+
+                # --- Online Linear Evaluator (decoupled, parallel training) ---
+                if online_evaluator is not None:
+                    eval_logits = online_evaluator(backbone_feats.detach())
+                    loss_eval = criterion_eval(eval_logits, targets_c)
+                    (loss_eval / accumulation_steps).backward()
+                    # Track train-time linear accuracy
+                    with torch.no_grad():
+                        train_linear_correct += (eval_logits.argmax(dim=1) == targets_c).sum().item()
+                        train_linear_total += targets_c.size(0)
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
@@ -462,6 +529,10 @@ def training_loop(phase,
                 if phase in [1, '1a', '1b'] and use_supmoco:
                     momentum_update(model, momentum_model, moco_momentum)
                 optimizer.zero_grad(set_to_none=True)
+                # Step the online evaluator optimizer (decoupled from main optimizer)
+                if online_evaluator is not None and optimizer_eval is not None:
+                    optimizer_eval.step()
+                    optimizer_eval.zero_grad(set_to_none=True)
 
             if phase in [1, '1a', '1b'] and use_supmoco:
                 with torch.no_grad():
@@ -494,7 +565,15 @@ def training_loop(phase,
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        # --- Queue-kNN Probe (Phase 1A only) ---
+        # --- Online Linear Eval Probe (Phase 1A only) ---
+        val_linear_acc = 0.0
+        train_linear_acc = 0.0
+        if phase == '1a' and online_evaluator is not None:
+            val_linear_acc = compute_linear_eval_accuracy(model, online_evaluator, val_loader, device)
+            train_linear_acc = train_linear_correct / max(train_linear_total, 1)
+            print(f"  Online Linear Eval — Train Acc: {train_linear_acc:.4f} | Val Bal Acc: {val_linear_acc:.4f}")
+
+        # --- Queue-kNN Probe (Phase 1A only, secondary diagnostic) ---
         val_knn_acc = 0.0
         if phase == '1a' and use_supmoco and supmoco_state is not None:
             queue_filled = int(supmoco_state.queue_filled.item())
@@ -505,7 +584,8 @@ def training_loop(phase,
         # --- Checkpoint: checkpoint_last.pt (every epoch, atomic write) ---
         save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
                         f"{checkpoint_dir}/checkpoint_temp.pt",
-                        momentum_model=momentum_model, supmoco_state=supmoco_state) 
+                        momentum_model=momentum_model, supmoco_state=supmoco_state,
+                        online_evaluator=online_evaluator, optimizer_eval=optimizer_eval) 
         os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_last.pt")
         
         if phase in [1, '1a', '1b']:
@@ -533,6 +613,9 @@ def training_loop(phase,
             })
         if phase == '1a' and use_supmoco:
             log_dict[f"Phase{phase}/Val/Queue_kNN_Acc"] = val_knn_acc
+        if phase == '1a' and online_evaluator is not None:
+            log_dict[f"Phase{phase}/Train/Linear_Acc"] = train_linear_acc
+            log_dict[f"Phase{phase}/Val/Linear_Bal_Acc"] = val_linear_acc
         if phase not in [1, '1a', '1b']:
             log_dict.update({
                 f"Phase{phase}/Val/Dice": val_dice,
@@ -551,21 +634,23 @@ def training_loop(phase,
                 best_acc = avg_train_loss  # Store loss in acc field for Phase 1A
                 save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
                                 f"{checkpoint_dir}/checkpoint_temp.pt",
-                                momentum_model=momentum_model, supmoco_state=supmoco_state)
+                                momentum_model=momentum_model, supmoco_state=supmoco_state,
+                                online_evaluator=online_evaluator, optimizer_eval=optimizer_eval)
                 os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best.pt")
                 wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
             else:
                 print(f"Best Train Loss yet: {best_train_loss:.4f}")
 
-            # checkpoint_best_knn.pt: save when queue-kNN accuracy increases
-            if val_knn_acc > best_knn_acc:
-                best_knn_acc = val_knn_acc
+            # checkpoint_best_linear.pt: save when online linear eval accuracy increases
+            if val_linear_acc > best_linear_acc:
+                best_linear_acc = val_linear_acc
                 save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
                                 f"{checkpoint_dir}/checkpoint_temp.pt",
-                                momentum_model=momentum_model, supmoco_state=supmoco_state)
-                os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best_knn.pt")
-                wandb.save(f"{checkpoint_dir}/checkpoint_best_knn.pt")
-                print(f"  New best Queue-kNN Acc: {best_knn_acc:.4f}")
+                                momentum_model=momentum_model, supmoco_state=supmoco_state,
+                                online_evaluator=online_evaluator, optimizer_eval=optimizer_eval)
+                os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best_linear.pt")
+                wandb.save(f"{checkpoint_dir}/checkpoint_best_linear.pt")
+                print(f"  New best Linear Eval Acc: {best_linear_acc:.4f}")
         else:
             # Phase 2+: original acc/dice logic
             if val_acc > best_acc:
@@ -677,6 +762,21 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
                 supmoco_state.load_state_dict(checkpoint['supmoco_state_dict'])
                 print(f"  Restored SupMoCo queue (filled={int(supmoco_state.queue_filled.item())}).")
 
+    # --- Online Linear Evaluator (decoupled from contrastive head) ---
+    num_classes = config.model.get('num_classes', 5)
+    online_evaluator = nn.Linear(enc_class.feature_dim, num_classes).to(device)
+    optimizer_eval = torch.optim.Adam(online_evaluator.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion_eval = nn.CrossEntropyLoss()
+
+    if resume and checkpoint is not None:
+        if checkpoint.get('online_evaluator_state_dict') is not None:
+            online_evaluator.load_state_dict(checkpoint['online_evaluator_state_dict'])
+            print("  Restored online linear evaluator from checkpoint.")
+            if checkpoint.get('optimizer_eval_state_dict') is not None:
+                optimizer_eval.load_state_dict(checkpoint['optimizer_eval_state_dict'])
+        else:
+            print("  Heads up: Checkpoint does not contain linear head. Starting with fresh linear head.")
+
     training_loop(
         '1a',
         start_epoch,
@@ -697,7 +797,10 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         momentum_model=momentum_model,
         supmoco_state=supmoco_state,
         unfreeze_epoch=-1,
-        accumulation_steps=accumulation_steps
+        accumulation_steps=accumulation_steps,
+        online_evaluator=online_evaluator,
+        optimizer_eval=optimizer_eval,
+        criterion_eval=criterion_eval,
     )
    
 

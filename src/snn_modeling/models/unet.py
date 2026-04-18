@@ -54,6 +54,7 @@ class SpikingResNetClassifier(nn.Module):
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
+        self.feature_dim = feature_dim
         self.use_swiglu = use_swiglu
         
         # --- SwiGLU MIL Attention Heads (Optional) ---
@@ -71,7 +72,11 @@ class SpikingResNetClassifier(nn.Module):
         
         
 
-    def forward(self, x, K=None):
+    def extract_features(self, x, K=None):
+        """Extract backbone features (before projection head).
+        
+        Returns (B, feature_dim) tensor suitable for linear evaluation.
+        """
         features, _ = self.encoder(x)
         # Spatiotemporal GAP: (T, B, C, H, W) -> (B, C)
         if features.dim() == 5:
@@ -109,8 +114,11 @@ class SpikingResNetClassifier(nn.Module):
                 out = torch.stack(master_vectors, dim=0) # [B, C_dim]
         # ============================
 
-        # The averaged Top-K (or SwiGLU-weighted) vector is passed to the Projection Head
+        return out
+
+    def forward(self, x, K=None):
+        out = self.extract_features(x, K=K)
+        # The backbone features are passed to the Projection Head
         # which will apply F.normalize prior to SupCon!
         out = self.classifier(out)
-        
         return out
