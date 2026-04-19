@@ -1114,10 +1114,10 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
 
     train_aug = nn.Sequential(
         GaussianNoise(std=0.05),
-        FrequencyDropout(p=0.3), # Kills spectral biometric (Alpha peak)
-        VideoRandomErasing(p=0.3, scale=(0.02, 0.2)), # Kills spatial biometric (Skull/Electrodes)
-        SpatialDropout(p=0.3), # Kills physical cap impedance variations (Specific point electrodes)
-        VideoTemporalMasking(p=0.3, max_mask_len=8), # Kills temporal biometric (ODConv barcode)
+        FrequencyDropout(p=0.1), # Kills spectral biometric (Alpha peak)
+        VideoRandomErasing(p=0.1, scale=(0.02, 0.2), ratio=(0.3, 3.3)), # Kills spatial biometric (Skull/Electrodes)
+        #SpatialDropout(p=0.3), # Kills physical cap impedance variations (Specific point electrodes)
+        VideoTemporalMasking(p=0.1, max_mask_len=8), # Kills temporal biometric (ODConv barcode)
         SignalJitter(lower=0.5, upper=2.0) # Kills absolute power biometric (Impedance)
     )
 
