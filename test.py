@@ -432,19 +432,17 @@ def test(config, loso, subj, device, model):
         log_dict["Eval/UMAP_Subject_Train"] = wandb.Image(train_subj_umap_path, caption=f"UMAP Train by Subject")
         print(f"  Saved {train_subj_umap_path}")
 
-        # Transform Val using Train-fitted UMAP, colored by Val Subject IDs
+        # Transform Val using Train-fitted UMAP, colored by Predicted TRAIN Subject IDs
         emb_val_2d_subj = train_reducer.transform(emb_val)
-        unique_val_subjs = np.unique(subj_val)
-        palette_subj_val = sns.color_palette("husl", len(unique_val_subjs))
         
         fig_subj_val, ax_subj_val = plt.subplots(figsize=(10, 8))
         sns.scatterplot(
             x=emb_val_2d_subj[:, 0], y=emb_val_2d_subj[:, 1],
-            hue=subj_val, palette=palette_subj_val,
+            hue=preds_subj_val, palette=palette_subj_train, hue_order=unique_train_subjs,
             s=15, alpha=0.7, ax=ax_subj_val, legend='full'
         )
-        ax_subj_val.set_title(f"Val UMAP (Train-Fitted) Colored by Subject ID — {id_label}")
-        ax_subj_val.legend(title='Subject ID', bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax_subj_val.set_title(f"Val UMAP (Train-Fitted) Colored by PRED Train Subj ID — {id_label}")
+        ax_subj_val.legend(title='Pred Train Subj', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
         fig_subj_val.tight_layout()
         
         val_subj_umap_path = f"evidence/umap_val_subject_{suffix}.png"
@@ -452,6 +450,7 @@ def test(config, loso, subj, device, model):
         plt.close(fig_subj_val)
         log_dict["Eval/UMAP_Subject_Val"] = wandb.Image(val_subj_umap_path, caption=f"UMAP Val by Subject (Train-Fitted trans.)")
         print(f"  Saved {val_subj_umap_path}")
+
         
     else:
         print("  Subject IDs not parsed. Skipping Proxy-A.")

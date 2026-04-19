@@ -7,6 +7,24 @@ from ..layers.neurons import ALIF, TimeDistributed, SwiGLU
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
 
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class GRL(nn.Module):
+    def __init__(self, alpha=1.0):
+        super(GRL, self).__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.alpha)
+
 class SpikingUNet(nn.Module):
     def __init__(self, encoder_backbone, decoder_backbone, in_channels, num_classes, encoding_method='direct', num_timesteps=32):
         super(SpikingUNet, self).__init__()
@@ -49,19 +67,29 @@ class UNet(nn.Module):
         raise NotImplementedError("This is a placeholder for the ANN UNet.")
 
 class SpikingResNetClassifier(nn.Module):
-    def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False, use_batchnorm=False):
+    def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False, use_batchnorm=False, use_dann=False, num_subjects=15):
         super().__init__()
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
         self.feature_dim = feature_dim
         self.use_swiglu = use_swiglu
+        self.use_dann = use_dann
+        self.num_subjects = num_subjects
         
         # --- SwiGLU MIL Attention Heads (Optional) ---
         if self.use_swiglu:
             self.mil_attention = nn.Sequential(
                 SwiGLU(feature_dim, p_drop=0.2),
                 nn.Linear(feature_dim, 1, bias=False)
+            )
+
+        if self.use_dann:
+            self.dann_head = nn.Sequential(
+                GRL(alpha=1.0),
+                nn.Linear(feature_dim, feature_dim // 2),
+                nn.SiLU(),
+                nn.Linear(feature_dim // 2, num_subjects)
             )
         
         # Auto-detect if encoder uses batchnorm to sync the ProjectionHead

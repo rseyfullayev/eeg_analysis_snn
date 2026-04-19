@@ -43,11 +43,14 @@ loss:
   target_rate: 0.1
   alpha: 0.3
   beta: 0.7
-  min_temporal_distance: 0.0  # Seconds: mask out same-video negatives within this window (0.0 = disabled)
+  exclude_same_trial: true  # Make contrastive formulation adhere strictly to Leave-One-Trial-Out by filtering exact same video negatives
+  use_dann: true
+  dann_weight: 1.0
+  dann_alpha: 1.0
 
 logging:
   project_name: "snn-encoding-showdown"
   run_name: "MobileNet"
-  tags: ["mobilenet", "tsm", "phase1a", "scda", "pk_sampler"]
+  tags: ["mobilenet", "tsm", "phase1a", "scda", "dann"]
   offline: false
   log_interval: 1

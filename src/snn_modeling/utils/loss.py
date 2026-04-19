@@ -254,8 +254,7 @@ class SupMoCoLoss(ContrastiveLoss):
                  iic_inter_weight=1.0,
                  temporal_decay_enabled=False,
                  temporal_decay_factor=0.999,
-                 min_temporal_distance=0.0,
-                 seconds_per_step=0.5):
+                 exclude_same_trial=True):
         super().__init__(
             masks=masks,
             temperature=temperature,
@@ -266,8 +265,7 @@ class SupMoCoLoss(ContrastiveLoss):
         )
         self.temporal_decay_enabled = temporal_decay_enabled
         self.temporal_decay_factor = temporal_decay_factor
-        self.min_temporal_distance = min_temporal_distance
-        self.seconds_per_step = seconds_per_step
+        self.exclude_same_trial = exclude_same_trial
 
     def forward(self,
                 query_features,
@@ -368,18 +366,14 @@ class SupMoCoLoss(ContrastiveLoss):
             neg_weights = neg_weights * temporal_weights.unsqueeze(0)
             pos_weights = pos_weights * temporal_weights.unsqueeze(0)
 
-        # --- Temporal Exclusion Mask ---
-        # Zero out negatives from the same video that are within min_temporal_distance seconds
-        if self.min_temporal_distance > 0 and query_video_ids is not None:
+        # --- Trial Exclusion Mask (Leave-One-Trial-Out) ---
+        # Zero out ALL negatives that come from the exact same video (trial)
+        if self.exclude_same_trial and query_video_ids is not None:
             q_vid = query_video_ids.view(-1, 1)    # (B, 1)
-            q_ts = query_timestamps.view(-1, 1).float()  # (B, 1)
             c_vid = all_video_ids.view(1, -1)       # (1, M)
-            c_ts = all_timestamps.view(1, -1).float()  # (1, M)
 
             same_video = (q_vid == c_vid)  # (B, M)
-            temporal_dist_seconds = (q_ts - c_ts).abs() * self.seconds_per_step  # (B, M)
-            temporal_exclude = same_video & (temporal_dist_seconds < self.min_temporal_distance)  # (B, M)
-            neg_weights = neg_weights * (~temporal_exclude).float()
+            neg_weights = neg_weights * (~same_video).float()
 
         # Decoupled denominator: negatives only (no positive terms in partition).
         neg_partition = torch.clamp((torch.exp(logits) * neg_weights).sum(dim=1, keepdim=True), min=1e-8)
@@ -407,10 +401,10 @@ class SupMoCoLoss(ContrastiveLoss):
                 print(f"Mean Neg Weight: {mean_neg_weight.item():.4f}")
                 print(f"Max Logit (shifted): {logits_max.mean().item():.4f}")
                 print(f"Denominator (Exp Neg Sum): {neg_partition.mean().item():.4f}")
-                if self.min_temporal_distance > 0 and query_video_ids is not None:
-                    excluded_count = temporal_exclude.sum().item()
+                if self.exclude_same_trial and query_video_ids is not None:
+                    excluded_count = same_video.sum().item()
                     total_neg_pairs = neg_mask.sum().item()
-                    print(f"Temporal Exclusions: {excluded_count:.0f} / {total_neg_pairs:.0f} neg pairs masked")
+                    print(f"Trial Exclusions: {excluded_count:.0f} / {total_neg_pairs:.0f} neg pairs masked")
                 print(f"Final Loss: {loss_val.item():.4f}\n")
                 
         self.step_count = step_count + 1

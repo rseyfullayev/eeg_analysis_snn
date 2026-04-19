@@ -22,7 +22,7 @@ from sklearn.exceptions import UndefinedMetricWarning
 import numpy as np
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
-from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing
+from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing, SpatialDropout
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingResNetClassifier
 from omegaconf import OmegaConf
@@ -380,7 +380,10 @@ def training_loop(phase,
                   accumulation_steps=1,
                   online_evaluator=None,
                   optimizer_eval=None,
-                  criterion_eval=None):
+                  criterion_eval=None,
+                  dann_weight=1.0,
+                  dann_alpha=1.0,
+                  subj_remapper=None):
     
     # Phase 1A trackers
     best_train_loss = float('inf') if phase == '1a' else None
@@ -407,6 +410,9 @@ def training_loop(phase,
         train_loss = 0.0
         train_linear_correct = 0
         train_linear_total = 0
+        train_dann_correct = 0
+        train_dann_total = 0
+        dann_loss_total = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
             # Handle both augmented (8 items) and non-augmented (6 items) returns
@@ -492,6 +498,28 @@ def training_loop(phase,
                     with torch.no_grad():
                         train_linear_correct += (eval_logits.argmax(dim=1) == targets_c).sum().item()
                         train_linear_total += targets_c.size(0)
+
+                # --- DANN (Domain Adversarial Neural Network) ---
+                if getattr(model, 'use_dann', False):
+                    # Update GRL alpha if dynamically given, default 1.0
+                    if hasattr(model, 'dann_head') and hasattr(model.dann_head[0], 'alpha'):
+                        model.dann_head[0].alpha = dann_alpha
+
+                    subj_preds = model.dann_head(backbone_feats)
+                    
+                    if subj_remapper is not None:
+                        mapped_labels = [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels]
+                        mapped_tensor = torch.tensor(mapped_labels, device=device, dtype=torch.long)
+                    else:
+                        mapped_tensor = subject_labels
+
+                    loss_dann = F.cross_entropy(subj_preds, mapped_tensor)
+                    loss = loss + (dann_weight * loss_dann)
+                    
+                    with torch.no_grad():
+                        train_dann_correct += (subj_preds.argmax(dim=1) == mapped_tensor).sum().item()
+                        train_dann_total += mapped_tensor.size(0)
+                        dann_loss_total += (loss_dann.item() * targets_c.size(0))
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
@@ -572,6 +600,14 @@ def training_loop(phase,
             val_linear_acc = compute_linear_eval_accuracy(model, online_evaluator, val_loader, device)
             train_linear_acc = train_linear_correct / max(train_linear_total, 1)
             print(f"  Online Linear Eval — Train Acc: {train_linear_acc:.4f} | Val Bal Acc: {val_linear_acc:.4f}")
+
+        # --- DANN Logging ---
+        if getattr(model, 'use_dann', False):
+            train_dann_acc = train_dann_correct / max(train_dann_total, 1)
+            avg_dann_loss = dann_loss_total / max(train_dann_total, 1)
+            print(f"  DANN — Train Subject Accuracy: {train_dann_acc:.4f} | Loss: {avg_dann_loss:.4f}")
+            log_dict[f'Phase{str(phase).upper()}/Train/DANN_Subject_Acc'] = train_dann_acc
+            log_dict[f'Phase{str(phase).upper()}/Train/DANN_Loss'] = avg_dann_loss
 
         # --- Queue-kNN Probe (Phase 1A only, secondary diagnostic) ---
         val_knn_acc = 0.0
@@ -676,6 +712,11 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     if config.training.get('bagging', False):
         print("WARNING: 'bagging' is set to True in config, but Phase 1A enforces old-style 1s windows. Ensure dataset complies!")
 
+    unique_subjects = sorted(list(set([s[3] for s in train_loader.dataset.samples if s[3] != -1])))
+    num_dynamic_subjects = max(len(unique_subjects), 1)
+    subj_remapper = {actual_id: mapped_id for mapped_id, actual_id in enumerate(unique_subjects)}
+    print(f"Dynamic DANN Subject Count: {num_dynamic_subjects} (Train Split)")
+
     if isinstance(model, SpikingResNetClassifier):
         enc_class = model
         # Try to forcefully disable SwiGLU if it was constructed with it
@@ -685,8 +726,15 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         enc_class = SpikingResNetClassifier(
             encoder_backbone = model.encoder,
             num_classes=config.model.get('num_classes', 5),
-            use_swiglu=False  # FORCE FALSE
+            use_swiglu=False,  # FORCE FALSE
+            use_dann=config.loss.get('use_dann', False),
+            num_subjects=num_dynamic_subjects
         ).to(device)
+
+    if getattr(enc_class, 'use_dann', False) and not hasattr(enc_class, 'dann_head'):
+        # If the model was pre-instantiated but somehow doesn't have the DANN head, log a warning
+        print("WARNING: use_dann is True but model has no dann_head. Ignoring DANN for this phase.")
+        enc_class.use_dann = False
 
     iic_enabled = config.loss.get('iic_enabled', False)
     iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
@@ -696,11 +744,6 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     use_supmoco = config.training.get('use_supmoco', False)
 
     if use_supmoco:
-        # Compute seconds_per_step from data config for temporal exclusion
-        _step_size = config.data.get('step_size', 128)
-        _sampling_rate = config.data.get('sampling_rate', 256)
-        _seconds_per_step = _step_size / _sampling_rate
-
         loss_fn = SupMoCoLoss(
             train_loader.dataset.prototypes,
             temperature=con_temp,
@@ -709,8 +752,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
             iic_inter_weight=iic_inter_weight,
             temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
             temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
-            min_temporal_distance=config.loss.get('min_temporal_distance', 0.0),
-            seconds_per_step=_seconds_per_step,
+            exclude_same_trial=config.loss.get('exclude_same_trial', True)
         )
     else:
         loss_fn = ContrastiveLoss(
@@ -801,20 +843,34 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         online_evaluator=online_evaluator,
         optimizer_eval=optimizer_eval,
         criterion_eval=criterion_eval,
+        dann_weight=config.loss.get('dann_weight', 1.0),
+        dann_alpha=config.loss.get('dann_alpha', 1.0),
+        subj_remapper=subj_remapper
     )
    
 
 def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
     print("=== Phase 1B: Training Encoder with MIL/Bagging & Arch Upgrades ===")
     
+    unique_subjects = sorted(list(set([s[3] for s in train_loader.dataset.samples if s[3] != -1])))
+    num_dynamic_subjects = max(len(unique_subjects), 1)
+    subj_remapper = {actual_id: mapped_id for mapped_id, actual_id in enumerate(unique_subjects)}
+    print(f"Dynamic DANN Subject Count: {num_dynamic_subjects} (Train Split)")
+
     if isinstance(model, SpikingResNetClassifier):
         enc_class = model
     else:
         enc_class = SpikingResNetClassifier(
             encoder_backbone = model.encoder,
             num_classes=config.model.get('num_classes', 5),
-            use_swiglu=config.model.get('use_swiglu', True)
+            use_swiglu=config.model.get('use_swiglu', True),
+            use_dann=config.loss.get('use_dann', False),
+            num_subjects=num_dynamic_subjects
         ).to(device)
+        
+    if getattr(enc_class, 'use_dann', False) and not hasattr(enc_class, 'dann_head'):
+        print("WARNING: use_dann is True but model has no dann_head. Ignoring DANN for this phase.")
+        enc_class.use_dann = False
 
     iic_enabled = config.loss.get('iic_enabled', False)
     iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
@@ -832,6 +888,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
             iic_inter_weight=iic_inter_weight,
             temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
             temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
+            exclude_same_trial=config.loss.get('exclude_same_trial', True)
         )
     else:
         loss_fn = ContrastiveLoss(
@@ -909,7 +966,10 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         momentum_model=momentum_model,
         supmoco_state=supmoco_state,
         unfreeze_epoch=unfreeze_epoch,
-        accumulation_steps=accumulation_steps
+        accumulation_steps=accumulation_steps,
+        dann_weight=config.loss.get('dann_weight', 1.0),
+        dann_alpha=config.loss.get('dann_alpha', 1.0),
+        subj_remapper=subj_remapper
     )
 
     
@@ -1053,11 +1113,12 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
 
     train_aug = nn.Sequential(
-        GaussianNoise(std=0.01),
-        FrequencyDropout(p=0.1),
-        VideoTemporalMasking(p=0.1, max_mask_len=2),
-        #SignalJitter(lower=0.8, upper=1.2),
-        #VideoRandomErasing(p=0.3)
+        GaussianNoise(std=0.05),
+        FrequencyDropout(p=0.3), # Kills spectral biometric (Alpha peak)
+        VideoRandomErasing(p=0.3, scale=(0.02, 0.2)), # Kills spatial biometric (Skull/Electrodes)
+        SpatialDropout(p=0.3), # Kills physical cap impedance variations (Specific point electrodes)
+        VideoTemporalMasking(p=0.3, max_mask_len=8), # Kills temporal biometric (ODConv barcode)
+        SignalJitter(lower=0.5, upper=2.0) # Kills absolute power biometric (Impedance)
     )
 
     train_set = SWEEPDataset(

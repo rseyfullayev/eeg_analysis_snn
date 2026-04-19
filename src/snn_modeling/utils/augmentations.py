@@ -141,6 +141,31 @@ class VideoRandomErasing(nn.Module):
 
         return x
 
+class SpatialDropout(nn.Module):
+    """
+    Randomly zeroes out specific spatial locations (electrodes) on the topographic map.
+    This simulates dropped connections or varying impedances at specific electrode locations.
+    The dropout mask is consistent across all time steps and frequency bands for a given clip.
+    Input shape: [B, T, C, H, W] or [T, C, H, W]
+    """
+    def __init__(self, p=0.05):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        if not self.training: return x
+        
+        if x.dim() == 5:
+            B, T, C, H, W = x.shape
+            # Drop each electrode (H, W) independently per sample in the batch
+            mask = (torch.rand(B, 1, 1, H, W, device=x.device) > self.p).float()
+        else:
+            # x: [T, C, H, W]
+            T, C, H, W = x.shape
+            mask = (torch.rand(1, 1, H, W, device=x.device) > self.p).float()
+            
+        return x * mask
+
 class TemporalMix(nn.Module):
     """
     Temporal Mixup: Mixes multiple videos along the temporal dimension.
