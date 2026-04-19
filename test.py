@@ -221,7 +221,12 @@ def test(config, loso, subj, device, model):
                 groups_list.extend(bag_id)
                 
                 # Lookup subjects
-                subjects = [bag_to_subj.get(str(b), -1) for b in bag_id]
+                subjects = []
+                for b in bag_id:
+                    # PyTorch dataloaders return tensors for integers, so unwrap them
+                    key = str(b.item() if hasattr(b, 'item') else b)
+                    subjects.append(bag_to_subj.get(key, -1))
+
                 subjects_list.extend(subjects)
 
         emb_all = torch.cat(embs, dim=0).numpy()
