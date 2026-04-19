@@ -501,9 +501,14 @@ def training_loop(phase,
 
                 # --- DANN (Domain Adversarial Neural Network) ---
                 if getattr(model, 'use_dann', False):
-                    # Update GRL alpha if dynamically given, default 1.0
+                    # Ganin et al. (2015) Alpha Annealing Schedule
+                    # Progress p smoothly moves from 0 to 1 over the course of training phases
+                    p = (epoch * len(train_loader) + batch_idx) / (epochs * len(train_loader))
+                    annealed_alpha = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * dann_alpha
+
+                    # Update GRL alpha if dynamically given
                     if hasattr(model, 'dann_head') and hasattr(model.dann_head[0], 'alpha'):
-                        model.dann_head[0].alpha = dann_alpha
+                        model.dann_head[0].alpha = annealed_alpha
 
                     subj_preds = model.dann_head(backbone_feats)
                     
