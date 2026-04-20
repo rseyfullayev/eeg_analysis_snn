@@ -1,2 +1,2 @@
-config/config_novelest.yaml
---loso 1 --checkpoint /media/temporaryuser3/STORAGE/ERO/saved_models/phase1a/MobileNet_20260420_005641_loso1/checkpoint_last.pt --resume
+config/config.yaml
+--loso 1 --checkpoint /media/temporaryuser3/STORAGE/ERO/saved_models/phase1a/MobileNet_20260420_032315_loso1/checkpoint_last.pt --resume
