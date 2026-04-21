@@ -604,18 +604,20 @@ def training_loop(phase,
         subj_cross_acc = 0.0
         if phase == '1a' and (epoch % probe_interval == 0 or epoch == epochs - 1):
             from test import _linear_probe_cv, _linear_probe_accuracy, _svm_probe_cv, _svm_probe_accuracy
-            from test import extract_embs  # Not imported globally to avoid circular logic, wait test.py's extract_embs is coupled to its local scope
             
             # Temporary inline extractor
             def _extract_feats(loader):
-                embs, lbls, grps, subjs = [], [], [], []
+                embs, lbls, grps = [], [], []
                 model.eval()
                 with torch.no_grad():
                     for batch in loader:
                         vid = batch[0].to(device)
-                        lbl = batch[2].to(device)
-                        bag_id = batch[3]
-                        subj = batch[4] 
+                        if len(batch) >= 8: # Augmented train batch
+                            lbl = batch[3].to(device)
+                            bag_id = batch[5]
+                        else: # Standard val batch
+                            lbl = batch[2].to(device)
+                            bag_id = batch[3]
                         
                         K_bag = None
                         if vid.dim() == 6:
