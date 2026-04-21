@@ -526,7 +526,7 @@ def training_loop(phase,
                     else:
                         mapped_tensor = subject_labels
                         
-                    loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor)
+                    loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor, targets_c)
                     loss = loss + (lambda_mmd * loss_mmd)
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]

@@ -209,10 +209,13 @@ class ContrastiveLoss(nn.Module):
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
         
         # Mean log-likelihood over positives
-        pos_weight_sum = torch.clamp(pos_weights.sum(1), min=1.0)
-        mean_log_prob_pos = (pos_weights * log_prob).sum(1) / pos_weight_sum
-        
-        loss = -mean_log_prob_pos.mean()
+        valid_anchors = pos_weights.sum(1) > 0
+        if not valid_anchors.any():
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+        else:
+            pos_weight_sum = pos_weights[valid_anchors].sum(1)
+            mean_log_prob_pos = (pos_weights[valid_anchors] * log_prob[valid_anchors]).sum(1) / pos_weight_sum
+            loss = -mean_log_prob_pos.mean()
         
         current_epoch = getattr(self, 'current_epoch', 0)
         step_count = getattr(self, 'step_count', 0)
@@ -348,12 +351,13 @@ class SupMoCoLoss(ContrastiveLoss):
             pos_weights = pos_mask * diff_subj_mask
 
             # 2. Hard Negatives: Labels differ, Subjects equal -> Weight = (1.0 + Dice)
-            #    Normal Negatives: Labels differ, Subjects differ -> explicitly ignored (Weight = 0.0)
+            # 3. Normal Negatives: Labels differ, Subjects differ -> Weight = 1.0
             dice_pair = self.sim_score[labels][:, all_labels]
             
             hard_neg_mask = neg_mask * same_subj_mask
+            normal_neg_mask = neg_mask * diff_subj_mask
             
-            neg_weights = (hard_neg_mask * (1.0 + dice_pair))  # Normal negatives ignored!
+            neg_weights = (hard_neg_mask * (1.0 + dice_pair)) + normal_neg_mask
         else:
             # Standard SupCon
             pos_weights = pos_mask.clone()
@@ -378,9 +382,13 @@ class SupMoCoLoss(ContrastiveLoss):
         neg_partition = torch.clamp((torch.exp(logits) * neg_weights).sum(dim=1, keepdim=True), min=1e-8)
         pos_log_prob = logits - torch.log(neg_partition)
 
-        pos_weight_sum = torch.clamp(pos_weights.sum(dim=1), min=1e-8)
-        mean_log_prob_pos = (pos_weights * pos_log_prob).sum(dim=1) / pos_weight_sum
-        loss_val = -mean_log_prob_pos.mean()
+        valid_anchors = pos_weights.sum(dim=1) > 0
+        if not valid_anchors.any():
+            loss_val = torch.tensor(0.0, device=device, requires_grad=True)
+        else:
+            pos_weight_sum = pos_weights[valid_anchors].sum(dim=1)
+            mean_log_prob_pos = (pos_weights[valid_anchors] * pos_log_prob[valid_anchors]).sum(dim=1) / pos_weight_sum
+            loss_val = -mean_log_prob_pos.mean()
         
         current_epoch = getattr(self, 'current_epoch', 0)
         step_count = getattr(self, 'step_count', 0)
@@ -476,7 +484,7 @@ class MultiKernelMMDLoss(nn.Module):
             median_dist = torch.median(pairwise_dists).item()
             return median_dist if median_dist > 1e-5 else 1.0
 
-    def forward(self, features, domain_labels):
+    def forward(self, features, domain_labels, class_labels=None):
         """Calculates Multi-Kernel MMD across all pairs of domains natively present in the batch."""
         unique_domains = torch.unique(domain_labels)
         if len(unique_domains) < 2:
@@ -500,14 +508,32 @@ class MultiKernelMMDLoss(nn.Module):
                 domain_i = unique_domains[i]
                 domain_j = unique_domains[j]
                 
-                idx_i = (domain_labels == domain_i).nonzero(as_tuple=True)[0]
-                idx_j = (domain_labels == domain_j).nonzero(as_tuple=True)[0]
+                if class_labels is not None:
+                    # Class-conditional MMD
+                    unique_classes = torch.unique(class_labels)
+                    for c in unique_classes:
+                        idx_i_c = ((domain_labels == domain_i) & (class_labels == c)).nonzero(as_tuple=True)[0]
+                        idx_j_c = ((domain_labels == domain_j) & (class_labels == c)).nonzero(as_tuple=True)[0]
+                        
+                        if len(idx_i_c) > 0 and len(idx_j_c) > 0:
+                            K_ii = kernel_matrix[idx_i_c][:, idx_i_c].mean()
+                            K_jj = kernel_matrix[idx_j_c][:, idx_j_c].mean()
+                            K_ij = kernel_matrix[idx_i_c][:, idx_j_c].mean()
+                            
+                            mmd_loss += K_ii + K_jj - 2 * K_ij
+                            num_pairs += 1
+                else:
+                    idx_i = (domain_labels == domain_i).nonzero(as_tuple=True)[0]
+                    idx_j = (domain_labels == domain_j).nonzero(as_tuple=True)[0]
+                    
+                    K_ii = kernel_matrix[idx_i][:, idx_i].mean()
+                    K_jj = kernel_matrix[idx_j][:, idx_j].mean()
+                    K_ij = kernel_matrix[idx_i][:, idx_j].mean()
+                    
+                    mmd_loss += K_ii + K_jj - 2 * K_ij
+                    num_pairs += 1
                 
-                K_ii = kernel_matrix[idx_i][:, idx_i].mean()
-                K_jj = kernel_matrix[idx_j][:, idx_j].mean()
-                K_ij = kernel_matrix[idx_i][:, idx_j].mean()
-                
-                mmd_loss += K_ii + K_jj - 2 * K_ij
-                num_pairs += 1
-                
+        if num_pairs == 0:
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
+
         return mmd_loss / num_pairs
