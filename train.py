@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss, SupMoCoLoss
+from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss, SupMoCoLoss, MultiKernelMMDLoss
 from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
 from src.snn_modeling.utils.supmoco import SupMoCoState, build_momentum_encoder, momentum_update
 import os
@@ -24,7 +24,7 @@ from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
 from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing, SpatialDropout
 from src.snn_modeling.layers.neurons import ALIF
-from src.snn_modeling.models.unet import SpikingResNetClassifier
+from src.snn_modeling.models.unet import SpikingMobileNetProjector
 from omegaconf import OmegaConf
 # Ignore the specific sklearn warning about missing classes
 warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
@@ -35,9 +35,7 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 #torch.autograd.set_detect_anomaly(True)
 torch.backends.cudnn.benchmark = True
-def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sweepnet.pt",
-                    momentum_model=None, supmoco_state=None,
-                    online_evaluator=None, optimizer_eval=None):
+                    momentum_model=None, supmoco_state=None):
     payload = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -47,8 +45,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
         'dice': dice,
         'momentum_model_state_dict': momentum_model.state_dict() if momentum_model is not None else None,
         'supmoco_state_dict': supmoco_state.state_dict() if supmoco_state is not None else None,
-        'online_evaluator_state_dict': online_evaluator.state_dict() if online_evaluator is not None else None,
-        'optimizer_eval_state_dict': optimizer_eval.state_dict() if optimizer_eval is not None else None,
     }
     torch.save(payload, path)
     print(f"Saved checkpoint at Epoch {epoch} (Acc: {acc:.4f}, Dice: {dice:.4f})")
@@ -378,12 +374,10 @@ def training_loop(phase,
                   supmoco_state=None,
                   unfreeze_epoch=-1,
                   accumulation_steps=1,
-                  online_evaluator=None,
-                  optimizer_eval=None,
-                  criterion_eval=None,
                   dann_weight=1.0,
                   dann_alpha=1.0,
-                  subj_remapper=None):
+                  subj_remapper=None,
+                  probe_interval=5):
     
     # Phase 1A trackers
     best_train_loss = float('inf') if phase == '1a' else None
@@ -489,15 +483,7 @@ def training_loop(phase,
                                query_video_ids=video_ids, query_timestamps=timestamps,
                                queue_video_ids=q_video_ids, queue_timestamps=q_timestamps)
 
-                # --- Online Linear Evaluator (decoupled, parallel training) ---
-                if online_evaluator is not None:
-                    eval_logits = online_evaluator(backbone_feats.detach())
-                    loss_eval = criterion_eval(eval_logits, targets_c)
-                    (loss_eval / accumulation_steps).backward()
-                    # Track train-time linear accuracy
-                    with torch.no_grad():
-                        train_linear_correct += (eval_logits.argmax(dim=1) == targets_c).sum().item()
-                        train_linear_total += targets_c.size(0)
+                # --- Offline Probe happens below in validation ---
 
                 # --- DANN (Domain Adversarial Neural Network) ---
                 if getattr(model, 'use_dann', False):
@@ -525,6 +511,22 @@ def training_loop(phase,
                         train_dann_correct += (subj_preds.argmax(dim=1) == mapped_tensor).sum().item()
                         train_dann_total += mapped_tensor.size(0)
                         dann_loss_total += (loss_dann.item() * targets_c.size(0))
+
+                # --- MMD Domain Expansion ---
+                use_mmd = config.loss.get('use_mmd', False)
+                if use_mmd:
+                    if not hasattr(model, 'mmd_fn'):
+                        model.mmd_fn = MultiKernelMMDLoss()
+                    
+                    if subj_remapper is not None:
+                        mapped_labels = [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels]
+                        mapped_tensor = torch.tensor(mapped_labels, device=device, dtype=torch.long)
+                    else:
+                        mapped_tensor = subject_labels
+                        
+                    loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor)
+                    lambda_mmd = config.loss.get('lambda_mmd', 0.1)
+                    loss = loss + (lambda_mmd * loss_mmd)
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
@@ -562,10 +564,6 @@ def training_loop(phase,
                 if phase in [1, '1a', '1b'] and use_supmoco:
                     momentum_update(model, momentum_model, moco_momentum)
                 optimizer.zero_grad(set_to_none=True)
-                # Step the online evaluator optimizer (decoupled from main optimizer)
-                if online_evaluator is not None and optimizer_eval is not None:
-                    optimizer_eval.step()
-                    optimizer_eval.zero_grad(set_to_none=True)
 
             if phase in [1, '1a', '1b'] and use_supmoco:
                 with torch.no_grad():
@@ -598,13 +596,71 @@ def training_loop(phase,
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        # --- Online Linear Eval Probe (Phase 1A only) ---
+        # --- Offline Probes (Phase 1A only) ---
         val_linear_acc = 0.0
         train_linear_acc = 0.0
-        if phase == '1a' and online_evaluator is not None:
-            val_linear_acc = compute_linear_eval_accuracy(model, online_evaluator, val_loader, device)
-            train_linear_acc = train_linear_correct / max(train_linear_total, 1)
-            print(f"  Online Linear Eval — Train Acc: {train_linear_acc:.4f} | Val Bal Acc: {val_linear_acc:.4f}")
+        subj_cv_acc = 0.0
+        subj_cross_acc = 0.0
+        if phase == '1a' and (epoch % probe_interval == 0 or epoch == epochs - 1):
+            from test import _linear_probe_cv, _linear_probe_accuracy, _svm_probe_cv, _svm_probe_accuracy
+            from test import extract_embs  # Not imported globally to avoid circular logic, wait test.py's extract_embs is coupled to its local scope
+            
+            # Temporary inline extractor
+            def _extract_feats(loader):
+                embs, lbls, grps, subjs = [], [], [], []
+                model.eval()
+                with torch.no_grad():
+                    for batch in loader:
+                        vid = batch[0].to(device)
+                        lbl = batch[2].to(device)
+                        bag_id = batch[3]
+                        subj = batch[4] 
+                        
+                        K_bag = None
+                        if vid.dim() == 6:
+                            B, K_bag, T, C, H, W = vid.shape
+                            vid = vid.view(B * K_bag, T, C, H, W)
+                        else:
+                            B, T, C, H, W = vid.shape
+
+                        vid = vid.permute(1, 0, 2, 3, 4)
+                        features, _ = model.encoder(vid)
+
+                        if features.dim() == 5:
+                            emb = features.mean(dim=[0, 3, 4])
+                        else:
+                            emb = features.mean(dim=[-2, -1])
+
+                        if K_bag is not None:
+                            emb = emb.view(B, K_bag, -1).mean(dim=1)
+
+                        emb = F.normalize(emb, dim=1, eps=1e-6)
+                        embs.append(emb.cpu())
+                        lbls.append(lbl.cpu())
+                        grps.extend(bag_id)
+                        
+                return torch.cat(embs, dim=0).numpy(), torch.cat(lbls, dim=0).numpy(), np.array([int(b) for b in grps])
+            
+            # Need to get subjects from dataset
+            tr_b2s = {str(item[0]): item[3] for item in train_loader.dataset.samples}
+            vl_b2s = {str(item[0]): item[3] for item in val_loader.dataset.samples}
+            
+            emb_t, lbl_t, grps_t = _extract_feats(train_loader)
+            emb_v, lbl_v, grps_v = _extract_feats(val_loader)
+            
+            subj_t = np.array([tr_b2s.get(str(g), -1) for g in grps_t])
+            subj_v = np.array([vl_b2s.get(str(g), -1) for g in grps_v])
+            
+            train_linear_acc = _linear_probe_cv(emb_t, lbl_t, grps_t, n_folds=5)
+            val_linear_acc = _linear_probe_accuracy(emb_t, lbl_t, emb_v, lbl_v)
+            
+            # Proxy-A
+            if not np.all(subj_t == -1):
+                subj_cv_acc = _svm_probe_cv(emb_t, subj_t, grps_t, n_folds=5)
+                subj_cross_acc = _svm_probe_accuracy(emb_t, subj_t, emb_v, subj_v)
+            
+            print(f"  Offline Probes — Emotion Train CV: {train_linear_acc:.4f} | Val Bal Acc: {val_linear_acc:.4f}")
+            print(f"  Proxy-A Probes — Subject Train CV (SVM): {subj_cv_acc:.4f} | Val Cross Acc (SVM): {subj_cross_acc:.4f}")
 
         # --- DANN Logging ---
         if getattr(model, 'use_dann', False):
@@ -614,19 +670,12 @@ def training_loop(phase,
             log_dict[f'Phase{str(phase).upper()}/Train/DANN_Subject_Acc'] = train_dann_acc
             log_dict[f'Phase{str(phase).upper()}/Train/DANN_Loss'] = avg_dann_loss
 
-        # --- Queue-kNN Probe (Phase 1A only, secondary diagnostic) ---
-        val_knn_acc = 0.0
-        if phase == '1a' and use_supmoco and supmoco_state is not None:
-            queue_filled = int(supmoco_state.queue_filled.item())
-            if queue_filled > 0:
-                val_knn_acc = compute_queue_knn_accuracy(model, val_loader, device, supmoco_state, k=5)
-                print(f"  Queue-kNN Val Accuracy (k=5): {val_knn_acc:.4f}")
+
 
         # --- Checkpoint: checkpoint_last.pt (every epoch, atomic write) ---
         save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
                         f"{checkpoint_dir}/checkpoint_temp.pt",
-                        momentum_model=momentum_model, supmoco_state=supmoco_state,
-                        online_evaluator=online_evaluator, optimizer_eval=optimizer_eval) 
+                        momentum_model=momentum_model, supmoco_state=supmoco_state) 
         os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_last.pt")
         
         if phase in [1, '1a', '1b']:
@@ -652,11 +701,11 @@ def training_loop(phase,
                 f"Phase{phase}/Train/QueueSize": queue_len,
                 f"Phase{phase}/Train/QueueFillRatio": queue_len / float(max(1, supmoco_state.queue_size)),
             })
-        if phase == '1a' and use_supmoco:
-            log_dict[f"Phase{phase}/Val/Queue_kNN_Acc"] = val_knn_acc
-        if phase == '1a' and online_evaluator is not None:
-            log_dict[f"Phase{phase}/Train/Linear_Acc"] = train_linear_acc
-            log_dict[f"Phase{phase}/Val/Linear_Bal_Acc"] = val_linear_acc
+        if phase == '1a' and (epoch % probe_interval == 0 or epoch == epochs - 1):
+            log_dict[f"Phase{phase}/Train/Emotion_Probe_CV_Acc"] = train_linear_acc
+            log_dict[f"Phase{phase}/Val/Emotion_Probe_Val_Acc"] = val_linear_acc
+            log_dict[f"Phase{phase}/Train/Subject_Probe_CV_Acc"] = subj_cv_acc
+            log_dict[f"Phase{phase}/Val/Subject_Probe_Val_Acc"] = subj_cross_acc
         if phase not in [1, '1a', '1b']:
             log_dict.update({
                 f"Phase{phase}/Val/Dice": val_dice,
@@ -675,20 +724,18 @@ def training_loop(phase,
                 best_acc = avg_train_loss  # Store loss in acc field for Phase 1A
                 save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
                                 f"{checkpoint_dir}/checkpoint_temp.pt",
-                                momentum_model=momentum_model, supmoco_state=supmoco_state,
-                                online_evaluator=online_evaluator, optimizer_eval=optimizer_eval)
+                                momentum_model=momentum_model, supmoco_state=supmoco_state)
                 os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best.pt")
                 wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
             else:
                 print(f"Best Train Loss yet: {best_train_loss:.4f}")
 
-            # checkpoint_best_linear.pt: save when online linear eval accuracy increases
+            # checkpoint_best_linear.pt: save when offline linear eval accuracy increases
             if val_linear_acc > best_linear_acc:
                 best_linear_acc = val_linear_acc
                 save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
                                 f"{checkpoint_dir}/checkpoint_temp.pt",
-                                momentum_model=momentum_model, supmoco_state=supmoco_state,
-                                online_evaluator=online_evaluator, optimizer_eval=optimizer_eval)
+                                momentum_model=momentum_model, supmoco_state=supmoco_state)
                 os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best_linear.pt")
                 wandb.save(f"{checkpoint_dir}/checkpoint_best_linear.pt")
                 print(f"  New best Linear Eval Acc: {best_linear_acc:.4f}")
@@ -722,13 +769,13 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     subj_remapper = {actual_id: mapped_id for mapped_id, actual_id in enumerate(unique_subjects)}
     print(f"Dynamic DANN Subject Count: {num_dynamic_subjects} (Train Split)")
 
-    if isinstance(model, SpikingResNetClassifier):
+    if isinstance(model, SpikingMobileNetProjector):
         enc_class = model
         # Try to forcefully disable SwiGLU if it was constructed with it
         if hasattr(enc_class, 'use_swiglu') and enc_class.use_swiglu:
              print("WARNING: Model initialized with SwiGLU, but Phase 1A enforces use_swiglu=False. Overriding where possible.")
     else:
-        enc_class = SpikingResNetClassifier(
+        enc_class = SpikingMobileNetProjector(
             encoder_backbone = model.encoder,
             num_classes=config.model.get('num_classes', 5),
             use_swiglu=False,  # FORCE FALSE
@@ -809,20 +856,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
                 supmoco_state.load_state_dict(checkpoint['supmoco_state_dict'], strict=False)
                 print(f"  Restored SupMoCo queue (filled={int(supmoco_state.queue_filled.item())}).")
 
-    # --- Online Linear Evaluator (decoupled from contrastive head) ---
-    num_classes = config.model.get('num_classes', 5)
-    online_evaluator = nn.Linear(enc_class.feature_dim, num_classes).to(device)
-    optimizer_eval = torch.optim.Adam(online_evaluator.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion_eval = nn.CrossEntropyLoss()
 
-    if resume and checkpoint is not None:
-        if checkpoint.get('online_evaluator_state_dict') is not None:
-            online_evaluator.load_state_dict(checkpoint['online_evaluator_state_dict'])
-            print("  Restored online linear evaluator from checkpoint.")
-            if checkpoint.get('optimizer_eval_state_dict') is not None:
-                optimizer_eval.load_state_dict(checkpoint['optimizer_eval_state_dict'])
-        else:
-            print("  Heads up: Checkpoint does not contain linear head. Starting with fresh linear head.")
 
     training_loop(
         '1a',
@@ -845,9 +879,6 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         supmoco_state=supmoco_state,
         unfreeze_epoch=-1,
         accumulation_steps=accumulation_steps,
-        online_evaluator=online_evaluator,
-        optimizer_eval=optimizer_eval,
-        criterion_eval=criterion_eval,
         dann_weight=config.loss.get('dann_weight', 1.0),
         dann_alpha=config.loss.get('dann_alpha', 1.0),
         subj_remapper=subj_remapper
@@ -862,10 +893,10 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
     subj_remapper = {actual_id: mapped_id for mapped_id, actual_id in enumerate(unique_subjects)}
     print(f"Dynamic DANN Subject Count: {num_dynamic_subjects} (Train Split)")
 
-    if isinstance(model, SpikingResNetClassifier):
+    if isinstance(model, SpikingMobileNetProjector):
         enc_class = model
     else:
-        enc_class = SpikingResNetClassifier(
+        enc_class = SpikingMobileNetProjector(
             encoder_backbone = model.encoder,
             num_classes=config.model.get('num_classes', 5),
             use_swiglu=config.model.get('use_swiglu', True),

@@ -1,4 +1,4 @@
-_target_: src.snn_modeling.models.unet.SpikingResNetClassifier
+_target_: src.snn_modeling.models.unet.SpikingMobileNetProjector
 num_classes: ${data.n_emotions}
 use_swiglu: false
 encoder_backbone: ${encoder}

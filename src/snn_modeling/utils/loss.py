@@ -348,13 +348,12 @@ class SupMoCoLoss(ContrastiveLoss):
             pos_weights = pos_mask * diff_subj_mask
 
             # 2. Hard Negatives: Labels differ, Subjects equal -> Weight = (1.0 + Dice)
-            #    Normal Negatives: Labels differ, Subjects differ -> Weight = 1.0
+            #    Normal Negatives: Labels differ, Subjects differ -> explicitly ignored (Weight = 0.0)
             dice_pair = self.sim_score[labels][:, all_labels]
             
             hard_neg_mask = neg_mask * same_subj_mask
-            normal_neg_mask = neg_mask * diff_subj_mask
             
-            neg_weights = (hard_neg_mask * (1.0 + dice_pair)) + normal_neg_mask
+            neg_weights = (hard_neg_mask * (1.0 + dice_pair))  # Normal negatives ignored!
         else:
             # Standard SupCon
             pos_weights = pos_mask.clone()
@@ -461,3 +460,54 @@ class FullHybridLoss(nn.Module):
             total_loss += tax_loss
         
         return total_loss
+
+class MultiKernelMMDLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def compute_median_distance(self, features):
+        """Compute median pairwise distance across all features for dynamic bandwidth."""
+        with torch.no_grad():
+            distances = torch.cdist(features, features, p=2.0)
+            upper_tri_indices = torch.triu_indices(distances.size(0), distances.size(1), offset=1)
+            pairwise_dists = distances[upper_tri_indices[0], upper_tri_indices[1]]
+            if pairwise_dists.numel() == 0:
+                return 1.0 # fallback
+            median_dist = torch.median(pairwise_dists).item()
+            return median_dist if median_dist > 1e-5 else 1.0
+
+    def forward(self, features, domain_labels):
+        """Calculates Multi-Kernel MMD across all pairs of domains natively present in the batch."""
+        unique_domains = torch.unique(domain_labels)
+        if len(unique_domains) < 2:
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
+
+        sigma_median = self.compute_median_distance(features)
+        bandwidths = [sigma_median / 4.0, sigma_median / 2.0, sigma_median, sigma_median * 2.0, sigma_median * 4.0]
+        
+        mmd_loss = 0.0
+        num_pairs = 0
+
+        # Precompute kernel matrix across ALL features once for efficiency
+        dist_sq = torch.cdist(features, features, p=2.0).pow(2)
+        kernel_matrix = torch.zeros_like(dist_sq)
+        for sigma in bandwidths:
+            gamma = 1.0 / (2 * (sigma ** 2))
+            kernel_matrix += torch.exp(-gamma * dist_sq)
+            
+        for i in range(len(unique_domains)):
+            for j in range(i + 1, len(unique_domains)):
+                domain_i = unique_domains[i]
+                domain_j = unique_domains[j]
+                
+                idx_i = (domain_labels == domain_i).nonzero(as_tuple=True)[0]
+                idx_j = (domain_labels == domain_j).nonzero(as_tuple=True)[0]
+                
+                K_ii = kernel_matrix[idx_i][:, idx_i].mean()
+                K_jj = kernel_matrix[idx_j][:, idx_j].mean()
+                K_ij = kernel_matrix[idx_i][:, idx_j].mean()
+                
+                mmd_loss += K_ii + K_jj - 2 * K_ij
+                num_pairs += 1
+                
+        return mmd_loss / num_pairs

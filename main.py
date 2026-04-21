@@ -9,7 +9,7 @@ from generate_dataset import run_data_setup
 from train import run_training, validate
 from test import test
 
-from src.snn_modeling.models.unet import SpikingResNetClassifier
+from src.snn_modeling.models.unet import SpikingMobileNetProjector
 from src.snn_modeling.utils.model_builder import build_model
 from src.snn_modeling.utils.utils import run_bio_audit, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject, generate_masks, calibrate_params
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
@@ -111,12 +111,12 @@ def main():
 
         model = build_model(config).to(device)
         
-        if isinstance(model, SpikingResNetClassifier):
+        if isinstance(model, SpikingMobileNetProjector):
             enc_class = model
         else:
             encoder_dict = getattr(config, 'encoder', {})
             use_bn = encoder_dict.get('use_batchnorm', False) if isinstance(encoder_dict, dict) or hasattr(encoder_dict, 'get') else False
-            enc_class = SpikingResNetClassifier(
+            enc_class = SpikingMobileNetProjector(
                 encoder_backbone = model.encoder,
                 num_classes=config.model.get('num_classes', 5),
                 use_swiglu=config.model.get('use_swiglu', False),
@@ -213,8 +213,8 @@ def main():
             print(f"Loaded checkpoint from {args.checkpoint}.")
         
         model = build_model(config).to(device)
-        if args.phase in ['1', '1a', '1b'] and not isinstance(model, SpikingResNetClassifier):
-            model = SpikingResNetClassifier(
+        if args.phase in ['1', '1a', '1b'] and not isinstance(model, SpikingMobileNetProjector):
+            model = SpikingMobileNetProjector(
                                             encoder_backbone = model.encoder,
                                             num_classes=config.model.get('num_classes', 5),
                                             use_swiglu=config.model.get('use_swiglu', False)
@@ -283,12 +283,12 @@ def main():
         model = build_model(config).to(device)
 
         if args.find_repr:
-            if isinstance(model, SpikingResNetClassifier):
+            if isinstance(model, SpikingMobileNetProjector):
                 enc_class = model
             else:
                 encoder_dict = getattr(config, 'encoder', {})
                 use_bn = encoder_dict.get('use_batchnorm', False) if isinstance(encoder_dict, dict) or hasattr(encoder_dict, 'get') else False
-                enc_class = SpikingResNetClassifier(
+                enc_class = SpikingMobileNetProjector(
                     encoder_backbone = model.encoder,
                     num_classes=config.model.get('num_classes', 5),
                     use_swiglu=config.model.get('use_swiglu', False),

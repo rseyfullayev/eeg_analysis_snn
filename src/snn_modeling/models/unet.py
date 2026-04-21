@@ -66,7 +66,7 @@ class UNet(nn.Module):
     def forward(self, x):
         raise NotImplementedError("This is a placeholder for the ANN UNet.")
 
-class SpikingResNetClassifier(nn.Module):
+class SpikingMobileNetProjector(nn.Module):
     def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False, use_batchnorm=False, use_dann=False, num_subjects=15):
         super().__init__()
 

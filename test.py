@@ -14,12 +14,27 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 try:
     from cuml.manifold import UMAP as cuUMAP
+    from cuml.linear_model import LogisticRegression as cuLogisticRegression
+    from cuml.svm import SVC as cuSVC
     _USE_CUML = True
-    print("[test.py] cuML UMAP detected — using GPU-accelerated UMAP.")
+    print("[test.py] cuML UMAP/LogReg/SVM detected — using GPU-accelerated variants.")
 except ImportError:
     import umap.umap_ as umap
     _USE_CUML = False
-    print("[test.py] cuML not available — falling back to CPU UMAP.")
+    print("[test.py] cuML not available — falling back to CPU scikit-learn.")
+
+def get_svm(**kwargs):
+    if _USE_CUML:
+        return cuSVC(kernel='linear')
+    else:
+        from sklearn.svm import LinearSVC
+        return LinearSVC(max_iter=1000)
+
+def get_logistic_regression(**kwargs):
+    if _USE_CUML:
+        return cuLogisticRegression(max_iter=1000)
+    else:
+        return LogisticRegression(max_iter=1000, solver='lbfgs', multi_class='multinomial', C=1.0)
 
 def make_umap(**kwargs):
     """Factory that returns a UMAP reducer using cuML (GPU) if available, else CPU umap-learn."""
@@ -57,12 +72,7 @@ def _knn_accuracy(emb_train, labels_train, emb_val, labels_val, k_values=(1, 3, 
 
 def _linear_probe_accuracy(emb_train, labels_train, emb_val, labels_val):
     """Logistic regression linear probe trained on one split, evaluated on another."""
-    clf = LogisticRegression(
-        max_iter=1000,
-        solver='lbfgs',
-        multi_class='multinomial',
-        C=1.0
-    )
+    clf = get_logistic_regression()
     clf.fit(emb_train, labels_train)
     preds_val = clf.predict(emb_val)
 
@@ -75,12 +85,29 @@ def _linear_probe_cv(emb, labels, groups, n_folds=5):
     preds_all, labels_all = [], []
 
     for train_idx, test_idx in sgkf.split(emb, labels, groups=groups):
-        clf = LogisticRegression(
-            max_iter=1000,
-            solver='lbfgs',
-            multi_class='multinomial',
-            C=1.0
-        )
+        clf = get_logistic_regression()
+        clf.fit(emb[train_idx], labels[train_idx])
+        preds_all.append(clf.predict(emb[test_idx]))
+        labels_all.append(labels[test_idx])
+
+    preds_all = np.concatenate(preds_all)
+    labels_all = np.concatenate(labels_all)
+    return balanced_accuracy_score(labels_all, preds_all)
+
+def _svm_probe_accuracy(emb_train, labels_train, emb_val, labels_val):
+    """Linear SVM probe trained on one split, evaluated on another."""
+    clf = get_svm()
+    clf.fit(emb_train, labels_train)
+    preds_val = clf.predict(emb_val)
+    return balanced_accuracy_score(labels_val, preds_val)
+
+def _svm_probe_cv(emb, labels, groups, n_folds=5):
+    """Intra-split linear SVM probe with StratifiedGroupKFold."""
+    sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    preds_all, labels_all = [], []
+
+    for train_idx, test_idx in sgkf.split(emb, labels, groups=groups):
+        clf = get_svm()
         clf.fit(emb[train_idx], labels[train_idx])
         preds_all.append(clf.predict(emb[test_idx]))
         labels_all.append(labels[test_idx])
@@ -136,7 +163,7 @@ def test(config, loso, subj, device, model):
         loso: Leave-one-subject-out ID (int or None).
         subj: Subject ID (int or None).
         device: torch device.
-        model: A SpikingResNetClassifier (or anything with an .encoder attribute).
+        model: A SpikingMobileNetProjector (or anything with an .encoder attribute).
     """
 
     model.eval()
@@ -388,13 +415,12 @@ def test(config, loso, subj, device, model):
     if not np.all(subj_train == -1):
         # 1. Evaluate predictability of Subject ID inside the Train set.
         # High accuracy = Subject ID is highly preserved. Low accuracy = Subject ID destroyed.
-        subj_cv_acc = _linear_probe_cv(emb_train, subj_train, groups_train, n_folds=5)
-        print(f"  Subject ID Prediction (Train Support, 5-fold CV): {subj_cv_acc:.4f}")
+        subj_cv_acc = _svm_probe_cv(emb_train, subj_train, groups_train, n_folds=5)
+        print(f"  Subject SVM Prediction (Train Support, 5-fold CV): {subj_cv_acc:.4f}")
         
         # 2. Fit on all Train subjects -> Predict on Test/Val set 
         # (Sanity check: Accuracy will inevitably be low for an unseen test subject)
-        from sklearn.linear_model import LogisticRegression
-        clf = LogisticRegression(solver='lbfgs', max_iter=1000, multi_class='multinomial')
+        clf = get_svm()
         clf.fit(emb_train, subj_train)
         subj_cross_acc = balanced_accuracy_score(subj_val, clf.predict(emb_val))
         print(f"  Subject ID Prediction (Train->Val cross-split):   {subj_cross_acc:.4f}")
@@ -431,6 +457,9 @@ def test(config, loso, subj, device, model):
         plt.close(fig_subj_tr)
         log_dict["Eval/UMAP_Subject_Train"] = wandb.Image(train_subj_umap_path, caption=f"UMAP Train by Subject")
         print(f"  Saved {train_subj_umap_path}")
+        
+        # We need preds_subj_val from the SVM for the val UMAP plot
+        preds_subj_val = clf.predict(emb_val)
 
         # Transform Val using Train-fitted UMAP, colored by Predicted TRAIN Subject IDs
         emb_val_2d_subj = train_reducer.transform(emb_val)
