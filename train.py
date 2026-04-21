@@ -378,7 +378,9 @@ def training_loop(phase,
                   dann_weight=1.0,
                   dann_alpha=1.0,
                   subj_remapper=None,
-                  probe_interval=5):
+                  probe_interval=5,
+                  use_mmd=False,
+                  lambda_mmd=0.0):
     
     # Phase 1A trackers
     best_train_loss = float('inf') if phase == '1a' else None
@@ -514,7 +516,6 @@ def training_loop(phase,
                         dann_loss_total += (loss_dann.item() * targets_c.size(0))
 
                 # --- MMD Domain Expansion ---
-                use_mmd = config.loss.get('use_mmd', False)
                 if use_mmd:
                     if not hasattr(model, 'mmd_fn'):
                         model.mmd_fn = MultiKernelMMDLoss()
@@ -526,7 +527,6 @@ def training_loop(phase,
                         mapped_tensor = subject_labels
                         
                     loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor)
-                    lambda_mmd = config.loss.get('lambda_mmd', 0.1)
                     loss = loss + (lambda_mmd * loss_mmd)
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
@@ -882,7 +882,9 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         accumulation_steps=accumulation_steps,
         dann_weight=config.loss.get('dann_weight', 1.0),
         dann_alpha=config.loss.get('dann_alpha', 1.0),
-        subj_remapper=subj_remapper
+        subj_remapper=subj_remapper,
+        use_mmd=config.loss.get('use_mmd', False),
+        lambda_mmd=config.loss.get('lambda_mmd', 0.0)
     )
    
 
@@ -1006,7 +1008,9 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         accumulation_steps=accumulation_steps,
         dann_weight=config.loss.get('dann_weight', 1.0),
         dann_alpha=config.loss.get('dann_alpha', 1.0),
-        subj_remapper=subj_remapper
+        subj_remapper=subj_remapper,
+        use_mmd=config.loss.get('use_mmd', False),
+        lambda_mmd=config.loss.get('lambda_mmd', 0.0)
     )
 
     
