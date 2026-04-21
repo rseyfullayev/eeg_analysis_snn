@@ -9,6 +9,7 @@ defaults:
 encoder:
   use_odconv: true
   use_batchnorm: false
+  p_drop: 0.3
 
 training:
   use_pk_sampler: true

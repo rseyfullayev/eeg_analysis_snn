@@ -527,7 +527,15 @@ def training_loop(phase,
                         mapped_tensor = subject_labels
                         
                     loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor, targets_c)
-                    loss = loss + (lambda_mmd * loss_mmd)
+
+                    # Ganin-like scheduler for MMD lambda
+                    plateau_epoch = 100
+                    current_step = epoch * len(train_loader) + batch_idx
+                    plateau_steps = plateau_epoch * len(train_loader)
+                    p = min(current_step / plateau_steps, 1.0)
+                    annealed_lambda_mmd = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * lambda_mmd
+                    
+                    loss = loss + (annealed_lambda_mmd * loss_mmd)
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
