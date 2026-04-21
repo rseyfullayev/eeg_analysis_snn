@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 #torch.autograd.set_detect_anomaly(True)
 torch.backends.cudnn.benchmark = True
+def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sweepnet.pt",
                     momentum_model=None, supmoco_state=None):
     payload = {
         'epoch': epoch,
