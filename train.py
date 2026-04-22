@@ -487,12 +487,19 @@ def training_loop(phase,
                                queue_video_ids=q_video_ids, queue_timestamps=q_timestamps)
 
                 # --- Offline Probe happens below in validation ---
-
+                target_lr_momentum = 0.75
                 # --- DANN (Domain Adversarial Neural Network) ---
                 if getattr(model, 'use_dann', False):
                     # Ganin et al. (2015) Alpha Annealing Schedule
                     # Progress p smoothly moves from 0 to 1 over the course of training phases
-                    p = (epoch * len(train_loader) + batch_idx) / (epochs * len(train_loader))
+
+                    plateau_ratio = math.acos(2.0 * target_lr_momentum - 1.0) / math.pi
+                    plateau_epoch = int(epochs * plateau_ratio)
+
+                    current_step = epoch * len(train_loader) + batch_idx
+                    plateau_steps = plateau_epoch * len(train_loader)
+
+                    p = min(1.0, current_step / plateau_steps)
                     annealed_alpha = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * dann_alpha
 
                     # Update GRL alpha if dynamically given
@@ -529,10 +536,14 @@ def training_loop(phase,
                     loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor.squeeze().long(), targets_c.squeeze().long())
 
                     # Ganin-like scheduler for MMD lambda
-                    plateau_epoch = 100
+                    plateau_ratio = math.acos(2.0 * target_lr_momentum - 1.0) / math.pi
+                    plateau_epoch = int(epochs * plateau_ratio)
+
                     current_step = epoch * len(train_loader) + batch_idx
                     plateau_steps = plateau_epoch * len(train_loader)
-                    p = min(current_step / plateau_steps, 1.0)
+
+                    p = min(1.0, current_step / plateau_steps)
+
                     annealed_lambda_mmd = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * lambda_mmd
                     
                     loss = loss + (annealed_lambda_mmd * loss_mmd)
