@@ -486,15 +486,15 @@ class MultiKernelMMDLoss(nn.Module):
 
     def forward(self, features, domain_labels, class_labels=None):
         """Calculates Multi-Kernel MMD across all pairs of domains natively present in the batch."""
+
+        features = F.normalize(features, dim=1) # L2 Normalization ensuring that Dual Loss lives in same hypersphere
+
         unique_domains = torch.unique(domain_labels)
         if len(unique_domains) < 2:
             return torch.tensor(0.0, device=features.device, requires_grad=True)
 
         sigma_median = self.compute_median_distance(features)
         bandwidths = [sigma_median / 4.0, sigma_median / 2.0, sigma_median, sigma_median * 2.0, sigma_median * 4.0]
-        
-        mmd_loss = 0.0
-        num_pairs = 0
 
         # Precompute kernel matrix across ALL features once for efficiency
         dist_sq = torch.cdist(features, features, p=2.0).pow(2)
@@ -503,37 +503,38 @@ class MultiKernelMMDLoss(nn.Module):
             gamma = 1.0 / (2 * (sigma ** 2))
             kernel_matrix += torch.exp(-gamma * dist_sq)
             
-        for i in range(len(unique_domains)):
-            for j in range(i + 1, len(unique_domains)):
-                domain_i = unique_domains[i]
-                domain_j = unique_domains[j]
-                
-                if class_labels is not None:
-                    # Class-conditional MMD
-                    unique_classes = torch.unique(class_labels)
-                    for c in unique_classes:
-                        idx_i_c = ((domain_labels == domain_i) & (class_labels == c)).nonzero(as_tuple=True)[0]
-                        idx_j_c = ((domain_labels == domain_j) & (class_labels == c)).nonzero(as_tuple=True)[0]
-                        
-                        if len(idx_i_c) > 0 and len(idx_j_c) > 0:
-                            K_ii = kernel_matrix[idx_i_c][:, idx_i_c].mean()
-                            K_jj = kernel_matrix[idx_j_c][:, idx_j_c].mean()
-                            K_ij = kernel_matrix[idx_i_c][:, idx_j_c].mean()
-                            
-                            mmd_loss += K_ii + K_jj - 2 * K_ij
-                            num_pairs += 1
-                else:
-                    idx_i = (domain_labels == domain_i).nonzero(as_tuple=True)[0]
-                    idx_j = (domain_labels == domain_j).nonzero(as_tuple=True)[0]
-                    
-                    K_ii = kernel_matrix[idx_i][:, idx_i].mean()
-                    K_jj = kernel_matrix[idx_j][:, idx_j].mean()
-                    K_ij = kernel_matrix[idx_i][:, idx_j].mean()
-                    
-                    mmd_loss += K_ii + K_jj - 2 * K_ij
-                    num_pairs += 1
-                
-        if num_pairs == 0:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
+        B = features.size(0)
+        max_class = class_labels.max()+1
+        group_ids = domain_labels * max_class + class_labels
+        
+        unique_groups, inverse_indices = torch.unique(group_ids, return_inverse=True)
+        G = unique_groups.size(0)
 
-        return mmd_loss / num_pairs
+        if G<2:
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
+        
+        H = F.one_hot(inverse_indices, num_classes=G).to(features.dtype)
+
+        group_counts = H.sum(dim=0)
+        H_norm = H / torch.clamp(group_counts, min=1.0).unsqueeze(0)
+
+        K_groups = torch.mm(torch.mm(H_norm.t(), kernel_matrix), H_norm)
+
+        group_domains = unique_groups // max_class
+        group_classes = unique_groups % max_class
+
+        same_class = (group_classes.unsqueeze(1) == group_classes.unsqueeze(0)).float()
+        diff_domain = (group_domains.unsqueeze(1) != group_domains.unsqueeze(0)).float()
+
+        valid_pairs = torch.triu(same_class * diff_domain, diagonal=1)
+        
+        K_self = torch.diag(K_groups)
+        MMD_matrix = K_self.unsqueeze(1) + K_self.unsqueeze(0) - 2.0*K_groups
+        num_pairs = valid_pairs.sum()
+
+        if num_pairs>0:
+            mmd_loss = (MMD_matrix * valid_pairs).sum() / num_pairs
+        else:
+            mmd_loss = torch.tensor(0.0, device=features.device, requires_grad=True)
+        
+        return mmd_loss

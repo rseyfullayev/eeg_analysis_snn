@@ -526,7 +526,7 @@ def training_loop(phase,
                     else:
                         mapped_tensor = subject_labels
                         
-                    loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor, targets_c)
+                    loss_mmd = model.mmd_fn(backbone_feats, mapped_tensor.squeeze().long(), targets_c.squeeze().long())
 
                     # Ganin-like scheduler for MMD lambda
                     plateau_epoch = 100
