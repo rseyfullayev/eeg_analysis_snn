@@ -284,6 +284,8 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
             print(f"[AdamW | Loss Base] {name}")
 
     # ── Build AdamW ──
+    # NOTE: Always keep all 5 groups even if empty, for checkpoint compatibility
+    # with legacy (pre-Muon) state dicts that always had 5 param groups.
     adam_groups = [
         {'params': adam_base_params, 'lr': lr, 'weight_decay': weight_decay},
         {'params': adam_encoder_params, 'lr': lr * 1e-2, 'weight_decay': weight_decay},
@@ -291,9 +293,7 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
         {'params': time_params, 'lr': lr * 0.5, 'weight_decay': 0.0},
         {'params': threshold_params, 'lr': lr * 1.0, 'weight_decay': 0.0},
     ]
-    # Filter out empty groups
-    adam_groups = [g for g in adam_groups if len(g['params']) > 0]
-    optimizer_adamw = optim.AdamW(adam_groups, betas=(0.9, 0.999)) if adam_groups else None
+    optimizer_adamw = optim.AdamW(adam_groups, betas=(0.9, 0.999))
 
     # ── Build Muon (if requested) ──
     optimizer_muon = None
