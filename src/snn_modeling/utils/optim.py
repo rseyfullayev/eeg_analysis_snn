@@ -13,21 +13,22 @@ import torch.optim as optim
 
 # ──────────────────────── Muon Wrapper ──────────────────────── #
 
-class Muon:
+class Muon(torch.optim.Muon):
     """Wrapper around torch.optim.Muon that handles >2D tensor reshaping.
 
     torch.optim.Muon expects 2D matrices for Newton-Schulz orthogonalization.
     Conv filters (e.g. [out, in, kH, kW]) must be reshaped to 2D
     [out, in*kH*kW] before the step, and restored to their original shape
     after. This wrapper handles that transparently.
-
-    The wrapper exposes the same interface as a standard optimizer so it
-    works seamlessly with HybridOptimizer/HybridScheduler.
     """
 
     def __init__(self, param_groups, lr=0.02, weight_decay=0.0, momentum=0.95):
         # Record original shapes for every >2D parameter
         self._nd_shapes = {}  # id(param) -> original shape
+        
+        # Ensure param_groups is a list so we can iterate it multiple times
+        param_groups = list(param_groups)
+        
         for group in param_groups:
             for p in group['params']:
                 if p.ndim > 2:
@@ -36,9 +37,7 @@ class Muon:
                     # its ndim==2 validation check
                     p.data = p.data.view(p.size(0), -1)
 
-        self._inner = torch.optim.Muon(
-            param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum
-        )
+        super().__init__(param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum)
 
         # Immediately restore original shapes so model.forward() works
         for group in param_groups:
@@ -49,7 +48,7 @@ class Muon:
     # --- Reshape helpers ---
     def _flatten_nd(self):
         """Reshape >2D param.data and param.grad to 2D [fan_out, fan_in]."""
-        for group in self._inner.param_groups:
+        for group in self.param_groups:
             for p in group['params']:
                 if id(p) in self._nd_shapes:
                     p.data = p.data.view(p.size(0), -1)
@@ -58,7 +57,7 @@ class Muon:
 
     def _restore_nd(self):
         """Restore >2D params back to their original shapes."""
-        for group in self._inner.param_groups:
+        for group in self.param_groups:
             for p in group['params']:
                 if id(p) in self._nd_shapes:
                     orig = self._nd_shapes[id(p)]
@@ -70,22 +69,9 @@ class Muon:
     @torch.no_grad()
     def step(self, closure=None):
         self._flatten_nd()
-        loss = self._inner.step(closure)
+        loss = super().step(closure)
         self._restore_nd()
         return loss
-
-    def zero_grad(self, set_to_none=True):
-        self._inner.zero_grad(set_to_none=set_to_none)
-
-    @property
-    def param_groups(self):
-        return self._inner.param_groups
-
-    def state_dict(self):
-        return self._inner.state_dict()
-
-    def load_state_dict(self, state_dict):
-        self._inner.load_state_dict(state_dict)
 
 
 # ──────────────────────── Hybrid Wrappers ──────────────────────── #
