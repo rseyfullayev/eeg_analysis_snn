@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss, SupMoCoLoss, MultiKernelMMDLoss
 from src.snn_modeling.utils.optim import Muon, HybridOptimizer, HybridScheduler
+from src.snn_modeling.utils.nan_monitor import NaNMonitor
+from src.snn_modeling.utils.live_tracker import LiveTracker
 from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
 from src.snn_modeling.utils.supmoco import SupMoCoState, build_momentum_encoder, momentum_update
 import os
@@ -296,7 +298,7 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
     ]
     optimizer_adamw = optim.AdamW(adam_groups, betas=(0.9, 0.999))
 
-    # ── Build Muon (if requested) ──
+    # ── Build Muon (if requested) — uses torch.optim.Muon (PyTorch >= 2.9) ──
     optimizer_muon = None
     if use_muon:
         muon_lr = config.training.get('muon_lr', 0.02)
@@ -310,7 +312,7 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
             optimizer_muon = Muon(muon_groups, lr=muon_lr, weight_decay=weight_decay, momentum=muon_momentum)
             n_muon = sum(p.numel() for g in muon_groups for p in g['params'])
             n_adam = sum(p.numel() for g in adam_groups for p in g['params']) if adam_groups else 0
-            print(f"\n=== Muon+AdamW Hybrid ===")
+            print(f"\n=== Muon+AdamW Hybrid (torch.optim.Muon) ===")
             print(f"  Muon params:  {n_muon:,}")
             print(f"  AdamW params: {n_adam:,}")
             print(f"  Muon LR: {muon_lr} | AdamW LR: {lr}\n")
@@ -462,18 +464,26 @@ def training_loop(phase,
                   subj_remapper=None,
                   probe_interval=5,
                   use_mmd=False,
-                  lambda_mmd=0.0):
+                  lambda_mmd=0.0,
+                  live_tracker=None):
     
     # Phase 1A trackers
     best_train_loss = float('inf') if phase == '1a' else None
     best_linear_acc = 0.0
 
-    #temp_mix = TemporalMix()
+    # NaN/Inf monitor with diagnostic reasoning
+    if live_tracker is None:
+        live_tracker = LiveTracker()  # disabled fallback (no credentials)
+    nan_monitor = NaNMonitor(model, verbose=True, max_reports_per_epoch=5, live_tracker=live_tracker)
+
+    device_info = str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "CPU"
+    live_tracker.training_started(phase, epochs, device_info=device_info)
 
     for epoch in range(start_epoch, epochs):
         model.train()
         loss_fn.current_epoch = epoch
         loss_fn.step_count = 0
+        nan_monitor.reset_epoch()
 
         if unfreeze_epoch > 0:
             if epoch < unfreeze_epoch:
@@ -556,6 +566,10 @@ def training_loop(phase,
                     backbone_feats = backbone_feats.view(B, K_bag, *backbone_feats.shape[1:]).mean(dim=1)
                 outputs = model.classifier(backbone_feats)
 
+                # Monitor: check activations after forward
+                nan_monitor.check_activations(epoch=epoch, batch_idx=batch_idx,
+                                              backbone_feats=backbone_feats, outputs=outputs)
+
                 with torch.no_grad():
                     key_features = momentum_model(k_inputs, K=K_bag)
                     if K_bag is not None and key_features.shape[0] == B * K_bag:
@@ -568,44 +582,59 @@ def training_loop(phase,
                                query_video_ids=video_ids, query_timestamps=timestamps,
                                queue_video_ids=q_video_ids, queue_timestamps=q_timestamps)
 
+                # Monitor: check loss
+                nan_monitor.check_loss(epoch=epoch, batch_idx=batch_idx, contrastive_loss=loss)
+
                 # --- Offline Probe happens below in validation ---
                 target_lr_momentum = 0.75
                 # --- DANN (Domain Adversarial Neural Network) ---
                 if getattr(model, 'use_dann', False):
-                    # Ganin et al. (2015) Alpha Annealing Schedule
-                    # Progress p smoothly moves from 0 to 1 over the course of training phases
+                    # Safety: skip DANN if backbone features contain NaN/Inf
+                    if torch.isfinite(backbone_feats).all():
+                        # Ganin et al. (2015) Alpha Annealing Schedule
+                        # Progress p smoothly moves from 0 to 1 over the course of training phases
 
-                    plateau_ratio = math.acos(2.0 * target_lr_momentum - 1.0) / math.pi
-                    plateau_epoch = int(epochs * plateau_ratio)
+                        plateau_ratio = math.acos(2.0 * target_lr_momentum - 1.0) / math.pi
+                        plateau_epoch = int(epochs * plateau_ratio)
 
-                    current_step = epoch * len(train_loader) + batch_idx
-                    plateau_steps = plateau_epoch * len(train_loader)
+                        current_step = epoch * len(train_loader) + batch_idx
+                        plateau_steps = plateau_epoch * len(train_loader)
 
-                    p = min(1.0, current_step / plateau_steps)
-                    annealed_alpha = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * dann_alpha
+                        p = min(1.0, current_step / plateau_steps)
+                        annealed_alpha = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * dann_alpha
 
-                    # Update GRL alpha if dynamically given
-                    if hasattr(model, 'dann_head') and hasattr(model.dann_head[0], 'alpha'):
-                        model.dann_head[0].alpha = annealed_alpha
+                        # Update GRL alpha if dynamically given
+                        if hasattr(model, 'dann_head') and hasattr(model.dann_head[0], 'alpha'):
+                            model.dann_head[0].alpha = annealed_alpha
 
-                    subj_preds = model.dann_head(backbone_feats)
-                    
-                    if subj_remapper is not None:
-                        mapped_labels = [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels]
-                        mapped_tensor = torch.tensor(mapped_labels, device=device, dtype=torch.long)
+                        subj_preds = model.dann_head(backbone_feats)
+
+                        # Monitor: check DANN head for GRL instability
+                        nan_monitor.check_dann(backbone_feats, subj_preds, annealed_alpha,
+                                               epoch=epoch, batch_idx=batch_idx)
+                        
+                        if subj_remapper is not None:
+                            mapped_labels = [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels]
+                            mapped_tensor = torch.tensor(mapped_labels, device=device, dtype=torch.long)
+                        else:
+                            mapped_tensor = subject_labels
+
+                        loss_dann = F.cross_entropy(subj_preds, mapped_tensor)
+                        loss = loss + (dann_weight * loss_dann)
+
+                        # Monitor: check DANN loss
+                        nan_monitor.check_loss(epoch=epoch, batch_idx=batch_idx, loss_dann=loss_dann)
+                        
+                        with torch.no_grad():
+                            train_dann_correct += (subj_preds.argmax(dim=1) == mapped_tensor).sum().item()
+                            train_dann_total += mapped_tensor.size(0)
+                            dann_loss_total += (loss_dann.item() * targets_c.size(0))
                     else:
-                        mapped_tensor = subject_labels
-
-                    loss_dann = F.cross_entropy(subj_preds, mapped_tensor)
-                    loss = loss + (dann_weight * loss_dann)
-                    
-                    with torch.no_grad():
-                        train_dann_correct += (subj_preds.argmax(dim=1) == mapped_tensor).sum().item()
-                        train_dann_total += mapped_tensor.size(0)
-                        dann_loss_total += (loss_dann.item() * targets_c.size(0))
+                        if batch_idx == 0:
+                            print("  [DANN] Skipping — NaN/Inf detected in backbone features")
 
                 # --- MMD Domain Expansion ---
-                if use_mmd:
+                if use_mmd and torch.isfinite(backbone_feats).all():
                     if not hasattr(model, 'mmd_fn'):
 
                         model.mmd_fn = MultiKernelMMDLoss()
@@ -662,8 +691,15 @@ def training_loop(phase,
             is_step = ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(train_loader))
 
             if is_step:
+                # Monitor: check gradients after backward
+                nan_monitor.check_gradients(epoch=epoch, batch_idx=batch_idx)
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+
+                # Monitor: check weights after optimizer step
+                nan_monitor.check_weights(epoch=epoch, batch_idx=batch_idx)
+
                 if phase in [1, '1a', '1b'] and use_supmoco:
                     momentum_update(model, momentum_model, moco_momentum)
                 optimizer.zero_grad(set_to_none=True)
@@ -693,11 +729,25 @@ def training_loop(phase,
             torch.cuda.empty_cache()
         gc.collect()
 
+        # NaN Monitor epoch summary
+        nan_monitor.summary()
+
         avg_train_loss = train_loss / len(train_loader)
-          
+
         val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase in [1, '1a', '1b'])
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
+
+        # --- Live Tracker: epoch summary ---
+        epoch_metrics = {
+            "train_loss": avg_train_loss,
+            "val_loss": val_loss,
+            "val_bal_acc": val_bal_acc,
+            "lr": current_lr,
+        }
+        if getattr(model, 'use_dann', False) and train_dann_total > 0:
+            epoch_metrics["dann_acc"] = train_dann_correct / max(train_dann_total, 1)
+            epoch_metrics["dann_loss"] = dann_loss_total / max(train_dann_total, 1)
 
         # --- Offline Probes (Phase 1A only) ---
         val_linear_acc = 0.0
@@ -767,6 +817,14 @@ def training_loop(phase,
             print(f"  Offline Probes — Emotion Train CV: {train_linear_acc:.4f} | Val Bal Acc: {val_linear_acc:.4f}")
             print(f"  Proxy-A Probes — Subject Train CV (SVM): {subj_cv_acc:.4f} | Val Cross Acc (SVM): {subj_cross_acc:.4f}")
 
+            # Live Tracker: probe results
+            live_tracker.probe_results(phase, epoch, {
+                "emotion_train_cv": train_linear_acc,
+                "emotion_val": val_linear_acc,
+                "subject_train_cv": subj_cv_acc,
+                "subject_val_cross": subj_cross_acc,
+            })
+
         # --- DANN Logging ---
         if getattr(model, 'use_dann', False):
             train_dann_acc = train_dann_correct / max(train_dann_total, 1)
@@ -832,6 +890,8 @@ def training_loop(phase,
                                 momentum_model=momentum_model, supmoco_state=supmoco_state)
                 os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best.pt")
                 wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
+                live_tracker.checkpoint_saved(f"{checkpoint_dir}/checkpoint_best.pt",
+                                             "train_loss", avg_train_loss)
             else:
                 print(f"Best Train Loss yet: {best_train_loss:.4f}")
 
@@ -844,6 +904,8 @@ def training_loop(phase,
                 os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best_linear.pt")
                 wandb.save(f"{checkpoint_dir}/checkpoint_best_linear.pt")
                 print(f"  New best Linear Eval Acc: {best_linear_acc:.4f}")
+                live_tracker.checkpoint_saved(f"{checkpoint_dir}/checkpoint_best_linear.pt",
+                                             "linear_eval_acc", best_linear_acc)
         else:
             # Phase 2+: original acc/dice logic
             if val_acc > best_acc:
@@ -853,6 +915,8 @@ def training_loop(phase,
                                 f"{checkpoint_dir}/checkpoint_temp.pt")
                 os.replace(f"{checkpoint_dir}/checkpoint_temp.pt", f"{checkpoint_dir}/checkpoint_best.pt")
                 wandb.save(f"{checkpoint_dir}/checkpoint_best.pt")
+                live_tracker.checkpoint_saved(f"{checkpoint_dir}/checkpoint_best.pt",
+                                             "val_acc", best_acc)
             elif val_acc == best_acc and val_dice > best_dice:
                 best_dice = val_dice
                 save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
@@ -862,9 +926,15 @@ def training_loop(phase,
 
         wandb.log(log_dict, step=epoch)
 
+        # Live Tracker: epoch summary (after all metrics computed)
+        live_tracker.epoch_summary(phase, epoch, epochs, epoch_metrics)
+
 
 def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
     print("=== Phase 1A: Training Encoder Only (Old Style, No MIL/Bagging, No SwiGLU) ===")
+
+    # Live tracker (Telegram/Discord)
+    live_tracker = LiveTracker(config=config)
     
     if config.training.get('bagging', False):
         print("WARNING: 'bagging' is set to True in config, but Phase 1A enforces old-style 1s windows. Ensure dataset complies!")
@@ -988,12 +1058,16 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         dann_alpha=config.loss.get('dann_alpha', 1.0),
         subj_remapper=subj_remapper,
         use_mmd=config.loss.get('use_mmd', False),
-        lambda_mmd=config.loss.get('lambda_mmd', 0.0)
+        lambda_mmd=config.loss.get('lambda_mmd', 0.0),
+        live_tracker=live_tracker
     )
    
 
 def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
     print("=== Phase 1B: Training Encoder with MIL/Bagging & Arch Upgrades ===")
+
+    # Live tracker (Telegram/Discord)
+    live_tracker = LiveTracker(config=config)
     
     unique_subjects = sorted(list(set([s[3] for s in train_loader.dataset.samples if s[3] != -1])))
     num_dynamic_subjects = max(len(unique_subjects), 1)
@@ -1114,7 +1188,8 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         dann_alpha=config.loss.get('dann_alpha', 1.0),
         subj_remapper=subj_remapper,
         use_mmd=config.loss.get('use_mmd', False),
-        lambda_mmd=config.loss.get('lambda_mmd', 0.0)
+        lambda_mmd=config.loss.get('lambda_mmd', 0.0),
+        live_tracker=live_tracker
     )
 
     

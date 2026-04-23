@@ -489,6 +489,10 @@ class MultiKernelMMDLoss(nn.Module):
 
         features = F.normalize(features, dim=1) # L2 Normalization ensuring that Dual Loss lives in same hypersphere
 
+        # Safety: bail out if features are degenerate (NaN/Inf from collapse or overflow)
+        if not torch.isfinite(features).all():
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
+
         unique_domains = torch.unique(domain_labels)
         if len(unique_domains) < 2:
             return torch.tensor(0.0, device=features.device, requires_grad=True)

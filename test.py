@@ -23,6 +23,21 @@ except ImportError:
     _USE_CUML = False
     print("[test.py] cuML not available — falling back to CPU scikit-learn.")
 
+def _features_are_degenerate(emb):
+    """Check if features are degenerate (NaN, Inf, or zero variance across all columns).
+    
+    This happens during representational collapse (common early in Muon training).
+    cuML's SVM computes gamma = 1 / (n_cols * x_var), which causes ZeroDivisionError
+    when variance is zero. cuML LogReg L-BFGS also produces NaN on degenerate inputs.
+    """
+    if np.any(np.isnan(emb)) or np.any(np.isinf(emb)):
+        return True
+    # Check if ALL features have zero variance (representational collapse)
+    col_var = np.var(emb, axis=0)
+    if np.all(col_var < 1e-12):
+        return True
+    return False
+
 def get_svm(**kwargs):
     if _USE_CUML:
         return cuSVC(kernel='linear')
@@ -72,46 +87,77 @@ def _knn_accuracy(emb_train, labels_train, emb_val, labels_val, k_values=(1, 3, 
 
 def _linear_probe_accuracy(emb_train, labels_train, emb_val, labels_val):
     """Logistic regression linear probe trained on one split, evaluated on another."""
-    clf = get_logistic_regression()
-    clf.fit(emb_train, labels_train)
-    preds_val = clf.predict(emb_val)
-
-    return balanced_accuracy_score(labels_val, preds_val)
+    if _features_are_degenerate(emb_train) or _features_are_degenerate(emb_val):
+        print("  [LinearProbe] Skipped — degenerate features (NaN/Inf/zero-var)")
+        return 0.0
+    try:
+        clf = get_logistic_regression()
+        clf.fit(emb_train, labels_train)
+        preds_val = clf.predict(emb_val)
+        return balanced_accuracy_score(labels_val, preds_val)
+    except Exception as e:
+        print(f"  [LinearProbe] Failed: {e}")
+        return 0.0
 
 
 def _linear_probe_cv(emb, labels, groups, n_folds=5):
     """Intra-split linear probe with StratifiedGroupKFold to prevent session leakage."""
+    if _features_are_degenerate(emb):
+        print("  [LinearProbeCV] Skipped — degenerate features (NaN/Inf/zero-var)")
+        return 0.0
     sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=42)
     preds_all, labels_all = [], []
 
     for train_idx, test_idx in sgkf.split(emb, labels, groups=groups):
-        clf = get_logistic_regression()
-        clf.fit(emb[train_idx], labels[train_idx])
-        preds_all.append(clf.predict(emb[test_idx]))
-        labels_all.append(labels[test_idx])
+        try:
+            clf = get_logistic_regression()
+            clf.fit(emb[train_idx], labels[train_idx])
+            preds_all.append(clf.predict(emb[test_idx]))
+            labels_all.append(labels[test_idx])
+        except Exception as e:
+            print(f"  [LinearProbeCV] Fold failed: {e}")
+            continue
 
+    if len(preds_all) == 0:
+        return 0.0
     preds_all = np.concatenate(preds_all)
     labels_all = np.concatenate(labels_all)
     return balanced_accuracy_score(labels_all, preds_all)
 
 def _svm_probe_accuracy(emb_train, labels_train, emb_val, labels_val):
     """Linear SVM probe trained on one split, evaluated on another."""
-    clf = get_svm()
-    clf.fit(emb_train, labels_train)
-    preds_val = clf.predict(emb_val)
-    return balanced_accuracy_score(labels_val, preds_val)
+    if _features_are_degenerate(emb_train) or _features_are_degenerate(emb_val):
+        print("  [SVMProbe] Skipped — degenerate features (NaN/Inf/zero-var)")
+        return 0.0
+    try:
+        clf = get_svm()
+        clf.fit(emb_train, labels_train)
+        preds_val = clf.predict(emb_val)
+        return balanced_accuracy_score(labels_val, preds_val)
+    except Exception as e:
+        print(f"  [SVMProbe] Failed: {e}")
+        return 0.0
 
 def _svm_probe_cv(emb, labels, groups, n_folds=5):
     """Intra-split linear SVM probe with StratifiedGroupKFold."""
+    if _features_are_degenerate(emb):
+        print("  [SVMProbeCV] Skipped — degenerate features (NaN/Inf/zero-var)")
+        return 0.0
     sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=42)
     preds_all, labels_all = [], []
 
     for train_idx, test_idx in sgkf.split(emb, labels, groups=groups):
-        clf = get_svm()
-        clf.fit(emb[train_idx], labels[train_idx])
-        preds_all.append(clf.predict(emb[test_idx]))
-        labels_all.append(labels[test_idx])
+        try:
+            clf = get_svm()
+            clf.fit(emb[train_idx], labels[train_idx])
+            preds_all.append(clf.predict(emb[test_idx]))
+            labels_all.append(labels[test_idx])
+        except Exception as e:
+            print(f"  [SVMProbeCV] Fold failed: {e}")
+            continue
 
+    if len(preds_all) == 0:
+        return 0.0
     preds_all = np.concatenate(preds_all)
     labels_all = np.concatenate(labels_all)
     return balanced_accuracy_score(labels_all, preds_all)
@@ -420,9 +466,18 @@ def test(config, loso, subj, device, model):
         
         # 2. Fit on all Train subjects -> Predict on Test/Val set 
         # (Sanity check: Accuracy will inevitably be low for an unseen test subject)
-        clf = get_svm()
-        clf.fit(emb_train, subj_train)
-        subj_cross_acc = balanced_accuracy_score(subj_val, clf.predict(emb_val))
+        subj_cross_acc = 0.0
+        clf = None
+        if not _features_are_degenerate(emb_train) and not _features_are_degenerate(emb_val):
+            try:
+                clf = get_svm()
+                clf.fit(emb_train, subj_train)
+                subj_cross_acc = balanced_accuracy_score(subj_val, clf.predict(emb_val))
+            except Exception as e:
+                print(f"  [Proxy-A] Cross-split SVM failed: {e}")
+                clf = None
+        else:
+            print("  [Proxy-A] Skipped cross-split — degenerate features")
         print(f"  Subject ID Prediction (Train->Val cross-split):   {subj_cross_acc:.4f}")
         
         log_dict["Eval/ProxyA_Subject_TrainCV"] = subj_cv_acc
@@ -459,26 +514,29 @@ def test(config, loso, subj, device, model):
         print(f"  Saved {train_subj_umap_path}")
         
         # We need preds_subj_val from the SVM for the val UMAP plot
-        preds_subj_val = clf.predict(emb_val)
+        if clf is not None:
+            preds_subj_val = clf.predict(emb_val)
 
-        # Transform Val using Train-fitted UMAP, colored by Predicted TRAIN Subject IDs
-        emb_val_2d_subj = train_reducer.transform(emb_val)
-        
-        fig_subj_val, ax_subj_val = plt.subplots(figsize=(10, 8))
-        sns.scatterplot(
-            x=emb_val_2d_subj[:, 0], y=emb_val_2d_subj[:, 1],
-            hue=preds_subj_val, palette=palette_subj_train, hue_order=unique_train_subjs,
-            s=15, alpha=0.7, ax=ax_subj_val, legend='full'
-        )
-        ax_subj_val.set_title(f"Val UMAP (Train-Fitted) Colored by PRED Train Subj ID — {id_label}")
-        ax_subj_val.legend(title='Pred Train Subj', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
-        fig_subj_val.tight_layout()
-        
-        val_subj_umap_path = f"evidence/umap_val_subject_{suffix}.png"
-        fig_subj_val.savefig(val_subj_umap_path, dpi=150)
-        plt.close(fig_subj_val)
-        log_dict["Eval/UMAP_Subject_Val"] = wandb.Image(val_subj_umap_path, caption=f"UMAP Val by Subject (Train-Fitted trans.)")
-        print(f"  Saved {val_subj_umap_path}")
+            # Transform Val using Train-fitted UMAP, colored by Predicted TRAIN Subject IDs
+            emb_val_2d_subj = train_reducer.transform(emb_val)
+            
+            fig_subj_val, ax_subj_val = plt.subplots(figsize=(10, 8))
+            sns.scatterplot(
+                x=emb_val_2d_subj[:, 0], y=emb_val_2d_subj[:, 1],
+                hue=preds_subj_val, palette=palette_subj_train, hue_order=unique_train_subjs,
+                s=15, alpha=0.7, ax=ax_subj_val, legend='full'
+            )
+            ax_subj_val.set_title(f"Val UMAP (Train-Fitted) Colored by PRED Train Subj ID — {id_label}")
+            ax_subj_val.legend(title='Pred Train Subj', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
+            fig_subj_val.tight_layout()
+            
+            val_subj_umap_path = f"evidence/umap_val_subject_{suffix}.png"
+            fig_subj_val.savefig(val_subj_umap_path, dpi=150)
+            plt.close(fig_subj_val)
+            log_dict["Eval/UMAP_Subject_Val"] = wandb.Image(val_subj_umap_path, caption=f"UMAP Val by Subject (Train-Fitted trans.)")
+            print(f"  Saved {val_subj_umap_path}")
+        else:
+            print("  [Proxy-A] Skipping Val Subject UMAP — SVM not fitted")
 
         
     else:

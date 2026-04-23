@@ -1,13 +1,7 @@
 """
 Muon (MomentUm Orthogonalized by Newton-schulz) optimizer and hybrid wrappers.
 
-Reference: https://kellerjordan.github.io/posts/muon/
-Based on: https://github.com/KellerJordan/Muon
-
-Muon internally runs standard SGD-momentum, and then performs an orthogonalization
-post-processing step, in which each 2D parameter's update is replaced with the
-nearest orthogonal matrix via Newton-Schulz iteration.
-
+Uses the official torch.optim.Muon (PyTorch >= 2.9) for the core optimizer.
 Muon should only be used for hidden weight layers (ndim >= 2).
 Biases, normalization parameters, SNN neuron dynamics, and other 1D/scalar
 parameters should be optimized using a standard method such as AdamW.
@@ -17,85 +11,72 @@ import torch
 import torch.optim as optim
 
 
-# ──────────────────────── Newton-Schulz core ──────────────────────── #
+# ──────────────────────── Muon Wrapper ──────────────────────── #
 
-def zeropower_via_newtonschulz5(G, steps: int = 5):
-    """Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+class Muon:
+    """Wrapper around torch.optim.Muon that handles >2D tensor reshaping.
 
-    Uses a quintic iteration whose coefficients are selected to maximize the
-    slope at zero for rapid convergence in bfloat16 on GPU.
-    """
-    assert G.ndim >= 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    torch.optim.Muon expects 2D matrices for Newton-Schulz orthogonalization.
+    Conv filters (e.g. [out, in, kH, kW]) must be reshaped to 2D
+    [out, in*kH*kW] before the step, and restored to their original shape
+    after. This wrapper handles that transparently.
 
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
-
-def muon_update(grad, momentum_buf, beta=0.95, ns_steps=5, nesterov=True):
-    """Compute a single Muon update: momentum + Newton-Schulz orthogonalization."""
-    original_shape = grad.shape
-    momentum_buf.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum_buf, beta) if nesterov else momentum_buf
-    if update.ndim > 2:  # conv / higher-dim filters: collapse to 2D for NS
-        update = update.view(update.size(0), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
-    return update.view(original_shape)
-
-
-# ──────────────────────── Single-device Muon ──────────────────────── #
-
-class Muon(torch.optim.Optimizer):
-    """Single-device Muon optimizer for >= 2D hidden-layer parameters.
-
-    Args:
-        params: List of parameters (must all be ndim >= 2).
-        lr: Learning rate in units of spectral norm per update.
-        weight_decay: AdamW-style weight decay.
-        momentum: Momentum coefficient (0.95 is typically fine).
-        ns_steps: Number of Newton-Schulz iterations.
+    The wrapper exposes the same interface as a standard optimizer so it
+    works seamlessly with HybridOptimizer/HybridScheduler.
     """
 
-    def __init__(self, params, lr=0.02, weight_decay=0.0, momentum=0.95, ns_steps=5):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, ns_steps=ns_steps)
-        super().__init__(params, defaults)
+    def __init__(self, param_groups, lr=0.02, weight_decay=0.0, momentum=0.95):
+        # Record original shapes for every >2D parameter
+        self._nd_shapes = {}  # id(param) -> original shape
+        for group in param_groups:
+            for p in group['params']:
+                if p.ndim > 2:
+                    self._nd_shapes[id(p)] = p.shape
 
+        self._inner = torch.optim.Muon(
+            param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum
+        )
+
+    # --- Reshape helpers ---
+    def _flatten_nd(self):
+        """Reshape >2D param.data and param.grad to 2D [fan_out, fan_in]."""
+        for group in self._inner.param_groups:
+            for p in group['params']:
+                if id(p) in self._nd_shapes:
+                    p.data = p.data.view(p.size(0), -1)
+                    if p.grad is not None:
+                        p.grad = p.grad.view(p.size(0), -1)
+
+    def _restore_nd(self):
+        """Restore >2D params back to their original shapes."""
+        for group in self._inner.param_groups:
+            for p in group['params']:
+                if id(p) in self._nd_shapes:
+                    orig = self._nd_shapes[id(p)]
+                    p.data = p.data.view(orig)
+                    if p.grad is not None:
+                        p.grad = p.grad.view(orig)
+
+    # --- Core optimizer interface ---
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                state = self.state[p]
-                if len(state) == 0:
-                    state["momentum_buffer"] = torch.zeros_like(p)
-                update = muon_update(
-                    p.grad, state["momentum_buffer"],
-                    beta=group["momentum"],
-                    ns_steps=group["ns_steps"],
-                )
-                p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(update.reshape(p.shape), alpha=-group["lr"])
-
+        self._flatten_nd()
+        loss = self._inner.step(closure)
+        self._restore_nd()
         return loss
+
+    def zero_grad(self, set_to_none=True):
+        self._inner.zero_grad(set_to_none=set_to_none)
+
+    @property
+    def param_groups(self):
+        return self._inner.param_groups
+
+    def state_dict(self):
+        return self._inner.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self._inner.load_state_dict(state_dict)
 
 
 # ──────────────────────── Hybrid Wrappers ──────────────────────── #
