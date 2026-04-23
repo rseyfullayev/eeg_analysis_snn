@@ -19,6 +19,9 @@ training:
   use_supmoco: true
   supmoco_momentum: 0.9
   supmoco_queue_size: 512
+  use_muon: true
+  muon_lr: 0.02
+  muon_momentum: 0.95
   
 
 

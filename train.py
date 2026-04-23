@@ -8,6 +8,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from src.snn_modeling.utils.loss import FullHybridLoss, TopKClassificationLoss, ContrastiveLoss, SupMoCoLoss, MultiKernelMMDLoss
+from src.snn_modeling.utils.optim import Muon, HybridOptimizer, HybridScheduler
 from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
 from src.snn_modeling.utils.supmoco import SupMoCoState, build_momentum_encoder, momentum_update
 import os
@@ -191,16 +192,19 @@ def freeze_bn_stats(module):
 
 def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
     lr = config.training.get('learning_rate', 1e-3)
-    encoder_params = []
-    base_params = []
-    base_params_no_decay = []
-    time_params = []
-    threshold_params = []
+    use_muon = config.training.get('use_muon', False)
+    weight_decay = config.training.get('weight_decay', 1e-4)
+
+    # ── Identify special (no-decay) parameter IDs ──
     no_decay_id = set()
     classess_names = (snn.Leaky, snn.Synaptic, snn.Alpha, 
                       ALIF, TopKClassificationLoss, 
                       nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, 
                       nn.LayerNorm, nn.GroupNorm, nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)
+    # ── Identify depthwise conv weight IDs (ban from Muon) ──
+    # Depthwise convs have groups == in_channels; their per-channel kernels are
+    # independent, so Newton-Schulz orthogonalization across them is invalid.
+    depthwise_id = set()
     for m in model.modules():
         if isinstance(m, classess_names):
             for param in m.parameters(recurse=False):
@@ -209,48 +213,125 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
             no_decay_id.add(id(m.bias))
         if hasattr(m, 'gain') and m.gain is not None:
              no_decay_id.add(id(m.gain))
+        if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+            if m.groups == m.in_channels and m.groups > 1:
+                depthwise_id.add(id(m.weight))
     for m in loss_fn.modules():
         if isinstance(m, classess_names):
             for param in m.parameters(recurse=False):
                 no_decay_id.add(id(param))      
 
+    # ── Classify every parameter ──
+    _SPECIAL_KEYS = ('alpha', 'beta', 'slope', 'decay', 'gamma', 'recurrent')
+
+    # AdamW buckets (always used)
+    adam_base_params = []
+    adam_encoder_params = []
+    adam_no_decay_params = []
+    time_params = []
+    threshold_params = []
+
+    # Muon buckets (only populated when use_muon=True)
+    muon_params = []
+    muon_encoder_params = []
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'alpha' in name or 'beta' in name or 'slope' in name or 'decay' in name or 'gamma' in name or 'recurrent' in name:
-            time_params.append(param)
-            print(f"Special LR for Time Param: {name}")
-        elif 'threshold' in name:
-            threshold_params.append(param)
-            print(f"Special LR for Threshold Param: {name}")
-        elif id(param) in no_decay_id:
-            base_params_no_decay.append(param)
-            print(f"No Decay Param: {name}")
-        elif low_encoder_lr and 'encoder' in name:
-            encoder_params.append(param)
-            print(f"Encoder Low LR Param: {name}")
-        else:
-            base_params.append(param)
-            print(f"Base Decay Param: {name}")
 
+        is_special_key = any(k in name for k in _SPECIAL_KEYS)
+        is_no_decay = id(param) in no_decay_id
+        is_threshold = 'threshold' in name
+
+        # 1. Time-constant params → AdamW with reduced LR
+        if is_special_key:
+            time_params.append(param)
+            print(f"[AdamW | Time] {name}")
+        # 2. Threshold params → AdamW
+        elif is_threshold:
+            threshold_params.append(param)
+            print(f"[AdamW | Threshold] {name}")
+        # 3. No-decay params (norms, biases, gains) → AdamW
+        elif is_no_decay:
+            adam_no_decay_params.append(param)
+            print(f"[AdamW | No-Decay] {name}")
+        # 4. Muon-eligible: ndim >= 2, not special, not depthwise conv
+        elif use_muon and param.ndim >= 2 and id(param) not in depthwise_id:
+            if low_encoder_lr and 'encoder' in name:
+                muon_encoder_params.append(param)
+                print(f"[Muon | Encoder] {name}")
+            else:
+                muon_params.append(param)
+                print(f"[Muon] {name}")
+        # 5. Everything else (including depthwise conv weights) → AdamW base
+        else:
+            if low_encoder_lr and 'encoder' in name:
+                adam_encoder_params.append(param)
+                print(f"[AdamW | Encoder Low-LR] {name}")
+            else:
+                adam_base_params.append(param)
+                print(f"[AdamW | Base] {name}")
+
+    # Loss function parameters → always AdamW
     for name, param in loss_fn.named_parameters():
         if not param.requires_grad:
             continue
         if id(param) in no_decay_id:
-            base_params_no_decay.append(param)
-            print(f"No Decay Param: {name}")
+            adam_no_decay_params.append(param)
+            print(f"[AdamW | Loss No-Decay] {name}")
         else:
-            base_params.append(param)
-            print(f"Base Decay Param: {name}")
-    optimizer = optim.AdamW([
-        {'params': base_params, 'lr': lr, 'weight_decay': config.training.get('weight_decay', 1e-4)},
-        {'params': encoder_params, 'lr': lr * 1e-2, 'weight_decay': config.training.get('weight_decay', 1e-4)},
-        {'params': base_params_no_decay, 'lr': lr, 'weight_decay': 0.0},
-        {'params': time_params, 'lr': lr * 0.5, 'weight_decay': 0.0},
-        {'params': threshold_params, 'lr': lr * 1.0, 'weight_decay': 0.0}
-    ], betas=(0.9, 0.999))
+            adam_base_params.append(param)
+            print(f"[AdamW | Loss Base] {name}")
 
-    return optimizer
+    # ── Build AdamW ──
+    adam_groups = [
+        {'params': adam_base_params, 'lr': lr, 'weight_decay': weight_decay},
+        {'params': adam_encoder_params, 'lr': lr * 1e-2, 'weight_decay': weight_decay},
+        {'params': adam_no_decay_params, 'lr': lr, 'weight_decay': 0.0},
+        {'params': time_params, 'lr': lr * 0.5, 'weight_decay': 0.0},
+        {'params': threshold_params, 'lr': lr * 1.0, 'weight_decay': 0.0},
+    ]
+    # Filter out empty groups
+    adam_groups = [g for g in adam_groups if len(g['params']) > 0]
+    optimizer_adamw = optim.AdamW(adam_groups, betas=(0.9, 0.999)) if adam_groups else None
+
+    # ── Build Muon (if requested) ──
+    optimizer_muon = None
+    if use_muon:
+        muon_lr = config.training.get('muon_lr', 0.02)
+        muon_momentum = config.training.get('muon_momentum', 0.95)
+        muon_groups = [
+            {'params': muon_params, 'lr': muon_lr, 'weight_decay': weight_decay, 'momentum': muon_momentum},
+            {'params': muon_encoder_params, 'lr': muon_lr * 1e-2, 'weight_decay': weight_decay, 'momentum': muon_momentum},
+        ]
+        muon_groups = [g for g in muon_groups if len(g['params']) > 0]
+        if muon_groups:
+            optimizer_muon = Muon(muon_groups, lr=muon_lr, weight_decay=weight_decay, momentum=muon_momentum)
+            n_muon = sum(p.numel() for g in muon_groups for p in g['params'])
+            n_adam = sum(p.numel() for g in adam_groups for p in g['params']) if adam_groups else 0
+            print(f"\n=== Muon+AdamW Hybrid ===")
+            print(f"  Muon params:  {n_muon:,}")
+            print(f"  AdamW params: {n_adam:,}")
+            print(f"  Muon LR: {muon_lr} | AdamW LR: {lr}\n")
+
+    if use_muon and optimizer_muon is not None:
+        return HybridOptimizer(optimizer_muon, optimizer_adamw)
+    else:
+        return optimizer_adamw
+
+
+def create_hybrid_scheduler(optimizer, T_max, eta_min=1e-6):
+    """Create a CosineAnnealingLR scheduler, handling both HybridOptimizer and plain optimizer."""
+    if isinstance(optimizer, HybridOptimizer):
+        sched_muon = None
+        sched_adamw = None
+        if optimizer.opt_muon is not None:
+            sched_muon = CosineAnnealingLR(optimizer.opt_muon, T_max=T_max, eta_min=eta_min)
+        if optimizer.opt_adamw is not None:
+            sched_adamw = CosineAnnealingLR(optimizer.opt_adamw, T_max=T_max, eta_min=eta_min)
+        return HybridScheduler(sched_muon, sched_adamw)
+    else:
+        return CosineAnnealingLR(optimizer, T_max=T_max, eta_min=eta_min)
 
 
 
@@ -848,7 +929,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     accumulation_steps = config.training.get('accumulation_steps', 1)
     
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+    scheduler = create_hybrid_scheduler(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
 
     # Load model weights FIRST (before building momentum encoder)
     if resume and checkpoint is not None:
@@ -991,7 +1072,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
 
     # Note: lower encoder LR
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=True)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+    scheduler = create_hybrid_scheduler(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
 
     momentum_model = None
     supmoco_state = None
