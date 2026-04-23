@@ -6,6 +6,9 @@ defaults:
   - training: phase1a
   - _self_
 
+architecture:
+  use_dann: true
+
 encoder:
   use_odconv: true
   use_batchnorm: false
@@ -45,12 +48,14 @@ loss:
   alpha: 0.3
   beta: 0.7
   exclude_same_trial: true
-  use_dann: true
+  
   dann_weight: 1.0
   dann_alpha: 1.0
   use_mmd: false
   lambda_mmd: 0.1
-  use_muon: false
+  use_muon: true
+  muon_lr: 0.02
+  muon_momentum: 0.95
 
 logging:
   project_name: "snn-encoding-showdown"

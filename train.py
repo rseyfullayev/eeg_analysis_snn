@@ -12,6 +12,7 @@ from src.snn_modeling.utils.optim import Muon, HybridOptimizer, HybridScheduler
 from src.snn_modeling.dataloader.dataset import SWEEPDataset, PKSampler
 from src.snn_modeling.utils.supmoco import SupMoCoState, build_momentum_encoder, momentum_update
 import os
+import math
 import gc
 from datetime import datetime
 from sklearn.metrics import balanced_accuracy_score
