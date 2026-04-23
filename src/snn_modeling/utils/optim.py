@@ -32,10 +32,19 @@ class Muon:
             for p in group['params']:
                 if p.ndim > 2:
                     self._nd_shapes[id(p)] = p.shape
+                    # Flatten to 2D NOW so torch.optim.Muon.__init__ passes
+                    # its ndim==2 validation check
+                    p.data = p.data.view(p.size(0), -1)
 
         self._inner = torch.optim.Muon(
             param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum
         )
+
+        # Immediately restore original shapes so model.forward() works
+        for group in param_groups:
+            for p in group['params']:
+                if id(p) in self._nd_shapes:
+                    p.data = p.data.view(self._nd_shapes[id(p)])
 
     # --- Reshape helpers ---
     def _flatten_nd(self):
