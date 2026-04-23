@@ -1,2 +1,2 @@
-config/config_sdca_mmd.yaml
---loso 1
+config/config_sdca_dann.yaml
+--loso 1 --checkpoint /media/temporaryuser3/STORAGE/ERO/saved_models/phase1a/MobileNet_20260422_193349_loso1/checkpoint_last.pt --resume

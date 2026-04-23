@@ -50,6 +50,7 @@ loss:
   dann_alpha: 1.0
   use_mmd: false
   lambda_mmd: 0.1
+  use_muon: false
 
 logging:
   project_name: "snn-encoding-showdown"

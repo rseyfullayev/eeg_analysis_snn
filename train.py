@@ -571,6 +571,9 @@ def training_loop(phase,
                 target_lr_momentum = 0.75
                 # --- DANN (Domain Adversarial Neural Network) ---
                 if getattr(model, 'use_dann', False):
+                    print("###########################################")
+                    print("DANN is enabled")
+                    print("###########################################")
                     # Ganin et al. (2015) Alpha Annealing Schedule
                     # Progress p smoothly moves from 0 to 1 over the course of training phases
 
@@ -606,6 +609,9 @@ def training_loop(phase,
                 # --- MMD Domain Expansion ---
                 if use_mmd:
                     if not hasattr(model, 'mmd_fn'):
+                        print("###########################################")
+                        print("MMD is enabled")
+                        print("###########################################")
                         model.mmd_fn = MultiKernelMMDLoss()
                     
                     if subj_remapper is not None:
