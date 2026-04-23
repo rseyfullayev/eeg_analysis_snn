@@ -688,13 +688,18 @@ def training_loop(phase,
             loss = loss / accumulation_steps
             loss.backward()
             
+            # Interactive bot state update (every 10 batches to avoid excessive IO)
+            if batch_idx % 10 == 0:
+                live_tracker.update_batch_state(epoch + 1, batch_idx + 1, len(train_loader), loss.item() * accumulation_steps)
+            
             is_step = ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(train_loader))
 
             if is_step:
-                # Monitor: check gradients after backward
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Monitor: check gradients after clipping but before optimizer step
                 nan_monitor.check_gradients(epoch=epoch, batch_idx=batch_idx)
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 # Monitor: check weights after optimizer step

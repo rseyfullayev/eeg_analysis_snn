@@ -34,6 +34,8 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from collections import deque
+import json
+import tempfile
 
 
 class LiveTracker:
@@ -106,6 +108,9 @@ class LiveTracker:
         if not self._enabled:
             print("[LiveTracker] No Telegram/Discord credentials found — live tracking disabled.")
             print("  Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars, or add to config YAML.")
+        else:
+            if self.tg_token:
+                threading.Thread(target=self._poll_telegram_commands, daemon=True).start()
 
     def _prefix(self, msg):
         """Prefix a message with the run label for multi-run identification."""
@@ -119,6 +124,166 @@ class LiveTracker:
         """Human-readable elapsed time since training started."""
         secs = int(time.time() - self._start_time)
         return str(timedelta(seconds=secs))
+
+    # ──────────────── Shared State & Interactive Bot ──────────────── #
+
+    def _update_state(self, updates_dict):
+        """Update shared state file with our latest metrics so the interactive bot can read it."""
+        if not self.tg_token: return
+        state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
+        try:
+            state = {}
+            if os.path.exists(state_file):
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+            
+            if self.run_label not in state:
+                state[self.run_label] = {"emoji": self._emoji, "start_time": self._start_time}
+            
+            state[self.run_label].update(updates_dict)
+            state[self.run_label]["last_updated"] = time.time()
+            
+            # Clean up old runs (e.g. haven't updated in 12 hours)
+            now = time.time()
+            state = {k: v for k, v in state.items() if (now - v.get("last_updated", 0)) < 43200}
+            
+            with open(state_file, 'w') as f:
+                json.dump(state, f)
+        except Exception:
+            pass
+
+    def _poll_telegram_commands(self):
+        """Daemon thread that acts as a simple Telegram interactive bot. 
+        Uses a lock so only one running script polls the Telegram API."""
+        lock_path = os.path.join(tempfile.gettempdir(), "snn_telegram_poller.lock")
+        offset = 0
+        while True:
+            is_master = False
+            try:
+                if os.path.exists(lock_path):
+                    if time.time() - os.path.getmtime(lock_path) > 15:
+                        os.remove(lock_path)
+                
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                is_master = True
+            except (FileExistsError, OSError):
+                pass
+            
+            if not is_master:
+                time.sleep(10)
+                continue
+                
+            try:
+                # We are the master poller!
+                while True:
+                    os.utime(lock_path, None) # keep lock alive
+                    url = f"https://api.telegram.org/bot{self.tg_token}/getUpdates?timeout=5&offset={offset}"
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code == 200:
+                        updates = resp.json().get('result', [])
+                        for u in updates:
+                            offset = max(offset, u['update_id'] + 1)
+                            self._handle_telegram_update(u)
+                    else:
+                        time.sleep(2)
+            except Exception:
+                try:
+                    os.remove(lock_path)
+                except Exception: pass
+                time.sleep(5)
+
+    def _handle_telegram_update(self, update):
+        if 'message' in update and 'text' in update['message']:
+            text = update['message']['text']
+            chat_id = update['message']['chat']['id']
+            if str(chat_id) != str(self.tg_chat_id): return
+            
+            if text.startswith('/status') or text.startswith('/runs'):
+                self._send_status_dashboard()
+                
+        elif 'callback_query' in update:
+            cb = update['callback_query']
+            chat_id = cb['message']['chat']['id']
+            if str(chat_id) != str(self.tg_chat_id): return
+            
+            data = cb['data']
+            if data.startswith("status:"):
+                run_id = data.split("status:")[1]
+                self._send_detailed_status(run_id, cb['id'])
+
+    def _send_status_dashboard(self):
+        state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+            
+        if not state:
+            self._send_telegram("No active runs found.")
+            return
+            
+        buttons = []
+        for run_id, run_data in state.items():
+            emoji = run_data.get('emoji', '🏃')
+            btn = {"text": f"{emoji} {run_id}", "callback_data": f"status:{run_id}"}
+            buttons.append([btn])
+            
+        reply_markup = {"inline_keyboard": buttons}
+        
+        url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
+        payload = {
+            "chat_id": self.tg_chat_id,
+            "text": "📊 *Active Training Runs*\nClick a run to fetch its current live state:",
+            "parse_mode": "Markdown",
+            "reply_markup": reply_markup
+        }
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception: pass
+
+    def _send_detailed_status(self, run_id, callback_id):
+        # Acknowledge callback
+        try:
+            requests.post(f"https://api.telegram.org/bot{self.tg_token}/answerCallbackQuery", 
+                          json={"callback_query_id": callback_id}, timeout=5)
+        except Exception: pass
+        
+        state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+            
+        if run_id not in state:
+            self._send_telegram(f"Run `{run_id}` no longer exists or hasn't started reporting.")
+            return
+            
+        rd = state[run_id]
+        emoji = rd.get('emoji', '🏃')
+        phase = rd.get('phase', 'Unknown')
+        epoch = rd.get('epoch', '?')
+        total_epochs = rd.get('total_epochs', '?')
+        batch = rd.get('batch', '?')
+        total_batches = rd.get('total_batches', '?')
+        loss = rd.get('loss', '?')
+        
+        lines = [f"{emoji} *[{run_id}] Live Status*"]
+        lines.append(f"Phase: `{phase}`")
+        if epoch != '?':
+            lines.append(f"Epoch: `{epoch}/{total_epochs}` (Batch `{batch}/{total_batches}`)")
+        if loss != '?':
+            lines.append(f"Current Loss: `{loss:.4f}`")
+                
+        last_upd = time.time() - rd.get('last_updated', time.time())
+        if last_upd > 120:
+            lines.append(f"\n⚠️ _Last update was {int(last_upd)}s ago (might be frozen/evaluating)_")
+        else:
+            lines.append(f"\n_Updated {int(last_upd)}s ago_")
+        
+        self._send_telegram("\n".join(lines))
 
     # ──────────────── Low-Level Send ──────────────── #
 
@@ -221,6 +386,7 @@ class LiveTracker:
     def training_started(self, phase, total_epochs, device_info=""):
         """Call at the very start of a training phase."""
         self._start_time = time.time()
+        self._update_state({"status": "running", "phase": phase, "total_epochs": total_epochs})
         msg = self._prefix(
             f"🚀 Phase *{phase}* started\n"
             f"📊 {total_epochs} epochs\n"
@@ -254,6 +420,15 @@ class LiveTracker:
                 lines.append(f"  • {key}: `{val}`")
 
         self._dispatch(self._prefix("\n".join(lines)))
+
+    def update_batch_state(self, epoch, batch, total_batches, loss):
+        """Silent update of current batch state for the interactive bot. Does not dispatch a message."""
+        self._update_state({
+            "epoch": epoch,
+            "batch": batch, 
+            "total_batches": total_batches,
+            "loss": loss
+        })
 
     def checkpoint_saved(self, path, metric_name="", metric_value=0.0):
         """Notify when a new best checkpoint is saved."""

@@ -87,6 +87,7 @@ class SpikingMobileNetProjector(nn.Module):
         if self.use_dann:
             self.dann_head = nn.Sequential(
                 GRL(alpha=1.0),
+                nn.LayerNorm(feature_dim),
                 nn.Linear(feature_dim, feature_dim // 2),
                 nn.SiLU(),
                 nn.Linear(feature_dim // 2, num_subjects)
