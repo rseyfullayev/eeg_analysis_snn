@@ -22,6 +22,9 @@ training:
   use_supmoco: true
   supmoco_momentum: 0.9
   supmoco_queue_size: 512
+  use_muon: true
+  muon_lr: 0.02
+  muon_momentum: 0.95
   
 
 
@@ -48,14 +51,11 @@ loss:
   alpha: 0.3
   beta: 0.7
   exclude_same_trial: true
-  
   dann_weight: 1.0
   dann_alpha: 1.0
   use_mmd: false
   lambda_mmd: 0.1
-  use_muon: true
-  muon_lr: 0.02
-  muon_momentum: 0.95
+  
 
 logging:
   project_name: "snn-encoding-showdown"

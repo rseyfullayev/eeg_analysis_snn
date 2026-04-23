@@ -256,8 +256,8 @@ def create_optimizer(model, loss_fn, config, low_encoder_lr=False):
         elif is_no_decay:
             adam_no_decay_params.append(param)
             print(f"[AdamW | No-Decay] {name}")
-        # 4. Muon-eligible: ndim >= 2, not special, not depthwise conv
-        elif use_muon and param.ndim >= 2 and id(param) not in depthwise_id:
+        # 4. Muon-eligible: ndim >= 2, not special, not depthwise conv, not DANN head
+        elif use_muon and param.ndim >= 2 and id(param) not in depthwise_id and 'dann_head' not in name:
             if low_encoder_lr and 'encoder' in name:
                 muon_encoder_params.append(param)
                 print(f"[Muon | Encoder] {name}")
