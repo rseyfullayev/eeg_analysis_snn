@@ -27,6 +27,7 @@ import numpy as np
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
 from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing, SpatialDropout
+from src.snn_modeling.utils.fourier_mixup import FourierMixup, build_fourier_mixup
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingMobileNetProjector
 from omegaconf import OmegaConf
@@ -690,7 +691,11 @@ def training_loop(phase,
             
             # Interactive bot state update (every 10 batches to avoid excessive IO)
             if batch_idx % 10 == 0:
-                live_tracker.update_batch_state(epoch + 1, batch_idx + 1, len(train_loader), loss.item() * accumulation_steps)
+                kwargs = {}
+                if hasattr(loss_fn, 'ema_pos_dots'):
+                    kwargs['EMA Pos Dot'] = loss_fn.ema_pos_dots
+                    kwargs['EMA Neg Dot'] = loss_fn.ema_neg_dots
+                live_tracker.update_batch_state(epoch + 1, batch_idx + 1, len(train_loader), loss.item() * accumulation_steps, **kwargs)
             
             is_step = ((batch_idx + 1) % accumulation_steps == 0) or ((batch_idx + 1) == len(train_loader))
 
@@ -985,7 +990,8 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
             iic_inter_weight=iic_inter_weight,
             temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
             temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
-            exclude_same_trial=config.loss.get('exclude_same_trial', True)
+            exclude_same_trial=config.loss.get('exclude_same_trial', True),
+            cosface_margin=config.loss.get('cosface_margin', 0.0)
         )
     else:
         loss_fn = ContrastiveLoss(
@@ -1111,7 +1117,8 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
             iic_inter_weight=iic_inter_weight,
             temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
             temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
-            exclude_same_trial=config.loss.get('exclude_same_trial', True)
+            exclude_same_trial=config.loss.get('exclude_same_trial', True),
+            cosface_margin=config.loss.get('cosface_margin', 0.0)
         )
     else:
         loss_fn = ContrastiveLoss(
@@ -1338,15 +1345,7 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     density = masks.sum() / masks.numel()
     print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
 
-    train_aug = nn.Sequential(
-        GaussianNoise(std=0.05),
-        FrequencyDropout(p=0.1), # Kills spectral biometric (Alpha peak)
-        VideoRandomErasing(p=0.1, scale=(0.02, 0.2), ratio=(0.3, 3.3)), # Kills spatial biometric (Skull/Electrodes)
-        #SpatialDropout(p=0.3), # Kills physical cap impedance variations (Specific point electrodes)
-        VideoTemporalMasking(p=0.1, max_mask_len=8), # Kills temporal biometric (ODConv barcode)
-        SignalJitter(lower=0.5, upper=2.0) # Kills absolute power biometric (Impedance)
-    )
-
+    # Create dataset first (without augmentations) so FourierMixup can scan it
     train_set = SWEEPDataset(
         config,
         split='train',
@@ -1354,8 +1353,49 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         loso=loso,
         subj=subj,
         prototypes=masks,
-        augmentations=train_aug
+        augmentations=None  # assigned below after FourierMixup scan
     )
+
+    # --- Fourier Mixup: data-level identity erasure (replaces DANN/MMD) ---
+    use_fourier_mixup = config.training.get('use_fourier_mixup', False)
+    fourier_mixup_modules = []
+    if use_fourier_mixup:
+        fmix_cfg = config.training.get('fourier_mixup', {})
+        fmix_sigma = fmix_cfg.get('sigma', None)
+        fmix_retention = fmix_cfg.get('retention_ratio', 0.95)
+        fmix_p = fmix_cfg.get('p', 0.5)
+        fmix_beta = fmix_cfg.get('beta_alpha', 1.0)
+        fmix_grid = config.data.get('grid_size', 32)
+        
+        # Always use build_fourier_mixup (handles caching + donor pool)
+        fourier_mixup_module = build_fourier_mixup(
+            train_set, retention_ratio=fmix_retention, p=fmix_p, 
+            beta_alpha=fmix_beta, device=str(device),
+            cache_dir=config.data.dataset_path, loso_id=loso
+        )
+        # Override sigma if explicitly specified
+        if fmix_sigma is not None:
+            print(f"[FourierMixup] Overriding \u03c3 with pre-specified value: {fmix_sigma}")
+            fourier_mixup_module.sigma = fmix_sigma
+            # Recompute the Gaussian mask with the new sigma
+            fmix_grid = config.data.get('grid_size', 32)
+            cy, cx = fmix_grid // 2, fmix_grid // 2
+            yy, xx = torch.meshgrid(torch.arange(fmix_grid, dtype=torch.float32),
+                                     torch.arange(fmix_grid, dtype=torch.float32), indexing='ij')
+            dist_sq = (yy - cy) ** 2 + (xx - cx) ** 2
+            fourier_mixup_module.gaussian_mask = torch.exp(-dist_sq / (2.0 * fmix_sigma ** 2))
+        fourier_mixup_modules = [fourier_mixup_module]
+    
+    # Compose: FourierMixup (if enabled) → standard augmentations
+    all_aug_modules = fourier_mixup_modules + [
+        GaussianNoise(std=0.05),
+        FrequencyDropout(p=0.1),
+        VideoRandomErasing(p=0.1, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
+        VideoTemporalMasking(p=0.1, max_mask_len=8),
+        SignalJitter(lower=0.5, upper=2.0)
+    ]
+    train_aug = nn.Sequential(*all_aug_modules)
+    train_set.augmentations = train_aug  # Now assign augmentations
     
     val_set = SWEEPDataset(
         config, 

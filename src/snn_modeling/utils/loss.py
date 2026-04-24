@@ -266,7 +266,8 @@ class SupMoCoLoss(ContrastiveLoss):
                  iic_inter_weight=1.0,
                  temporal_decay_enabled=False,
                  temporal_decay_factor=0.999,
-                 exclude_same_trial=True):
+                 exclude_same_trial=True,
+                 cosface_margin=0.0):
         super().__init__(
             masks=masks,
             temperature=temperature,
@@ -278,6 +279,7 @@ class SupMoCoLoss(ContrastiveLoss):
         self.temporal_decay_enabled = temporal_decay_enabled
         self.temporal_decay_factor = temporal_decay_factor
         self.exclude_same_trial = exclude_same_trial
+        self.cosface_margin = cosface_margin
 
     def forward(self,
                 query_features,
@@ -343,17 +345,32 @@ class SupMoCoLoss(ContrastiveLoss):
         all_timestamps = torch.cat(candidate_timestamps, dim=0)  # (M,)
         
 
-        logits = torch.matmul(q, all_features.T) / self.temperature  # (B, M)
+        # Compute raw cosine similarities (before temperature)
+        cos_sim = torch.matmul(q, all_features.T)  # (B, M) — values in [-1, 1]
 
         pos_mask = (labels.unsqueeze(1) == all_labels.unsqueeze(0)).float()
         neg_mask = 1.0 - pos_mask
         same_subj_mask = (subject_labels.unsqueeze(1) == all_subject_labels.unsqueeze(0)).float()
         diff_subj_mask = 1.0 - same_subj_mask
 
+        # --- CosFace Angular Margin ---
+        # Subtract margin from positive cosine similarities IN COSINE SPACE (before temperature)
+        # This is the correct formulation: cos(θ) - m for positives, cos(θ) for negatives
+        if self.cosface_margin > 0:
+            cos_sim_margin = cos_sim - self.cosface_margin * pos_mask
+        else:
+            cos_sim_margin = cos_sim
+
+        # Now apply temperature scaling to get logits
+        logits = cos_sim_margin / self.temperature  # (B, M)
+        # Unpenalized logits for the denominator (negatives don't get margin)
+        logits_neg = cos_sim / self.temperature
+
         # Mask out ALL positives (same class) from the max-shift so they don't skew the partition
-        mask_for_max = torch.where(pos_mask.bool(), torch.full_like(logits, -1e9), logits)
+        mask_for_max = torch.where(pos_mask.bool(), torch.full_like(logits_neg, -1e9), logits_neg)
         logits_max, _ = torch.max(mask_for_max, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
+        logits_neg = logits_neg - logits_max.detach()
 
         if self.iic_enabled:
             # 1. Domain Adaptation Positives: Labels equal, Subjects differ
@@ -388,7 +405,8 @@ class SupMoCoLoss(ContrastiveLoss):
             neg_weights = neg_weights * (~same_video).float()
 
         # Decoupled denominator: negatives only (no positive terms in partition).
-        neg_partition = torch.clamp((torch.exp(logits) * neg_weights).sum(dim=1, keepdim=True), min=1e-8)
+        # Use unpenalized logits for denominator so margin only affects numerator
+        neg_partition = torch.clamp((torch.exp(logits_neg) * neg_weights).sum(dim=1, keepdim=True), min=1e-8)
         pos_log_prob = logits - torch.log(neg_partition)
 
         valid_anchors = pos_weights.sum(dim=1) > 0
@@ -403,9 +421,9 @@ class SupMoCoLoss(ContrastiveLoss):
         step_count = getattr(self, 'step_count', 0)
         
         with torch.no_grad():
-            raw_dots = torch.matmul(q, all_features.T) # No temperature scaling
-            pos_dots = (raw_dots * pos_mask).sum() / (pos_mask.sum() + 1e-6)
-            neg_dots = (raw_dots * neg_mask).sum() / (neg_mask.sum() + 1e-6)
+            # cos_sim already contains raw cosine similarities (no temperature)
+            pos_dots = (cos_sim * pos_mask).sum() / (pos_mask.sum() + 1e-6)
+            neg_dots = (cos_sim * neg_mask).sum() / (neg_mask.sum() + 1e-6)
 
             if not hasattr(self, 'ema_pos_dots'):
                 self.ema_pos_dots = pos_dots.item()

@@ -114,8 +114,7 @@ class LiveTracker:
 
     def _prefix(self, msg):
         """Prefix a message with the run label for multi-run identification."""
-        escaped_label = self.run_label.replace('_', '\\_').replace('-', '\\-').replace('*', '')
-        return f"{self._emoji} *[{escaped_label}]*\n{msg}"
+        return f"{self._emoji} <b>[{self.run_label}]</b>\n{msg}"
 
     @property
     def enabled(self):
@@ -248,8 +247,8 @@ class LiveTracker:
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
         payload = {
             "chat_id": self.tg_chat_id,
-            "text": "📊 *Active Training Runs*\nClick a run to fetch its current live state:",
-            "parse_mode": "Markdown",
+            "text": "📊 <b>Active Training Runs</b>\nClick a run to fetch its current live state:",
+            "parse_mode": "HTML",
             "reply_markup": reply_markup
         }
         try:
@@ -286,23 +285,31 @@ class LiveTracker:
         total_batches = rd.get('total_batches', '?')
         loss = rd.get('loss', '?')
         
-        escaped_id = run_id.replace('_', '\\_').replace('-', '\\-')
-        lines = [f"{emoji} *[{escaped_id}] Live Status*"]
-        lines.append(f"Phase: `{phase}`")
+        lines = [f"{emoji} <b>[{run_id}] Live Status</b>"]
+        lines.append(f"Phase: <code>{phase}</code>")
         if epoch != '?':
-            lines.append(f"Epoch: `{epoch}/{total_epochs}` (Batch `{batch}/{total_batches}`)")
+            lines.append(f"Epoch: <code>{epoch}/{total_epochs}</code> (Batch <code>{batch}/{total_batches}</code>)")
         if loss != '?':
-            lines.append(f"Current Loss: `{loss:.4f}`")
+            lines.append(f"Current Loss: <code>{loss:.4f}</code>")
+            
+        # Display any extra metrics passed via update_batch_state (like EMA dots)
+        ignore_keys = {'emoji', 'phase', 'epoch', 'total_epochs', 'batch', 'total_batches', 'loss', 'last_updated', 'warnings', 'status', 'start_time'}
+        for k, v in rd.items():
+            if k not in ignore_keys:
+                if isinstance(v, float):
+                    lines.append(f"{k}: <code>{v:.4f}</code>")
+                else:
+                    lines.append(f"{k}: <code>{v}</code>")
             
         warnings = rd.get('warnings', [])
         if warnings:
-            lines.append(f"⚠️ *Warnings*: `{len(warnings)}` (Collapse, etc.)")
+            lines.append(f"⚠️ <b>Warnings</b>: <code>{len(warnings)}</code> (Collapse, etc.)")
                 
         last_upd = time.time() - rd.get('last_updated', time.time())
         if last_upd > 120:
-            lines.append(f"\n⚠️ _Last update was {int(last_upd)}s ago (might be frozen/evaluating)_")
+            lines.append(f"\n⚠️ <i>Last update was {int(last_upd)}s ago (might be frozen/evaluating)</i>")
         else:
-            lines.append(f"\n_Updated {int(last_upd)}s ago_")
+            lines.append(f"\n<i>Updated {int(last_upd)}s ago</i>")
             
         # Extract existing buttons to keep the dashboard usable!
         buttons = []
@@ -318,7 +325,7 @@ class LiveTracker:
             "chat_id": self.tg_chat_id,
             "message_id": callback_msg_id,
             "text": "\n".join(lines),
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "reply_markup": {"inline_keyboard": buttons}
         }
         try:
@@ -345,8 +352,7 @@ class LiveTracker:
             return
             
         # Send last 10 warnings
-        escaped_id = run_id.replace('_', '\\_').replace('-', '\\-')
-        msg = f"⚠️ *[{escaped_id}] Recent Warnings*\n\n"
+        msg = f"⚠️ <b>[{run_id}] Recent Warnings</b>\n\n"
         for w in warnings[-10:]:
             msg += f"• {w}\n"
             
@@ -354,7 +360,7 @@ class LiveTracker:
 
     # ──────────────── Low-Level Send ──────────────── #
 
-    def _send_telegram(self, text, parse_mode="Markdown"):
+    def _send_telegram(self, text, parse_mode="HTML"):
         """Send a message via Telegram Bot API."""
         try:
             url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
@@ -366,7 +372,16 @@ class LiveTracker:
             }
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code != 200:
-                print(f"[LiveTracker] Telegram error {resp.status_code}: {resp.text[:200]}")
+                err_msg = resp.text
+                if "can't parse entities" in err_msg and parse_mode:
+                    # Ultimate fallback: strip all formatting, send as plain text
+                    import re
+                    clean = re.sub(r'<[^>]+>', '', text)
+                    payload['text'] = clean
+                    payload.pop('parse_mode', None)
+                    requests.post(url, json=payload, timeout=10)
+                else:
+                    print(f"[LiveTracker] Telegram error {resp.status_code}: {err_msg[:200]}")
         except Exception as e:
             print(f"[LiveTracker] Telegram send failed: {e}")
 
@@ -455,7 +470,7 @@ class LiveTracker:
         self._start_time = time.time()
         self._update_state({"status": "running", "phase": phase, "total_epochs": total_epochs})
         msg = self._prefix(
-            f"🚀 Phase *{phase}* started\n"
+            f"🚀 Phase <b>{phase}</b> started\n"
             f"📊 {total_epochs} epochs\n"
             f"🖥️ {device_info}\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
@@ -474,28 +489,30 @@ class LiveTracker:
         pct = int(100 * (epoch + 1) / total_epochs)
         bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
 
-        lines = [f"📈 *Epoch {progress}* ({pct}%) `[{bar}]`"]
+        lines = [f"📈 <b>Epoch {progress}</b> ({pct}%) <code>[{bar}]</code>"]
         lines.append(f"⏱️ {elapsed}")
 
         for key, val in metrics.items():
             if isinstance(val, float):
                 if abs(val) < 0.01 or abs(val) > 1000:
-                    lines.append(f"  • {key}: `{val:.2e}`")
+                    lines.append(f"  • {key}: <code>{val:.2e}</code>")
                 else:
-                    lines.append(f"  • {key}: `{val:.4f}`")
+                    lines.append(f"  • {key}: <code>{val:.4f}</code>")
             else:
-                lines.append(f"  • {key}: `{val}`")
+                lines.append(f"  • {key}: <code>{val}</code>")
 
         self._dispatch(self._prefix("\n".join(lines)))
 
-    def update_batch_state(self, epoch, batch, total_batches, loss):
+    def update_batch_state(self, epoch, batch, total_batches, loss, **kwargs):
         """Silent update of current batch state for the interactive bot. Does not dispatch a message."""
-        self._update_state({
+        state_dict = {
             "epoch": epoch,
             "batch": batch, 
             "total_batches": total_batches,
             "loss": loss
-        })
+        }
+        state_dict.update(kwargs)
+        self._update_state(state_dict)
 
     def add_warning(self, text):
         """Silently add a warning to the state for fetching via the dashboard."""
@@ -519,9 +536,9 @@ class LiveTracker:
         """Notify when a new best checkpoint is saved."""
         filename = os.path.basename(path)
         msg = self._prefix(
-            f"💾 *Checkpoint saved*\n"
-            f"  `{filename}`\n"
-            f"  {metric_name}: `{metric_value:.4f}`"
+            f"💾 <b>Checkpoint saved</b>\n"
+            f"  <code>{filename}</code>\n"
+            f"  {metric_name}: <code>{metric_value:.4f}</code>"
         )
         self._dispatch(msg, urgent=True)
 
@@ -531,30 +548,30 @@ class LiveTracker:
         Args:
             probes: dict like {"train_cv": 0.45, "val_linear": 0.38, ...}
         """
-        lines = [f"🔬 *Probes* (Epoch {epoch})"]
+        lines = [f"🔬 <b>Probes</b> (Epoch {epoch})"]
         for key, val in probes.items():
             if isinstance(val, float):
-                lines.append(f"  • {key}: `{val:.4f}`")
+                lines.append(f"  • {key}: <code>{val:.4f}</code>")
             else:
-                lines.append(f"  • {key}: `{val}`")
+                lines.append(f"  • {key}: <code>{val}</code>")
         self._dispatch(self._prefix("\n".join(lines)))
 
     def nan_alert(self, location, diagnosis, details=""):
         """URGENT: NaN/Inf detected. Sends immediately."""
         msg = (
-            f"🚨 *NaN/Inf ALERT*\n"
+            f"🚨 <b>NaN/Inf ALERT</b>\n"
             f"📍 {location}\n"
             f"🔍 {diagnosis}\n"
         )
         if details:
             # Truncate for Telegram (4096 char limit)
-            msg += f"```\n{details[:3000]}\n```"
+            msg += f"<pre>\n{details[:3000]}\n</pre>"
         self._dispatch(self._prefix(msg), urgent=True)
 
     def dann_status(self, epoch, batch_idx, alpha, acc, loss):
         """Report DANN training status."""
         msg = self._prefix(
-            f"🎭 *DANN* (Ep {epoch} B{batch_idx})\n"
+            f"🎭 <b>DANN</b> (Ep {epoch} B{batch_idx})\n"
             f"  α={alpha:.4f} | Acc={acc:.4f} | Loss={loss:.4f}"
         )
         self._dispatch(msg)
@@ -563,9 +580,9 @@ class LiveTracker:
         """Call when training phase completes."""
         elapsed = self._elapsed()
         msg = self._prefix(
-            f"✅ Phase *{phase}* complete!\n"
+            f"✅ Phase <b>{phase}</b> complete!\n"
             f"⏱️ Total time: {elapsed}\n"
-            f"🏆 Best {best_metric_name}: `{best_metric_value:.4f}`"
+            f"🏆 Best {best_metric_name}: <code>{best_metric_value:.4f}</code>"
         )
         self._dispatch(msg, urgent=True)
 
@@ -573,10 +590,10 @@ class LiveTracker:
         """Call when training crashes with an exception."""
         elapsed = self._elapsed()
         msg = self._prefix(
-            f"💥 *CRASHED*\n"
-            f"Phase *{phase}*\n"
+            f"💥 <b>CRASHED</b>\n"
+            f"Phase <b>{phase}</b>\n"
             f"⏱️ After: {elapsed}\n"
-            f"```\n{str(error_msg)[:800]}\n```"
+            f"<pre>\n{str(error_msg)[:800]}\n</pre>"
         )
         self._dispatch(msg, urgent=True)
 

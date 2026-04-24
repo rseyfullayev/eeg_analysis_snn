@@ -181,12 +181,13 @@ class NaNMonitor:
             self._report("Activations", 'representational_collapse' if collapsed else 'loss_nan', details)
             return True
 
-        if collapsed and self.verbose and self._should_report():
-            loc = f"Epoch {epoch} Batch {batch_idx}" if epoch is not None else ""
-            msg = f"Collapse warning ({loc}): {', '.join(collapsed)} have near-zero variance"
-            print(f"  [NaNMonitor] ⚡ {msg}")
-            if hasattr(self, 'live_tracker') and self.live_tracker:
-                self.live_tracker.add_warning(msg)
+        if collapsed:
+            # Silently count — summary printed once at epoch end
+            if not hasattr(self, '_collapse_count'):
+                self._collapse_count = 0
+                self._collapse_names = set()
+            self._collapse_count += 1
+            self._collapse_names.update(collapsed)
             return False  # Not NaN, but worth noting
 
         return False
@@ -334,3 +335,14 @@ class NaNMonitor:
                   f"First occurrence at: {self._first_nan_location}")
         elif self.verbose:
             print(f"  [NaNMonitor] Epoch clean — no NaN/Inf detected.")
+        
+        # Collapse summary (throttled to 1 line per epoch instead of per-batch spam)
+        collapse_count = getattr(self, '_collapse_count', 0)
+        if collapse_count > 0:
+            names = ', '.join(sorted(getattr(self, '_collapse_names', set())))
+            msg = f"Collapse: {collapse_count} batches had near-zero variance ({names})"
+            print(f"  [NaNMonitor] ⚡ {msg}")
+            if self._live_tracker is not None:
+                self._live_tracker.add_warning(msg)
+            self._collapse_count = 0
+            self._collapse_names = set()
