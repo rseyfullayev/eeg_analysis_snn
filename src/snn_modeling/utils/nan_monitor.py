@@ -183,8 +183,10 @@ class NaNMonitor:
 
         if collapsed and self.verbose and self._should_report():
             loc = f"Epoch {epoch} Batch {batch_idx}" if epoch is not None else ""
-            print(f"  [NaNMonitor] ⚡ Collapse warning ({loc}): {', '.join(collapsed)} "
-                  f"have near-zero variance")
+            msg = f"Collapse warning ({loc}): {', '.join(collapsed)} have near-zero variance"
+            print(f"  [NaNMonitor] ⚡ {msg}")
+            if hasattr(self, 'live_tracker') and self.live_tracker:
+                self.live_tracker.add_warning(msg)
             return False  # Not NaN, but worth noting
 
         return False

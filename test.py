@@ -40,7 +40,11 @@ def _features_are_degenerate(emb):
 
 def get_svm(**kwargs):
     if _USE_CUML:
-        return cuSVC(kernel='linear')
+        try:
+            from cuml.svm import LinearSVC as cuLinearSVC
+            return cuLinearSVC(max_iter=1000)
+        except ImportError:
+            return cuSVC(kernel='linear', gamma='scale')
     else:
         from sklearn.svm import LinearSVC
         return LinearSVC(max_iter=1000)

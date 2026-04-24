@@ -114,7 +114,8 @@ class LiveTracker:
 
     def _prefix(self, msg):
         """Prefix a message with the run label for multi-run identification."""
-        return f"{self._emoji} *[{self.run_label}]*\n{msg}"
+        escaped_label = self.run_label.replace('_', '\\_').replace('-', '\\-').replace('*', '')
+        return f"{self._emoji} *[{escaped_label}]*\n{msg}"
 
     @property
     def enabled(self):
@@ -205,12 +206,16 @@ class LiveTracker:
         elif 'callback_query' in update:
             cb = update['callback_query']
             chat_id = cb['message']['chat']['id']
+            msg_id = cb['message']['message_id']
             if str(chat_id) != str(self.tg_chat_id): return
             
             data = cb['data']
             if data.startswith("status:"):
                 run_id = data.split("status:")[1]
-                self._send_detailed_status(run_id, cb['id'])
+                self._send_detailed_status(run_id, cb['id'], msg_id)
+            elif data.startswith("warnings:"):
+                run_id = data.split("warnings:")[1]
+                self._send_warnings(run_id, cb['id'])
 
     def _send_status_dashboard(self):
         state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
@@ -224,8 +229,16 @@ class LiveTracker:
             self._send_telegram("No active runs found.")
             return
             
+        old_msg_id = state.get('_meta', {}).get('status_msg_id')
+        if old_msg_id:
+            try:
+                requests.post(f"https://api.telegram.org/bot{self.tg_token}/deleteMessage",
+                              json={"chat_id": self.tg_chat_id, "message_id": old_msg_id}, timeout=3)
+            except Exception: pass
+            
         buttons = []
         for run_id, run_data in state.items():
+            if run_id == '_meta': continue
             emoji = run_data.get('emoji', '🏃')
             btn = {"text": f"{emoji} {run_id}", "callback_data": f"status:{run_id}"}
             buttons.append([btn])
@@ -240,10 +253,14 @@ class LiveTracker:
             "reply_markup": reply_markup
         }
         try:
-            requests.post(url, json=payload, timeout=5)
+            resp = requests.post(url, json=payload, timeout=5).json()
+            if resp.get('ok'):
+                state.setdefault('_meta', {})['status_msg_id'] = resp['result']['message_id']
+                with open(state_file, 'w') as f:
+                    json.dump(state, f)
         except Exception: pass
 
-    def _send_detailed_status(self, run_id, callback_id):
+    def _send_detailed_status(self, run_id, callback_id, callback_msg_id=None):
         # Acknowledge callback
         try:
             requests.post(f"https://api.telegram.org/bot{self.tg_token}/answerCallbackQuery", 
@@ -258,7 +275,6 @@ class LiveTracker:
             state = {}
             
         if run_id not in state:
-            self._send_telegram(f"Run `{run_id}` no longer exists or hasn't started reporting.")
             return
             
         rd = state[run_id]
@@ -270,20 +286,71 @@ class LiveTracker:
         total_batches = rd.get('total_batches', '?')
         loss = rd.get('loss', '?')
         
-        lines = [f"{emoji} *[{run_id}] Live Status*"]
+        escaped_id = run_id.replace('_', '\\_').replace('-', '\\-')
+        lines = [f"{emoji} *[{escaped_id}] Live Status*"]
         lines.append(f"Phase: `{phase}`")
         if epoch != '?':
             lines.append(f"Epoch: `{epoch}/{total_epochs}` (Batch `{batch}/{total_batches}`)")
         if loss != '?':
             lines.append(f"Current Loss: `{loss:.4f}`")
+            
+        warnings = rd.get('warnings', [])
+        if warnings:
+            lines.append(f"⚠️ *Warnings*: `{len(warnings)}` (Collapse, etc.)")
                 
         last_upd = time.time() - rd.get('last_updated', time.time())
         if last_upd > 120:
             lines.append(f"\n⚠️ _Last update was {int(last_upd)}s ago (might be frozen/evaluating)_")
         else:
             lines.append(f"\n_Updated {int(last_upd)}s ago_")
+            
+        # Extract existing buttons to keep the dashboard usable!
+        buttons = []
+        for rid, rdata in state.items():
+            if rid == '_meta': continue
+            e = rdata.get('emoji', '🏃')
+            buttons.append([{"text": f"{e} {rid}", "callback_data": f"status:{rid}"}])
+            
+        if warnings:
+            buttons.insert(0, [{"text": "⚠️ Fetch Warnings", "callback_data": f"warnings:{run_id}"}])
+            
+        payload = {
+            "chat_id": self.tg_chat_id,
+            "message_id": callback_msg_id,
+            "text": "\n".join(lines),
+            "parse_mode": "Markdown",
+            "reply_markup": {"inline_keyboard": buttons}
+        }
+        try:
+            requests.post(f"https://api.telegram.org/bot{self.tg_token}/editMessageText", json=payload, timeout=5)
+        except Exception: pass
+
+    def _send_warnings(self, run_id, callback_id):
+        try:
+            requests.post(f"https://api.telegram.org/bot{self.tg_token}/answerCallbackQuery", 
+                          json={"callback_query_id": callback_id}, timeout=5)
+        except Exception: pass
         
-        self._send_telegram("\n".join(lines))
+        state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+        except Exception: return
+        
+        if run_id not in state: return
+        
+        warnings = state[run_id].get('warnings', [])
+        if not warnings:
+            self._send_telegram(f"No warnings for `{run_id}`.")
+            return
+            
+        # Send last 10 warnings
+        escaped_id = run_id.replace('_', '\\_').replace('-', '\\-')
+        msg = f"⚠️ *[{escaped_id}] Recent Warnings*\n\n"
+        for w in warnings[-10:]:
+            msg += f"• {w}\n"
+            
+        self._send_telegram(msg)
 
     # ──────────────── Low-Level Send ──────────────── #
 
@@ -430,6 +497,24 @@ class LiveTracker:
             "loss": loss
         })
 
+    def add_warning(self, text):
+        """Silently add a warning to the state for fetching via the dashboard."""
+        if not self.tg_token: return
+        state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            if self.run_label not in state: return
+            warnings = state[self.run_label].get("warnings", [])
+            warnings.append(text)
+            
+            # Keep only last 50 warnings to prevent file bloat
+            state[self.run_label]["warnings"] = warnings[-50:]
+            with open(state_file, 'w') as f:
+                json.dump(state, f)
+        except Exception: pass
+
     def checkpoint_saved(self, path, metric_name="", metric_value=0.0):
         """Notify when a new best checkpoint is saved."""
         filename = os.path.basename(path)
@@ -463,7 +548,7 @@ class LiveTracker:
         )
         if details:
             # Truncate for Telegram (4096 char limit)
-            msg += f"```\n{details[:500]}\n```"
+            msg += f"```\n{details[:3000]}\n```"
         self._dispatch(self._prefix(msg), urgent=True)
 
     def dann_status(self, epoch, batch_idx, alpha, acc, loss):

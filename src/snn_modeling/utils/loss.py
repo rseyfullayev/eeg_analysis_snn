@@ -219,20 +219,29 @@ class ContrastiveLoss(nn.Module):
         
         current_epoch = getattr(self, 'current_epoch', 0)
         step_count = getattr(self, 'step_count', 0)
-        if step_count == 500:
-            with torch.no_grad():
-                raw_dots = torch.matmul(features, features.T) 
-                pos_dots = (raw_dots * mask).sum() / (mask.sum() + 1e-6)
-                neg_dots = (raw_dots * neg_mask).sum() / (neg_mask.sum() + 1e-6)
+        
+        with torch.no_grad():
+            raw_dots = torch.matmul(features, features.T) 
+            pos_dots = (raw_dots * mask).sum() / (mask.sum() + 1e-6)
+            neg_dots = (raw_dots * neg_mask).sum() / (neg_mask.sum() + 1e-6)
 
+            if not hasattr(self, 'ema_pos_dots'):
+                self.ema_pos_dots = pos_dots.item()
+                self.ema_neg_dots = neg_dots.item()
+            else:
+                alpha = 0.05
+                self.ema_pos_dots = (1 - alpha) * self.ema_pos_dots + alpha * pos_dots.item()
+                self.ema_neg_dots = (1 - alpha) * self.ema_neg_dots + alpha * neg_dots.item()
+
+        if step_count > 0 and step_count % 500 == 0:
+            with torch.no_grad():
                 mean_pos_weight = pos_weights[mask.bool()].mean()
                 mean_neg_weight = neg_weights[neg_mask.bool()].mean()
-                
                 denom_val = exp_logits.sum(1).mean().item()
 
-                print(f"\n--- Loss Diagnostics (Epoch {current_epoch} | Batch {step_count}) ---")
-                print(f"Mean Pos Dot Product: {pos_dots.item():.4f}")
-                print(f"Mean Neg Dot Product: {neg_dots.item():.4f}")
+                print(f"\n--- Loss Diagnostics EMA (Epoch {current_epoch} | Batch {step_count}) ---")
+                print(f"EMA Pos Dot Product: {self.ema_pos_dots:.4f}")
+                print(f"EMA Neg Dot Product: {self.ema_neg_dots:.4f}")
                 print(f"Mean Pos Weight: {mean_pos_weight.item():.4f}")
                 print(f"Mean Neg Weight: {mean_neg_weight.item():.4f}")
                 print(f"Max Logit (shifted): {logits_max.mean().item():.4f}")
@@ -392,18 +401,28 @@ class SupMoCoLoss(ContrastiveLoss):
         
         current_epoch = getattr(self, 'current_epoch', 0)
         step_count = getattr(self, 'step_count', 0)
-        if step_count == 500:
-            with torch.no_grad():
-                raw_dots = torch.matmul(q, all_features.T) # No temperature scaling
-                pos_dots = (raw_dots * pos_mask).sum() / (pos_mask.sum() + 1e-6)
-                neg_dots = (raw_dots * neg_mask).sum() / (neg_mask.sum() + 1e-6)
+        
+        with torch.no_grad():
+            raw_dots = torch.matmul(q, all_features.T) # No temperature scaling
+            pos_dots = (raw_dots * pos_mask).sum() / (pos_mask.sum() + 1e-6)
+            neg_dots = (raw_dots * neg_mask).sum() / (neg_mask.sum() + 1e-6)
 
+            if not hasattr(self, 'ema_pos_dots'):
+                self.ema_pos_dots = pos_dots.item()
+                self.ema_neg_dots = neg_dots.item()
+            else:
+                alpha = 0.05
+                self.ema_pos_dots = (1 - alpha) * self.ema_pos_dots + alpha * pos_dots.item()
+                self.ema_neg_dots = (1 - alpha) * self.ema_neg_dots + alpha * neg_dots.item()
+
+        if step_count > 0 and step_count % 500 == 0:
+            with torch.no_grad():
                 mean_pos_weight = pos_weights[pos_mask.bool()].mean()
                 mean_neg_weight = neg_weights[neg_mask.bool()].mean()
 
-                print(f"\n--- Loss Diagnostics (Epoch {current_epoch} | Batch {step_count}) ---")
-                print(f"Mean Pos Dot Product: {pos_dots.item():.4f}")
-                print(f"Mean Neg Dot Product: {neg_dots.item():.4f}")
+                print(f"\n--- SupMoCo Diagnostics EMA (Epoch {current_epoch} | Batch {step_count}) ---")
+                print(f"EMA Pos Dot Product: {self.ema_pos_dots:.4f}")
+                print(f"EMA Neg Dot Product: {self.ema_neg_dots:.4f}")
                 print(f"Mean Pos Weight: {mean_pos_weight.item():.4f}")
                 print(f"Mean Neg Weight: {mean_neg_weight.item():.4f}")
                 print(f"Max Logit (shifted): {logits_max.mean().item():.4f}")

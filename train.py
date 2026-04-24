@@ -830,6 +830,14 @@ def training_loop(phase,
                 "subject_val_cross": subj_cross_acc,
             })
 
+        log_dict = {
+            f"Phase{phase}/Train/Loss": avg_train_loss,
+            f"Phase{phase}/Val/Loss": val_loss,
+            f"Phase{phase}/Val/Accuracy": val_acc,
+            f"Phase{phase}/Val/Balanced_Accuracy": val_bal_acc,
+            "LR": current_lr
+        }
+
         # --- DANN Logging ---
         if getattr(model, 'use_dann', False):
             train_dann_acc = train_dann_correct / max(train_dann_total, 1)
@@ -856,13 +864,6 @@ def training_loop(phase,
                   f"Val Acc: {val_acc:.4f} | Dice: {val_dice:.4f} | "
                   f"Val Pre: {val_pre:.4f} | Val Rec: {val_rec:.4f}")
         
-        log_dict = {
-            f"Phase{phase}/Train/Loss": avg_train_loss,
-            f"Phase{phase}/Val/Loss": val_loss,
-            f"Phase{phase}/Val/Accuracy": val_acc,
-            f"Phase{phase}/Val/Balanced_Accuracy": val_bal_acc,
-            "LR": current_lr
-        }
         if phase in [1, '1a', '1b'] and use_supmoco and supmoco_state is not None:
             queue_len = int(supmoco_state.queue_filled.item())
             log_dict.update({
