@@ -188,7 +188,7 @@ class ContrastiveLoss(nn.Module):
             neg_weights = neg_mask * (1.0 + dice_pair)
         else:
             pos_weights = mask.clone()
-            neg_weights = neg_mask.clone()
+            neg_weights = neg_mask * (1.0 + dice_pair)
 
         if self.decoupled:
             denom_weights = neg_weights
@@ -385,9 +385,10 @@ class SupMoCoLoss(ContrastiveLoss):
             
             neg_weights = (hard_neg_mask * (1.0 + dice_pair)) + normal_neg_mask
         else:
-            # Standard SupCon
+            # Standard SupCon with Dice-weighted negatives
+            dice_pair = self.sim_score[labels][:, all_labels]
             pos_weights = pos_mask.clone()
-            neg_weights = neg_mask.clone()
+            neg_weights = neg_mask * (1.0 + dice_pair)
 
         if self.temporal_decay_enabled:
             # Apply temporal decay: w_temporal = temporal_decay_factor ^ age
