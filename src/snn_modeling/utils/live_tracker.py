@@ -10,9 +10,10 @@ Setup (Telegram):
        https://api.telegram.org/bot<TOKEN>/getUpdates
        to find your chat_id
     3. Set in config YAML:
-       logging:
-         telegram_token: "123456:ABC-DEF..."
-         telegram_chat_id: "987654321"
+       logger:
+         telegram:
+           token: "123456:ABC-DEF..."
+           chat_id: "987654321"
     
     OR set environment variables:
        TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
@@ -21,7 +22,7 @@ Setup (Telegram):
 Setup (Discord):
     1. Server Settings → Integrations → Webhooks → New Webhook → Copy URL
     2. Set in config YAML:
-       logging:
+       logger:
          discord_webhook: "https://discord.com/api/webhooks/..."
 
     OR set environment variable:
@@ -66,15 +67,24 @@ class LiveTracker:
         self.min_interval = min_interval
         self.run_name = "Training"
         self.run_label = "Training"  # Short label for message prefix
+        self.is_cancelled = False
         self._start_time = time.time()
 
         # Load from config or env vars
         if config is not None:
-            logging_cfg = config.get('logging', {})
-            self.tg_token = logging_cfg.get('telegram_token', None) or os.environ.get('TELEGRAM_BOT_TOKEN')
-            self.tg_chat_id = logging_cfg.get('telegram_chat_id', None) or os.environ.get('TELEGRAM_CHAT_ID')
+            logging_cfg = config.get('logger', config.get('logging', {}))
+            tg_cfg = logging_cfg.get('telegram', {})
+            
+            self.tg_token = tg_cfg.get('token', None) or logging_cfg.get('telegram_token', None) or os.environ.get('TELEGRAM_BOT_TOKEN')
+            self.tg_chat_id = tg_cfg.get('chat_id', None) or logging_cfg.get('telegram_chat_id', None) or os.environ.get('TELEGRAM_CHAT_ID')
             self.discord_webhook = logging_cfg.get('discord_webhook', None) or os.environ.get('DISCORD_WEBHOOK_URL')
             self.run_name = logging_cfg.get('run_name', config.get('experiment_name', 'Training'))
+
+            # Check if logging is explicitly disabled
+            if not logging_cfg.get('enabled', True):
+                self.tg_token = None
+                self.tg_chat_id = None
+                self.discord_webhook = None
 
             # Build a unique label from tags so parallel runs are distinguishable
             # e.g. tags=["mobilenet","tsm","phase1a","scda","dann"] → "DANN"
@@ -139,6 +149,10 @@ class LiveTracker:
             
             if self.run_label not in state:
                 state[self.run_label] = {"emoji": self._emoji, "start_time": self._start_time}
+            
+            if state[self.run_label].get("status") == "cancelled":
+                self.is_cancelled = True
+                return
             
             state[self.run_label].update(updates_dict)
             state[self.run_label]["last_updated"] = time.time()
@@ -215,6 +229,9 @@ class LiveTracker:
             elif data.startswith("warnings:"):
                 run_id = data.split("warnings:")[1]
                 self._send_warnings(run_id, cb['id'])
+            elif data.startswith("cancel:"):
+                run_id = data.split("cancel:")[1]
+                self._handle_cancel_request(run_id, cb['id'])
 
     def _send_status_dashboard(self):
         state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
@@ -321,6 +338,9 @@ class LiveTracker:
         if warnings:
             buttons.insert(0, [{"text": "⚠️ Fetch Warnings", "callback_data": f"warnings:{run_id}"}])
             
+        if phase != "Unknown" and rd.get("status") != "cancelled":
+            buttons.insert(0, [{"text": "🛑 Cancel Run", "callback_data": f"cancel:{run_id}"}])
+            
         payload = {
             "chat_id": self.tg_chat_id,
             "message_id": callback_msg_id,
@@ -357,6 +377,23 @@ class LiveTracker:
             msg += f"• {w}\n"
             
         self._send_telegram(msg)
+
+    def _handle_cancel_request(self, run_id, callback_id):
+        try:
+            requests.post(f"https://api.telegram.org/bot{self.tg_token}/answerCallbackQuery", 
+                          json={"callback_query_id": callback_id, "text": f"Cancelling {run_id}...", "show_alert": True}, timeout=5)
+        except Exception: pass
+        
+        state_file = os.path.join(tempfile.gettempdir(), "snn_tracker_state.json")
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            if run_id in state:
+                state[run_id]["status"] = "cancelled"
+                with open(state_file, 'w') as f:
+                    json.dump(state, f)
+        except Exception: pass
 
     # ──────────────── Low-Level Send ──────────────── #
 

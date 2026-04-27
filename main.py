@@ -101,11 +101,11 @@ def main():
         # Init W&B for eval logging
         id_label = f"loso{args.loso}" if args.loso else f"subj{args.subj}"
         wandb.init(
-            project=config.logging.project_name,
-            name=f"eval-{config.logging.run_name}-{id_label}",
+            project=config.logger.project_name,
+            name=f"eval-{config.logger.run_name}-{id_label}",
             config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
-            tags=list(config.logging.tags) + ["eval"],
-            mode="disabled" if config.logging.get('offline') else "online",
+            tags=list(config.logger.tags) + ["eval"],
+            mode="disabled" if config.logger.get('offline') or not config.logger.get('enabled', True) else "online",
             settings=wandb.Settings(_disable_stats=True, _disable_meta=True)
         )
 

@@ -1,0 +1,9 @@
+defaults:
+  - telegram: default
+
+project_name: "snn-encoding-showdown"
+run_name: "MobileNet"
+tags: ["mobilenet", "tsm", "phase1a", "scda"]
+offline: false
+log_interval: 1
+enabled: true

@@ -4,6 +4,7 @@ defaults:
   - decoder: spiking        
   - architecture: phase1a
   - training: phase1a
+  - logger: default
   - _self_
 
 encoder:
@@ -45,7 +46,7 @@ loss:
   lambda_seg: 0.0
   lambda_con: 0.0
   temperature: 0.1
-  iic_enabled: true
+  use_scda: true
   decoupled: true
   iic_intra_weight: 1.0
   iic_inter_weight: 1.0
@@ -68,5 +69,4 @@ logging:
   tags: ["mobilenet", "tsm", "phase1a", "scda"]
   offline: false
   log_interval: 1
-  telegram_token: "8184554905:AAHLQvFjkq-0tZE1qa6RzU9WGoelLMQXr2s"
-  telegram_chat_id: "833213921"
+  

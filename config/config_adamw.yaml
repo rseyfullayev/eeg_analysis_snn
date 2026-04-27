@@ -21,7 +21,11 @@ training:
   supmoco_momentum: 0.9
   supmoco_queue_size: 512
   use_muon: false
-  use_fourier_mixup: false
+  use_fourier_mixup: true
+  fourier_mixup:
+    retention_ratio: 0.95       # % variance to retain (try 0.90–0.98)
+    p: 0.5                     # blend probability
+    beta_alpha: 1.0             # Beta distribution shape (1.0=uniform)
   
 
 
@@ -40,10 +44,8 @@ loss:
   lambda_seg: 0.0
   lambda_con: 0.0
   temperature: 0.1
-  use_scda: true
+  use_scda: false
   decoupled: true
-  iic_intra_weight: 1.0
-  iic_inter_weight: 1.0
   lambda_class: 1.0
   lambda_fire: 0.0
   target_rate: 0.1

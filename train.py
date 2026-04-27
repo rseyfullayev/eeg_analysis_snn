@@ -26,8 +26,7 @@ from sklearn.exceptions import UndefinedMetricWarning
 import numpy as np
 from tqdm import tqdm
 from src.snn_modeling.utils.utils import initialize_network
-from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing, SpatialDropout
-from src.snn_modeling.utils.fourier_mixup import FourierMixup, build_fourier_mixup
+from src.snn_modeling.utils.augmentations import VideoTemporalMasking, GaussianNoise, FrequencyDropout, SignalJitter, VideoRandomErasing, SpatialDropout, FourierMixup, build_fourier_mixup
 from src.snn_modeling.layers.neurons import ALIF
 from src.snn_modeling.models.unet import SpikingMobileNetProjector
 from omegaconf import OmegaConf
@@ -505,6 +504,12 @@ def training_loop(phase,
         dann_loss_total = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
+            if live_tracker and getattr(live_tracker, 'is_cancelled', False):
+                print("\n[!] Run cancelled via Telegram Dashboard. Exiting...")
+                live_tracker.custom("🛑 **Run manually cancelled by user via Dashboard.**")
+                import sys
+                sys.exit(0)
+                
             # Handle both augmented (8 items) and non-augmented (6 items) returns
             # Augmented: (inp1, inp2, targets, targets_c, subject_labels, bag_id, video_id, timestamp)
             # Non-augmented: (inputs, targets, targets_c, bag_id, video_id, timestamp)
@@ -974,7 +979,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         print("WARNING: use_dann is True but model has no dann_head. Ignoring DANN for this phase.")
         enc_class.use_dann = False
 
-    iic_enabled = config.loss.get('iic_enabled', False)
+    use_scda = config.loss.get('use_scda', False)
     iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
     iic_inter_weight = config.loss.get('iic_inter_weight', 1.0)
     decoupled = config.loss.get('decoupled', False)
@@ -985,7 +990,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         loss_fn = SupMoCoLoss(
             train_loader.dataset.prototypes,
             temperature=con_temp,
-            iic_enabled=iic_enabled,
+            iic_enabled=use_scda,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
             temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
@@ -1101,7 +1106,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         print("WARNING: use_dann is True but model has no dann_head. Ignoring DANN for this phase.")
         enc_class.use_dann = False
 
-    iic_enabled = config.loss.get('iic_enabled', False)
+    use_scda = config.loss.get('use_scda', False)
     iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
     iic_inter_weight = config.loss.get('iic_inter_weight', 1.0)
     decoupled = config.loss.get('decoupled', False)
@@ -1112,7 +1117,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         loss_fn = SupMoCoLoss(
             train_loader.dataset.prototypes,
             temperature=con_temp,
-            iic_enabled=iic_enabled,
+            iic_enabled=use_scda,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
             temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
@@ -1124,7 +1129,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         loss_fn = ContrastiveLoss(
             train_loader.dataset.prototypes,
             temperature=con_temp,
-            iic_enabled=iic_enabled,
+            iic_enabled=use_scda,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
             decoupled=decoupled,
@@ -1319,21 +1324,31 @@ phase_handles = {
 
 def run_training(config, model, device, phase, resume, loso=None, subj=None, checkpoint=None):
 
+    logger_cfg = config.get('logger', {})
+    if not logger_cfg.get('enabled', True):
+        print("Run disabled via config.logger.enabled = False. Skipping...")
+        return
+
+    time_str = datetime.now().strftime('%m%d_%H%M%S')
     if loso:
-        run_name = f"{config.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_loso{loso}"
+        run_name = f"{logger_cfg.get('run_name', config.experiment_name)}_{time_str}_loso{loso}"
     else:
-        run_name = f"{config.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_subj{subj}"
-    checkpoint_dir = os.path.join(config.data.get('save_path', ''), "saved_models", f"phase{phase}", run_name)
+        run_name = f"{logger_cfg.get('run_name', config.experiment_name)}_{time_str}_subj{subj}"
     
+    # Overwrite the logger's run_name so it's consistent across LiveTracker and WandB
+    if 'logger' in config:
+        config.logger.run_name = run_name
+
+    checkpoint_dir = os.path.join(config.data.get('save_path', ''), "saved_models", f"phase{phase}", run_name)
     
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     wandb.init(
-        project=config.logging.project_name,
-        name=config.logging.run_name,
+        project=logger_cfg.get('project_name', 'snn'),
+        name=run_name,
         config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
-        tags=list(config.logging.tags),
-        mode="disabled" if config.logging.get('offline') else "online",
+        tags=list(logger_cfg.get('tags', [])),
+        mode="disabled" if logger_cfg.get('offline') else "online",
         settings=wandb.Settings(_disable_stats=True, _disable_meta=True) 
     )
     

@@ -122,7 +122,7 @@ class ContrastiveLoss(nn.Module):
                  decoupled=False):
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature
-        self.iic_enabled = iic_enabled
+        self.use_scda = iic_enabled
         self.iic_intra_weight = iic_intra_weight
         self.iic_inter_weight = iic_inter_weight
         self.decoupled = decoupled
@@ -183,7 +183,7 @@ class ContrastiveLoss(nn.Module):
         dice_pair = self.sim_score[label_flat][:, label_flat]   # (2N, 2N)
         neg_mask = logits_mask - mask                                      # 1 for negatives, 0 for positives/self
         
-        if self.iic_enabled:
+        if self.use_scda:
             pos_weights = mask * self.iic_intra_weight
             neg_weights = neg_mask * (1.0 + dice_pair)
         else:
@@ -372,7 +372,7 @@ class SupMoCoLoss(ContrastiveLoss):
         logits = logits - logits_max.detach()
         logits_neg = logits_neg - logits_max.detach()
 
-        if self.iic_enabled:
+        if self.use_scda:
             # 1. Domain Adaptation Positives: Labels equal, Subjects differ
             pos_weights = pos_mask * diff_subj_mask
 
