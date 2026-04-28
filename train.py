@@ -1342,28 +1342,33 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         print("Run disabled via config.logger.enabled = False. Skipping...")
         return
 
-    time_str = datetime.now().strftime('%m%d_%H%M%S')
-    if loso:
-        run_name = f"{logger_cfg.get('run_name', config.experiment_name)}_{time_str}_loso{loso}"
-    else:
-        run_name = f"{logger_cfg.get('run_name', config.experiment_name)}_{time_str}_subj{subj}"
-    
-    # Overwrite the logger's run_name so it's consistent across LiveTracker and WandB
-    if 'logger' in config:
-        config.logger.run_name = run_name
+    # Use pre-calculated run_name from main.py if available, otherwise generate one
+    run_name = logger_cfg.get('run_name')
+    if not run_name:
+        time_str = datetime.now().strftime('%m%d_%H%M%S')
+        id_tag = f"loso{loso}" if loso else (f"subj{subj}" if subj else "run")
+        run_name = f"{logger_cfg.get('run_name', config.experiment_name)}_{time_str}_{id_tag}"
+        
+        if 'logger' in config:
+            from omegaconf import open_dict
+            with open_dict(config):
+                config.logger.run_name = run_name
 
     checkpoint_dir = os.path.join(config.data.get('save_path', ''), "saved_models", f"phase{phase}", run_name)
     
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    wandb.init(
-        project=logger_cfg.get('project_name', 'snn'),
-        name=run_name,
-        config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
-        tags=list(logger_cfg.get('tags', [])),
-        mode="disabled" if logger_cfg.get('offline') else "online",
-        settings=wandb.Settings(_disable_stats=True, _disable_meta=True) 
-    )
+    if wandb.run is None:
+        wandb.init(
+            project=logger_cfg.get('project_name', 'snn'),
+            name=run_name,
+            config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
+            tags=list(logger_cfg.get('tags', [])),
+            mode="disabled" if logger_cfg.get('offline') else "online",
+            settings=wandb.Settings(_disable_stats=True, _disable_meta=True) 
+        )
+    else:
+        print(f"[W&B] Using existing run: {wandb.run.name}")
     
     log_dir = os.path.join("results", run_name)
     writer = SummaryWriter(log_dir=log_dir)

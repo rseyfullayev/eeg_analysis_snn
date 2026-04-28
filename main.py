@@ -93,6 +93,31 @@ def main():
     if args.phase is not None:
         args.phase = str(args.phase).lower()
 
+    # --- [EARLY W&B INITIALIZATION] ---
+    # We start W&B here so we can see the console output of setup-data and masks in real-time
+    if not (args.mode == 'test' or args.test or args.audit_bio or args.calculate_stat):
+        from datetime import datetime
+        time_str = datetime.now().strftime('%m%d_%H%M%S')
+        id_tag = f"loso{args.loso}" if args.loso else (f"subj{args.subj}" if args.subj else "run")
+        base_name = config.logger.get('run_name', config.get('experiment_name', 'snn_run'))
+        run_name = f"{base_name}_{time_str}_{id_tag}"
+        
+        # Inject into config so it is propagated to train.py and LiveTracker
+        from omegaconf import open_dict
+        with open_dict(config):
+            config.logger.run_name = run_name
+
+        if config.logger.get('enabled', True):
+            wandb.init(
+                project=config.logger.get('project_name', 'snn'),
+                name=run_name,
+                config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
+                tags=list(config.logger.get('tags', [])),
+                mode="disabled" if config.logger.get('offline') else "online",
+                settings=wandb.Settings(_disable_stats=True, _disable_meta=True)
+            )
+            print(f"\n[W&B] initialized at start: {run_name}\n")
+
     if args.setup_data:
         print("\n--- [1] Running Dataset Setup ---")
         if not args.raw_path or not args.coords_path or not args.output_path:
