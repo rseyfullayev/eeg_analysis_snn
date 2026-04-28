@@ -815,7 +815,20 @@ def training_loop(phase,
             tr_b2s = {str(item[0]): item[3] for item in train_loader.dataset.samples}
             vl_b2s = {str(item[0]): item[3] for item in val_loader.dataset.samples}
             
-            emb_t, lbl_t, grps_t = _extract_feats(train_loader)
+            import copy
+            clean_train_set = copy.copy(train_loader.dataset)
+            clean_train_set.augmentations = None
+            
+            bs = getattr(train_loader, 'batch_size', None)
+            if bs is None:
+                try:
+                    bs = clean_train_set.config.training.batch_size
+                except Exception:
+                    bs = 16
+            
+            clean_train_loader = DataLoader(clean_train_set, batch_size=bs, shuffle=False, num_workers=0)
+            
+            emb_t, lbl_t, grps_t = _extract_feats(clean_train_loader)
             emb_v, lbl_v, grps_v = _extract_feats(val_loader)
             
             subj_t = np.array([tr_b2s.get(str(g), -1) for g in grps_t])

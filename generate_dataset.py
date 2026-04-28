@@ -12,6 +12,43 @@ import torch.nn.functional as F
 
 SELECTED_EMOTIONS = [0, 1, 2, 3, 4] 
 
+def compute_alignment_matrix(covs_list, device):
+    """
+    Computes the EA alignment matrix R^{-1/2} from a list of trial covariances.
+    """
+    mean_cov = torch.stack(covs_list).mean(dim=0)
+    C = mean_cov.shape[0]
+    
+    # Add small epsilon for numerical stability
+    mean_cov = mean_cov + torch.eye(C, device=device) * 1e-4
+    
+    # Compute R^{-1/2} using Eigen Decomposition
+    L, Q = torch.linalg.eigh(mean_cov)
+    L_inv_sqrt = torch.diag(1.0 / torch.sqrt(L.clamp(min=1e-6)))
+    R_inv_sqrt = torch.matmul(torch.matmul(Q, L_inv_sqrt), Q.t())
+    
+    return R_inv_sqrt
+
+def apply_alignment(x, R_inv_sqrt):
+    """
+    Applies the pre-computed alignment matrix to the raw signal.
+    """
+    is_batched = (x.dim() == 3)
+    if not is_batched:
+        x = x.unsqueeze(0)
+        
+    # Center the data
+    x_mean = x.mean(dim=-1, keepdim=True)
+    x_centered = x - x_mean
+    
+    R_inv_sqrt_batched = R_inv_sqrt.unsqueeze(0).expand(x.shape[0], -1, -1)
+    x_aligned = torch.bmm(R_inv_sqrt_batched, x_centered)
+    
+    if not is_batched:
+        x_aligned = x_aligned.squeeze(0)
+        
+    return x_aligned
+
 def parse_metadata(filename):
     """
     Format: SubjectID_SessionID_Date.cnt (e.g., "1_1_20180804.cnt")
@@ -30,7 +67,7 @@ def parse_metadata(filename):
         session_id = "unknown"
 
     
-    return subject_id
+    return subject_id, session_id
 
 def run_data_setup(config=None):
     print("Initializing Pipeline...")
@@ -66,6 +103,32 @@ def run_data_setup(config=None):
 
     emotion_map = {original: idx for idx, original in enumerate(SELECTED_EMOTIONS)}
     
+    # --- EA PASS 1: COMPUTE SESSION COVARIANCES ---
+    print(f"Phase 1: Computing Session-Level Euclidean Alignment Matrices across {len(dataset_reader)} files...")
+    subject_covs = defaultdict(list)
+    
+    for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader), desc="EA Pass 1"):
+        subject_id, session_id = parse_metadata(orig_filename)
+        session_key = f"{subject_id}_{session_id}"
+        
+        raw_eeg = raw_eeg.to(device)
+        
+        # Calculate single trial covariance
+        x_mean = raw_eeg.mean(dim=-1, keepdim=True)
+        x_centered = raw_eeg - x_mean
+        
+        if x_centered.dim() == 3:
+            x_centered = x_centered.squeeze(0) # (C, T)
+            
+        C, T = x_centered.shape
+        cov = torch.mm(x_centered, x_centered.t()) / max(T - 1, 1)
+        subject_covs[session_key].append(cov)
+
+    print("Phase 1 Complete: Resolving Alignment Matrices...")
+    subject_alignment_matrices = {}
+    for subj, covs in subject_covs.items():
+        subject_alignment_matrices[subj] = compute_alignment_matrix(covs, device)
+        
     # --- STATISTICS COLLECTOR ---
 
     registry = []
@@ -75,18 +138,24 @@ def run_data_setup(config=None):
     total_collected = 0
     GPU_BATCH_SIZE = 16 
     
-    print(f"Processing {len(dataset_reader)} raw files...")
+    print("Phase 2: Generating Dataset...")
     
     for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader)): 
         bag_id += 1
-        subject_id = parse_metadata(orig_filename)
+        subject_id, session_id = parse_metadata(orig_filename)
+        session_key = f"{subject_id}_{session_id}"
 
         if use_sampling_limit and total_collected >= TOTAL_TARGET: break
 
         raw_eeg = raw_eeg.to(device)
-        if raw_eeg.shape[1] < WINDOW_SIZE: continue
+        if raw_eeg.dim() == 2 and raw_eeg.shape[1] < WINDOW_SIZE: continue
+        elif raw_eeg.dim() == 3 and raw_eeg.shape[2] < WINDOW_SIZE: continue
 
         with torch.no_grad():
+            # Apply pre-computed Session-Level Euclidean Alignment
+            R_inv_sqrt = subject_alignment_matrices[session_key]
+            raw_eeg = apply_alignment(raw_eeg, R_inv_sqrt)
+            
             feats = wavelet(raw_eeg)
             feats = torch.log1p(feats)
             median = feats.median(dim=-1, keepdim=True).values

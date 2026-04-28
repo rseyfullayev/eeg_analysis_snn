@@ -29,6 +29,7 @@ data/
 cicd/
 
 PROJECT_STATE.md
+artifacts/
 
 # Auto-runner state (local to lab machine)
 .last_run_commit

@@ -200,8 +200,8 @@ class TemporalMix(nn.Module):
 
 def compute_subject_variance_map(dataset, max_samples_per_subject=200, device='cuda'):
     from collections import defaultdict
-    subject_magnitudes = defaultdict(list)
-    print("[FourierMixup] Phase 1: Computing subject magnitude centroids in 3D...")
+    subject_ffts = defaultdict(list)
+    print("[FourierMixup] Phase 1: Computing subject complex FFT centroids in 3D...")
     
     for idx in tqdm(range(len(dataset)), desc="Scanning FFTs"):
         sample = dataset[idx]
@@ -213,7 +213,7 @@ def compute_subject_variance_map(dataset, max_samples_per_subject=200, device='c
             subject_idx = dataset.samples[idx][3]
             
         if subject_idx == -1: continue
-        if len(subject_magnitudes[subject_idx]) >= max_samples_per_subject: continue
+        if len(subject_ffts[subject_idx]) >= max_samples_per_subject: continue
             
         if video.dim() == 5:
             volume = video[0].mean(dim=1)  # (T, H, W)
@@ -226,41 +226,42 @@ def compute_subject_variance_map(dataset, max_samples_per_subject=200, device='c
         
         fft_3d = torch.fft.fftn(volume)
         fft_shifted = torch.fft.fftshift(fft_3d)
-        magnitude = torch.abs(fft_shifted)
         
-        subject_magnitudes[subject_idx].append(magnitude.cpu())
+        subject_ffts[subject_idx].append(fft_shifted.cpu())
     
-    subject_ids_sorted = sorted(subject_magnitudes.keys())
+    subject_ids_sorted = sorted(subject_ffts.keys())
     centroids = []
-    donor_magnitudes = []
+    donor_ffts = []
     for subj_id in subject_ids_sorted:
-        mags = torch.stack(subject_magnitudes[subj_id])
-        centroid = mags.mean(dim=0)  # (T, H, W)
+        ffts = torch.stack(subject_ffts[subj_id])
+        centroid = ffts.mean(dim=0)  # (T, H, W) complex
         centroids.append(centroid)
-        donor_magnitudes.append((subj_id, centroid))
+        donor_ffts.append((subj_id, centroid))
     
     if len(centroids) < 2:
         print("[FourierMixup] Warning: fewer than 2 subjects found, returning uniform variance map.")
         shape = centroids[0].shape if centroids else (16, 32, 32)
-        return torch.ones(shape), shape, donor_magnitudes
+        return torch.ones(shape), shape, donor_ffts
         
     centroids = torch.stack(centroids)
-    variance_map = centroids.var(dim=0)
+    # Variance of the magnitudes for optimal sigma search
+    variance_map = torch.abs(centroids).var(dim=0)
     variance_map = variance_map / (variance_map.max() + 1e-8)
     shape = variance_map.shape
     print(f"[FourierMixup] Phase 1 complete: {len(centroids)} subjects, shape={shape}")
     
-    return variance_map, shape, donor_magnitudes
+    return variance_map, shape, donor_ffts
 
 def compute_optimal_sigma(variance_map, retention_ratio=0.95, max_iter=50, tol=1e-6):
     T, H, W = variance_map.shape
+    device = variance_map.device
     total_energy = variance_map.sum().item()
     target_energy = retention_ratio * total_energy
     
     ct, cy, cx = T // 2, H // 2, W // 2
-    tt, yy, xx = torch.meshgrid(torch.arange(T, dtype=torch.float32),
-                                torch.arange(H, dtype=torch.float32),
-                                torch.arange(W, dtype=torch.float32), indexing='ij')
+    tt, yy, xx = torch.meshgrid(torch.arange(T, dtype=torch.float32, device=device),
+                                torch.arange(H, dtype=torch.float32, device=device),
+                                torch.arange(W, dtype=torch.float32, device=device), indexing='ij')
     dist_sq = (tt - ct) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2
     
     sigma_min = 0.5
@@ -280,7 +281,7 @@ def compute_optimal_sigma(variance_map, retention_ratio=0.95, max_iter=50, tol=1
     return sigma
 
 class FourierMixup(nn.Module):
-    def __init__(self, sigma, shape, p=0.5, beta_alpha=1.0, donor_magnitudes=None):
+    def __init__(self, sigma, shape, p=0.5, beta_alpha=1.0, donor_ffts=None):
         super().__init__()
         self.p = p
         self.beta_alpha = beta_alpha
@@ -297,9 +298,9 @@ class FourierMixup(nn.Module):
         
         self.register_buffer('gaussian_mask', gaussian_mask)
         
-        if donor_magnitudes is not None and len(donor_magnitudes) > 0:
-            self.donor_subject_ids = [d[0] for d in donor_magnitudes]
-            donor_stack = torch.stack([d[1] for d in donor_magnitudes])
+        if donor_ffts is not None and len(donor_ffts) > 0:
+            self.donor_subject_ids = [d[0] for d in donor_ffts]
+            donor_stack = torch.stack([d[1] for d in donor_ffts])
             self.register_buffer('donor_pool', donor_stack)
         else:
             self.donor_subject_ids = []
@@ -311,22 +312,21 @@ class FourierMixup(nn.Module):
         if self.donor_pool.ndim < 2 or self.donor_pool.shape[0] < 1: return x
             
         donor_idx = torch.randint(0, self.donor_pool.shape[0], (1,)).item()
-        donor_mag = self.donor_pool[donor_idx]
+        donor_fft_val = self.donor_pool[donor_idx]
         
         lam = torch.distributions.Beta(self.beta_alpha, self.beta_alpha).sample().item()
         orig_shape = x.shape
         frames = x.permute(1, 0, 2, 3)
         
         fft_a = torch.fft.fftshift(torch.fft.fftn(frames, dim=(1, 2, 3)), dim=(1, 2, 3))
-        mag_a = torch.abs(fft_a)
-        phase_a = torch.angle(fft_a)
         
-        mag_donor = donor_mag.unsqueeze(0)
+        donor_c = donor_fft_val.unsqueeze(0)
         mask = self.gaussian_mask.unsqueeze(0)
         blend_mask = mask * lam
         
-        mixed_mag = (blend_mask * mag_donor) + ((1.0 - blend_mask) * mag_a)
-        mixed_fft = mixed_mag * torch.exp(1j * phase_a)
+        # Cartesian Complex Interpolation
+        mixed_fft = (blend_mask * donor_c) + ((1.0 - blend_mask) * fft_a)
+        
         mixed_frames = torch.fft.ifftn(torch.fft.ifftshift(mixed_fft, dim=(1, 2, 3)), dim=(1, 2, 3)).real
         
         return mixed_frames.permute(1, 0, 2, 3).reshape(orig_shape)
@@ -337,7 +337,7 @@ def build_fourier_mixup(dataset, retention_ratio=0.95, p=0.5, beta_alpha=1.0,
     import os
     if cache_dir is None: cache_dir = getattr(dataset, 'samples_dir', None) or '.'
     cache_key = f"loso{loso_id}_ret{retention_ratio:.2f}" if loso_id is not None else f"ret{retention_ratio:.2f}"
-    cache_path = os.path.join(cache_dir, f"fourier_mixup_cache_3d_{cache_key}.pt")
+    cache_path = os.path.join(cache_dir, f"fourier_mixup_cache_complex_3d_{cache_key}.pt")
     
     if os.path.exists(cache_path):
         print(f"[FourierMixup] Loading cached σ from {cache_path}")
@@ -347,18 +347,18 @@ def build_fourier_mixup(dataset, retention_ratio=0.95, p=0.5, beta_alpha=1.0,
         donor_ids = cached.get('donor_subject_ids', [])
         donor_centroids = cached.get('donor_centroids', None)
         if donor_centroids is not None and len(donor_ids) > 0:
-            donor_magnitudes = list(zip(donor_ids, [donor_centroids[i] for i in range(donor_centroids.shape[0])]))
+            donor_ffts = list(zip(donor_ids, [donor_centroids[i] for i in range(donor_centroids.shape[0])]))
         else:
-            donor_magnitudes = []
+            donor_ffts = []
     else:
         print(f"[FourierMixup] No cache found at {cache_path}, computing from scratch...")
-        variance_map, shape, donor_magnitudes = compute_subject_variance_map(
+        variance_map, shape, donor_ffts = compute_subject_variance_map(
             dataset, max_samples_per_subject=max_samples_per_subject, device=device
         )
         sigma = compute_optimal_sigma(variance_map, retention_ratio=retention_ratio)
         try:
-            donor_ids = [d[0] for d in donor_magnitudes]
-            donor_centroids = torch.stack([d[1] for d in donor_magnitudes]) if donor_magnitudes else torch.zeros(0)
+            donor_ids = [d[0] for d in donor_ffts]
+            donor_centroids = torch.stack([d[1] for d in donor_ffts]) if donor_ffts else torch.zeros(0)
             torch.save({
                 'sigma': torch.tensor(sigma),
                 'shape': torch.tensor(shape),
@@ -370,6 +370,6 @@ def build_fourier_mixup(dataset, retention_ratio=0.95, p=0.5, beta_alpha=1.0,
         except Exception as e:
             print(f"[FourierMixup] Warning: could not save cache: {e}")
     
-    mixup = FourierMixup(sigma=sigma, shape=shape, p=p, beta_alpha=beta_alpha, donor_magnitudes=donor_magnitudes)
+    mixup = FourierMixup(sigma=sigma, shape=shape, p=p, beta_alpha=beta_alpha, donor_ffts=donor_ffts)
     print(f"[FourierMixup] Ready: σ={sigma:.2f}, shape={shape}, p={p}, β_α={beta_alpha}")
     return mixup

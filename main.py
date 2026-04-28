@@ -43,6 +43,7 @@ def main():
     parser.add_argument('--audit_bio', action='store_true', help='Run Biological Audit (Model-Free)')
     parser.add_argument('--masks', action='store_true', help='Derive masks from Subject')
     parser.add_argument('--calibrate', action='store_true', help='Calibrate optimal ALIF parameters')
+    parser.add_argument('--no_train', action='store_true', help='Skip training after setup tasks')
     args = parser.parse_args()
     config_path = args.config
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -91,6 +92,28 @@ def main():
 
     if args.phase is not None:
         args.phase = str(args.phase).lower()
+
+    if args.setup_data:
+        print("\n--- [1] Running Dataset Setup ---")
+        if not args.raw_path or not args.coords_path or not args.output_path:
+            parser.error("When using --setup_data, you MUST specify raw_path, coords_path, and output_path (either config or CLI).")
+        config.data.raw_path = args.raw_path
+        config.data.coords_path = args.coords_path
+        config.data.dataset_path = args.output_path
+        print(f"   Raw Source: {args.raw_path}")
+        print(f"   Coordinates: {args.coords_path}")
+        print(f"   Target: {args.output_path}")
+        run_data_setup(config)
+        print("Setup complete.\n")
+
+    if args.masks:
+        print("\n--- [2] Generating Prototypes / Masks ---")
+        generate_masks(config, subject_id=args.subj, loso_subject_id=args.loso)
+        print("Masks generated.\n")
+        
+    if args.no_train:
+        print("Exiting because --no_train was specified.")
+        exit(0)
 
     if args.mode == 'test' or args.test:
         if args.checkpoint is None:
@@ -169,9 +192,6 @@ def main():
         
         calibrate_params(model.encoder, val_loader, device)
     
-    elif args.masks:
-        generate_masks(config, subject_id=args.subj, loso_subject_id=args.loso)
-
     elif args.calculate_stat:
         dataset = SWEEPDataset(
                 config, 
@@ -184,25 +204,6 @@ def main():
         analyze_distribution(dataloader)
         #calculate_optimal_firing_rate(dataset)
         generate_topology_proof(dataloader, torch.device("cuda"), class_names=[0,1,2,3,4])
-
-        
-
-    elif args.setup_data:
-        print("Running dataset setup...")
-        
-        if not args.raw_path or not args.coords_path or not args.output_path:
-            parser.error("When using --setup_data, you MUST specify raw_path, coords_path, and output_path (either config or CLI).")
-        config.data.raw_path = args.raw_path
-        config.data.coords_path = args.coords_path
-        config.data.dataset_path = args.output_path
-        print(f"   Raw Source: {args.raw_path}")
-        print(f"   Coordinates: {args.coords_path}")
-        print(f"   Target: {args.output_path}")
-        
-        # Execute Setup
-        run_data_setup(config)
-        
-        print("Setup complete.")
     elif args.val:
         checkpoint = None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

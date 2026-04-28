@@ -1,4 +1,4 @@
-dataset_path: "/media/temporaryuser3/STORAGE/SEED-V/preprocessed_eeg"
+dataset_path: "/media/temporaryuser3/STORAGE/SEED-V/preprocessed_eeg_ea"
 raw_path: "/media/temporaryuser3/STORAGE/SEED-V/"
 coords_path: "/media/temporaryuser3/STORAGE/SEED-V/coords.csv"
 save_path: "/media/temporaryuser3/STORAGE/ERO/"
