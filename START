@@ -1,2 +1,2 @@
 config/config_adamw.yaml
---setup-data --masks --loso 1
+--setup_data --masks --loso 1
