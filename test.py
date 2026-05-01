@@ -364,27 +364,8 @@ def test(config, loso, subj, device, model):
         print("  Diagonal = intra-class mean pairwise, Off-diagonal = inter-class centroid")
         print(np.array2string(sim, precision=3, suppress_small=True))
 
-        # 5. UMAP (cuML GPU if available, else CPU)
-        reducer = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
-        emb_2d = reducer.fit_transform(emb)
-
-        palette = sns.color_palette("husl", num_classes)
-
-        fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
-        sns.scatterplot(
-            x=emb_2d[:, 0], y=emb_2d[:, 1],
-            hue=labels, palette=palette,
-            s=15, alpha=0.7, ax=ax_umap
-        )
-        ax_umap.set_title(f"UMAP {split_name} — {id_label}")
-        ax_umap.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
-        fig_umap.tight_layout()
-
+        # 5. Cosine Similarity Heatmap
         suffix = f"loso{loso}" if loso else f"subj{subj}"
-        umap_path = f"evidence/umap_{split_name.lower()}_{suffix}.png"
-        fig_umap.savefig(umap_path, dpi=150)
-        plt.close(fig_umap)
-        print(f"UMAP saved to {umap_path}")
 
         fig_sim, ax_sim = plt.subplots(figsize=(6, 5))
         sns.heatmap(
@@ -405,7 +386,6 @@ def test(config, loso, subj, device, model):
         print(f"Cosine similarity heatmap saved to {sim_path}")
 
         return {
-            f"{tag}/UMAP_{id_label}": wandb.Image(umap_path, caption=f"UMAP {split_name} {id_label}"),
             f"{tag}/CosineSim_{id_label}": wandb.Image(sim_path, caption=f"Cosine Sim {split_name} {id_label}"),
             f"{tag}/Silhouette": sil,
             f"{tag}/LinearProbe_BalAcc": lp,
@@ -471,7 +451,6 @@ def test(config, loso, subj, device, model):
         # 2. Fit on all Train subjects -> Predict on Test/Val set 
         # (Sanity check: Accuracy will inevitably be low for an unseen test subject)
         subj_cross_acc = 0.0
-        clf = None
         if not _features_are_degenerate(emb_train) and not _features_are_degenerate(emb_val):
             try:
                 clf = get_svm()
@@ -479,71 +458,175 @@ def test(config, loso, subj, device, model):
                 subj_cross_acc = balanced_accuracy_score(subj_val, clf.predict(emb_val))
             except Exception as e:
                 print(f"  [Proxy-A] Cross-split SVM failed: {e}")
-                clf = None
         else:
             print("  [Proxy-A] Skipped cross-split — degenerate features")
         print(f"  Subject ID Prediction (Train->Val cross-split):   {subj_cross_acc:.4f}")
         
         log_dict["Eval/ProxyA_Subject_TrainCV"] = subj_cv_acc
         log_dict["Eval/ProxyA_Subject_TrainVal"] = subj_cross_acc
-
-        # =================================================================
-        # Subject-Heterogeneous UMAP Generative Probes
-        # =================================================================
-        print(f"\n{'='*60}")
-        print(f"  Subject-Heterogeneous UMAPs")
-        print(f"{'='*60}")
-
-        train_reducer = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
-        emb_train_2d_subj = train_reducer.fit_transform(emb_train)
-        
-        unique_train_subjs = np.unique(subj_train)
-        palette_subj_train = sns.color_palette("husl", len(unique_train_subjs))
-        
-        fig_subj_tr, ax_subj_tr = plt.subplots(figsize=(10, 8))
-        sns.scatterplot(
-            x=emb_train_2d_subj[:, 0], y=emb_train_2d_subj[:, 1],
-            hue=subj_train, palette=palette_subj_train,
-            s=15, alpha=0.7, ax=ax_subj_tr, legend='full'
-        )
-        ax_subj_tr.set_title(f"Train UMAP Colored by Subject ID — {id_label}")
-        ax_subj_tr.legend(title='Subject ID', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
-        fig_subj_tr.tight_layout()
-        
-        suffix = f"loso{loso}" if loso else f"subj{subj}"
-        train_subj_umap_path = f"evidence/umap_train_subject_{suffix}.png"
-        fig_subj_tr.savefig(train_subj_umap_path, dpi=150)
-        plt.close(fig_subj_tr)
-        log_dict["Eval/UMAP_Subject_Train"] = wandb.Image(train_subj_umap_path, caption=f"UMAP Train by Subject")
-        print(f"  Saved {train_subj_umap_path}")
-        
-        # We need preds_subj_val from the SVM for the val UMAP plot
-        if clf is not None:
-            preds_subj_val = clf.predict(emb_val)
-
-            # Transform Val using Train-fitted UMAP, colored by Predicted TRAIN Subject IDs
-            emb_val_2d_subj = train_reducer.transform(emb_val)
-            
-            fig_subj_val, ax_subj_val = plt.subplots(figsize=(10, 8))
-            sns.scatterplot(
-                x=emb_val_2d_subj[:, 0], y=emb_val_2d_subj[:, 1],
-                hue=preds_subj_val, palette=palette_subj_train, hue_order=unique_train_subjs,
-                s=15, alpha=0.7, ax=ax_subj_val, legend='full'
-            )
-            ax_subj_val.set_title(f"Val UMAP (Train-Fitted) Colored by PRED Train Subj ID — {id_label}")
-            ax_subj_val.legend(title='Pred Train Subj', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
-            fig_subj_val.tight_layout()
-            
-            val_subj_umap_path = f"evidence/umap_val_subject_{suffix}.png"
-            fig_subj_val.savefig(val_subj_umap_path, dpi=150)
-            plt.close(fig_subj_val)
-            log_dict["Eval/UMAP_Subject_Val"] = wandb.Image(val_subj_umap_path, caption=f"UMAP Val by Subject (Train-Fitted trans.)")
-            print(f"  Saved {val_subj_umap_path}")
-        else:
-            print("  [Proxy-A] Skipping Val Subject UMAP — SVM not fitted")
-
-        
     else:
         print("  Subject IDs not parsed. Skipping Proxy-A.")
+
+    # =================================================================
+    # UMAP Visualizations (3 purpose-built plots)
+    # =================================================================
+    suffix = f"loso{loso}" if loso else f"subj{subj}"
+    palette_emo = sns.color_palette("husl", num_classes)
+
+    print(f"\n{'='*60}")
+    print(f"  UMAP 1: Subject Font Proof")
+    print(f"{'='*60}")
+    # Fit on x_train, transform x_train, color by Subject ID
+    reducer1 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
+    emb_train_2d_s = reducer1.fit_transform(emb_train)
+
+    unique_train_subjs = np.unique(subj_train)
+    palette_subj = sns.color_palette("husl", len(unique_train_subjs))
+
+    fig1, ax1 = plt.subplots(figsize=(10, 8))
+    sns.scatterplot(
+        x=emb_train_2d_s[:, 0], y=emb_train_2d_s[:, 1],
+        hue=subj_train, palette=palette_subj,
+        s=15, alpha=0.7, ax=ax1, legend='full'
+    )
+    ax1.set_title(f"UMAP 1 · Subject Font Proof (fit train) — {id_label}")
+    ax1.legend(title='Subject ID', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
+    fig1.tight_layout()
+    umap1_path = f"evidence/umap1_subject_font_{suffix}.png"
+    fig1.savefig(umap1_path, dpi=150)
+    plt.close(fig1)
+    log_dict["Eval/UMAP1_SubjectFont"] = wandb.Image(umap1_path, caption="UMAP 1 · Subject Font Proof")
+    print(f"  Saved {umap1_path}")
+
+    print(f"\n{'='*60}")
+    print(f"  UMAP 2: Domain Shift (train ○ + val ★)")
+    print(f"{'='*60}")
+    # Fit on x_train, transform x_train (light circles) and x_val (dark stars), color by Emotion
+    reducer2 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
+    emb_train_2d_d = reducer2.fit_transform(emb_train)
+    emb_val_2d_d = reducer2.transform(emb_val)
+
+    fig2, ax2 = plt.subplots(figsize=(10, 8))
+    # Train points: light circles
+    for c in range(num_classes):
+        mask_c = labels_train == c
+        ax2.scatter(
+            emb_train_2d_d[mask_c, 0], emb_train_2d_d[mask_c, 1],
+            c=[palette_emo[c]], s=12, alpha=0.3, marker='o',
+            label=f"Train Emo {c}" if c == 0 else None  # Only one legend entry for train
+        )
+    # Val points: dark stars with black outline
+    for c in range(num_classes):
+        mask_c = labels_val == c
+        ax2.scatter(
+            emb_val_2d_d[mask_c, 0], emb_val_2d_d[mask_c, 1],
+            c=[palette_emo[c]], s=60, alpha=0.9, marker='*',
+            edgecolors='black', linewidths=0.5,
+            label=f"Val Emo {c}" if c == 0 else None  # Only one legend entry for val
+        )
+    # Build a proper legend
+    import matplotlib.lines as mlines
+    legend_handles = []
+    for c in range(num_classes):
+        legend_handles.append(mlines.Line2D([], [], color=palette_emo[c], marker='o',
+                              linestyle='None', markersize=5, alpha=0.4, label=f'Train Emo {c}'))
+    for c in range(num_classes):
+        legend_handles.append(mlines.Line2D([], [], color=palette_emo[c], marker='*',
+                              linestyle='None', markersize=8, markeredgecolor='black',
+                              markeredgewidth=0.5, label=f'Val Emo {c}'))
+    ax2.legend(handles=legend_handles, bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2, fontsize=7)
+    ax2.set_title(f"UMAP 2 · Domain Shift (fit train) — {id_label}")
+    fig2.tight_layout()
+    umap2_path = f"evidence/umap2_domain_shift_{suffix}.png"
+    fig2.savefig(umap2_path, dpi=150)
+    plt.close(fig2)
+    log_dict["Eval/UMAP2_DomainShift"] = wandb.Image(umap2_path, caption="UMAP 2 · Domain Shift")
+    print(f"  Saved {umap2_path}")
+
+    print(f"\n{'='*60}")
+    print(f"  UMAP 3: Validation Separability")
+    print(f"{'='*60}")
+    # Fit on x_val, transform x_val, color by Emotion
+    reducer3 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
+    emb_val_2d_v = reducer3.fit_transform(emb_val)
+
+    fig3, ax3 = plt.subplots(figsize=(10, 8))
+    sns.scatterplot(
+        x=emb_val_2d_v[:, 0], y=emb_val_2d_v[:, 1],
+        hue=labels_val, palette=palette_emo,
+        s=15, alpha=0.7, ax=ax3
+    )
+    ax3.set_title(f"UMAP 3 · Validation Separability (fit val) — {id_label}")
+    ax3.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
+    fig3.tight_layout()
+    umap3_path = f"evidence/umap3_val_sep_{suffix}.png"
+    fig3.savefig(umap3_path, dpi=150)
+    plt.close(fig3)
+    log_dict["Eval/UMAP3_ValSeparability"] = wandb.Image(umap3_path, caption="UMAP 3 · Validation Separability")
+    print(f"  Saved {umap3_path}")
+
+    # =================================================================
+    # Intra-Bag Cosine Similarity Heatmap (sampled from train set)
+    # =================================================================
+    print(f"\n{'='*60}")
+    print(f"  Intra-Bag Cosine Similarity Heatmap")
+    print(f"{'='*60}")
+
+    # Sample a random bag from the training set and extract per-window embeddings
+    rng = np.random.RandomState(42)
+    sampled_bag_idx = rng.randint(0, len(train_set))
+    bag_sample = train_set.samples[sampled_bag_idx]
+    sampled_bag_id = bag_sample[0]
+    sampled_files = bag_sample[1]
+    sampled_emotion = bag_sample[2]
+    sampled_subject = bag_sample[3]
+    print(f"  Sampled bag_id={sampled_bag_id} (subject={sampled_subject}, emotion={sampled_emotion}, "
+          f"windows={len(sampled_files)})")
+
+    # Load all windows in the bag and extract per-window embeddings
+    window_embs = []
+    model.eval()
+    with torch.no_grad():
+        for fname in sampled_files:
+            fpath = os.path.join(train_set.samples_dir, fname)
+            try:
+                win = torch.load(fpath, weights_only=True, map_location='cpu').float()
+            except Exception as e:
+                print(f"    Skipping {fname}: {e}")
+                continue
+            # win shape: [T, C, H, W] — add batch dim
+            win = win.unsqueeze(0).to(device)            # [1, T, C, H, W]
+            win = win.permute(1, 0, 2, 3, 4)             # [T, 1, C, H, W]
+            feat, _ = model.encoder(win)                  # encoder output
+            if feat.dim() == 5:
+                emb_w = feat.mean(dim=[0, 3, 4])          # [1, D]
+            else:
+                emb_w = feat.mean(dim=[-2, -1])           # [1, D]
+            emb_w = F.normalize(emb_w, dim=1, eps=1e-6)
+            window_embs.append(emb_w.cpu())
+
+    if len(window_embs) >= 2:
+        bag_embs = torch.cat(window_embs, dim=0).numpy()  # [W, D]
+        bag_cos_sim = cosine_similarity(bag_embs)          # [W, W]
+
+        fig_bag, ax_bag = plt.subplots(figsize=(8, 7))
+        sns.heatmap(
+            bag_cos_sim, cmap="viridis", vmin=-0.2, vmax=1.0,
+            square=True, ax=ax_bag,
+            xticklabels=False, yticklabels=False
+        )
+        ax_bag.set_title(f"Intra-Bag Cosine Sim · bag={sampled_bag_id} "
+                         f"(subj={sampled_subject}, emo={sampled_emotion}, W={len(bag_embs)})")
+        ax_bag.set_xlabel("Window Index")
+        ax_bag.set_ylabel("Window Index")
+        fig_bag.tight_layout()
+        bag_hm_path = f"evidence/intrabag_cossim_{suffix}.png"
+        fig_bag.savefig(bag_hm_path, dpi=150)
+        plt.close(fig_bag)
+        log_dict["Eval/IntraBag_CosSim"] = wandb.Image(bag_hm_path, caption=f"Intra-Bag Cosine Sim (bag {sampled_bag_id})")
+        print(f"  Saved {bag_hm_path}")
+    else:
+        print("  [IntraBag] Not enough windows to compute pairwise similarity.")
+
     wandb.log(log_dict)
     print(f"\nLogged to W&B under Eval/ and EvalTrain/ prefixes.")
