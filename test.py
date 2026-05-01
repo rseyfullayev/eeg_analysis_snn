@@ -572,14 +572,22 @@ def test(config, loso, subj, device, model):
     print(f"  Intra-Bag Cosine Similarity Heatmap")
     print(f"{'='*60}")
 
-    # Sample a random bag from the training set and extract per-window embeddings
+    # Gather all unique bag_ids, sample one, then collect ALL windows for that bag_id
+    # (each sample entry is (bag_id, files, emotion_idx, subject_idx, ...))
+    bag_id_to_info = {}
+    for s in train_set.samples:
+        bid = s[0]
+        if bid not in bag_id_to_info:
+            bag_id_to_info[bid] = {"files": [], "emotion": s[2], "subject": s[3]}
+        bag_id_to_info[bid]["files"].extend(s[1])  # accumulate all window files
+
+    all_bag_ids = list(bag_id_to_info.keys())
     rng = np.random.RandomState(42)
-    sampled_bag_idx = rng.randint(0, len(train_set))
-    bag_sample = train_set.samples[sampled_bag_idx]
-    sampled_bag_id = bag_sample[0]
-    sampled_files = bag_sample[1]
-    sampled_emotion = bag_sample[2]
-    sampled_subject = bag_sample[3]
+    sampled_bag_id = all_bag_ids[rng.randint(0, len(all_bag_ids))]
+    sampled_info = bag_id_to_info[sampled_bag_id]
+    sampled_files = sampled_info["files"]
+    sampled_emotion = sampled_info["emotion"]
+    sampled_subject = sampled_info["subject"]
     print(f"  Sampled bag_id={sampled_bag_id} (subject={sampled_subject}, emotion={sampled_emotion}, "
           f"windows={len(sampled_files)})")
 
