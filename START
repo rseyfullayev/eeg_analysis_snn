@@ -1,0 +1,2 @@
+config/config_adamw_ea.yaml
+--loso 1 --checkpoint phase1a/MobileNet_0429_024110_loso1/checkpoint_best.pt --resume
