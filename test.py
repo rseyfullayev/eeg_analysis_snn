@@ -469,43 +469,27 @@ def test(config, loso, subj, device, model):
 
     # =================================================================
     # UMAP Visualizations (3 purpose-built plots)
-    # Neutral class (3) is excluded so only true emotions are visible.
     # =================================================================
-    NEUTRAL_CLASS = 3
     suffix = f"loso{loso}" if loso else f"subj{subj}"
-
-    # --- Filter out neutral from both splits ---
-    mask_train_emo = labels_train != NEUTRAL_CLASS
-    mask_val_emo   = labels_val   != NEUTRAL_CLASS
-
-    emb_train_f   = emb_train[mask_train_emo]
-    labels_train_f = labels_train[mask_train_emo]
-    subj_train_f   = subj_train[mask_train_emo]
-
-    emb_val_f     = emb_val[mask_val_emo]
-    labels_val_f   = labels_val[mask_val_emo]
-
-    # Palette for the 4 non-neutral classes (indices 0,1,2,4)
-    emo_classes = sorted(set(np.concatenate([labels_train_f, labels_val_f])))
-    palette_emo = {c: col for c, col in zip(emo_classes, sns.color_palette("husl", len(emo_classes)))}
+    palette_emo = sns.color_palette("husl", num_classes)
 
     print(f"\n{'='*60}")
-    print(f"  UMAP 1: Subject Font Proof  (neutral excluded)")
+    print(f"  UMAP 1: Subject Font Proof")
     print(f"{'='*60}")
     # Fit on x_train, transform x_train, color by Subject ID
     reducer1 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
-    emb_train_2d_s = reducer1.fit_transform(emb_train_f)
+    emb_train_2d_s = reducer1.fit_transform(emb_train)
 
-    unique_train_subjs = np.unique(subj_train_f)
+    unique_train_subjs = np.unique(subj_train)
     palette_subj = sns.color_palette("husl", len(unique_train_subjs))
 
     fig1, ax1 = plt.subplots(figsize=(10, 8))
     sns.scatterplot(
         x=emb_train_2d_s[:, 0], y=emb_train_2d_s[:, 1],
-        hue=subj_train_f, palette=palette_subj,
+        hue=subj_train, palette=palette_subj,
         s=15, alpha=0.7, ax=ax1, legend='full'
     )
-    ax1.set_title(f"UMAP 1 · Subject Font Proof (fit train, no neutral) — {id_label}")
+    ax1.set_title(f"UMAP 1 · Subject Font Proof (fit train) — {id_label}")
     ax1.legend(title='Subject ID', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
     fig1.tight_layout()
     umap1_path = f"evidence/umap1_subject_font_{suffix}.png"
@@ -515,41 +499,43 @@ def test(config, loso, subj, device, model):
     print(f"  Saved {umap1_path}")
 
     print(f"\n{'='*60}")
-    print(f"  UMAP 2: Domain Shift (train ○ + val ★, no neutral)")
+    print(f"  UMAP 2: Domain Shift (train ○ + val ★)")
     print(f"{'='*60}")
     # Fit on x_train, transform x_train (light circles) and x_val (dark stars), color by Emotion
     reducer2 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
-    emb_train_2d_d = reducer2.fit_transform(emb_train_f)
-    emb_val_2d_d = reducer2.transform(emb_val_f)
+    emb_train_2d_d = reducer2.fit_transform(emb_train)
+    emb_val_2d_d = reducer2.transform(emb_val)
 
     fig2, ax2 = plt.subplots(figsize=(10, 8))
     # Train points: light circles
-    for c in emo_classes:
-        mask_c = labels_train_f == c
+    for c in range(num_classes):
+        mask_c = labels_train == c
         ax2.scatter(
             emb_train_2d_d[mask_c, 0], emb_train_2d_d[mask_c, 1],
             c=[palette_emo[c]], s=12, alpha=0.3, marker='o',
+            label=f"Train Emo {c}" if c == 0 else None  # Only one legend entry for train
         )
     # Val points: dark stars with black outline
-    for c in emo_classes:
-        mask_c = labels_val_f == c
+    for c in range(num_classes):
+        mask_c = labels_val == c
         ax2.scatter(
             emb_val_2d_d[mask_c, 0], emb_val_2d_d[mask_c, 1],
             c=[palette_emo[c]], s=60, alpha=0.9, marker='*',
             edgecolors='black', linewidths=0.5,
+            label=f"Val Emo {c}" if c == 0 else None  # Only one legend entry for val
         )
     # Build a proper legend
     import matplotlib.lines as mlines
     legend_handles = []
-    for c in emo_classes:
+    for c in range(num_classes):
         legend_handles.append(mlines.Line2D([], [], color=palette_emo[c], marker='o',
                               linestyle='None', markersize=5, alpha=0.4, label=f'Train Emo {c}'))
-    for c in emo_classes:
+    for c in range(num_classes):
         legend_handles.append(mlines.Line2D([], [], color=palette_emo[c], marker='*',
                               linestyle='None', markersize=8, markeredgecolor='black',
                               markeredgewidth=0.5, label=f'Val Emo {c}'))
     ax2.legend(handles=legend_handles, bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2, fontsize=7)
-    ax2.set_title(f"UMAP 2 · Domain Shift (fit train, no neutral) — {id_label}")
+    ax2.set_title(f"UMAP 2 · Domain Shift (fit train) — {id_label}")
     fig2.tight_layout()
     umap2_path = f"evidence/umap2_domain_shift_{suffix}.png"
     fig2.savefig(umap2_path, dpi=150)
@@ -558,19 +544,19 @@ def test(config, loso, subj, device, model):
     print(f"  Saved {umap2_path}")
 
     print(f"\n{'='*60}")
-    print(f"  UMAP 3: Validation Separability  (no neutral)")
+    print(f"  UMAP 3: Validation Separability")
     print(f"{'='*60}")
     # Fit on x_val, transform x_val, color by Emotion
     reducer3 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
-    emb_val_2d_v = reducer3.fit_transform(emb_val_f)
+    emb_val_2d_v = reducer3.fit_transform(emb_val)
 
     fig3, ax3 = plt.subplots(figsize=(10, 8))
     sns.scatterplot(
         x=emb_val_2d_v[:, 0], y=emb_val_2d_v[:, 1],
-        hue=labels_val_f, palette=palette_emo,
+        hue=labels_val, palette=palette_emo,
         s=15, alpha=0.7, ax=ax3
     )
-    ax3.set_title(f"UMAP 3 · Validation Separability (fit val, no neutral) — {id_label}")
+    ax3.set_title(f"UMAP 3 · Validation Separability (fit val) — {id_label}")
     ax3.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
     fig3.tight_layout()
     umap3_path = f"evidence/umap3_val_sep_{suffix}.png"
@@ -595,9 +581,9 @@ def test(config, loso, subj, device, model):
             bag_id_to_info[bid] = {"files": [], "emotion": s[2], "subject": s[3]}
         bag_id_to_info[bid]["files"].extend(s[1])  # accumulate all window files
 
-    valid_bag_ids = [bid for bid, info in bag_id_to_info.items() if len(info["files"]) > 100]
+    valid_bag_ids = [bid for bid, info in bag_id_to_info.items() if len(info["files"]) > 100 and info["emotion"] != 3]
     if not valid_bag_ids:
-        print("  [IntraBag] No bag found with W > 100. Falling back to all bags.")
+        print("  [IntraBag] No non-neutral bag found with W > 100. Falling back to all bags.")
         valid_bag_ids = list(bag_id_to_info.keys())
         
     rng = np.random.RandomState(42)
