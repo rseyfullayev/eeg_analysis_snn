@@ -1,2 +1,0 @@
-config/config_adamw_ea.yaml
---loso 1 --checkpoint /media/temporaryuser3/STORAGE/ERO/saved_models/phase1a/MobileNet_0429_024110_loso1/checkpoint_best.pt --resume
