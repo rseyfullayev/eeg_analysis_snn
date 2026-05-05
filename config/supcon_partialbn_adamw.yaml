@@ -1,10 +1,10 @@
 defaults:
-  - /data: seed_v
-  - /encoder: analog
-  - /decoder: spiking        
-  - /architecture: phase1a
-  - /training: phase1a
-  - /logger: default
+  - data: seed_v
+  - encoder: analog
+  - decoder: spiking        
+  - architecture: phase1a
+  - training: phase1a
+  - logger: default
   - _self_
 
 encoder:
