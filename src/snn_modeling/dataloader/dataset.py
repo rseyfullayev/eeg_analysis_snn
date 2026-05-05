@@ -146,17 +146,16 @@ class SWEEPDataset(Dataset):
     def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None):
         self.config = config
         self.split = split
-        self.num_classes = config['data'].get('n_emotions', 5)
-        self.grid_size = config['data'].get('grid_size', 32)
-        self.dataset_path = config['data']['dataset_path'] 
+        self.num_classes = config.data.get('n_emotions', 5)
+        self.grid_size = config.data.get('grid_size', 32)
+        self.dataset_path = config.data.dataset_path 
         self.samples_dir = os.path.join(self.dataset_path)
-        self.preload = config['data'].get('preload_ram', False)
-        self.train_size = config['data'].get('train_size', 0.8)
+        self.preload = config.data.get('preload_ram', False)
+        self.train_size = config.data.get('train_size', 0.8)
         self.augmentations = augmentations
         self.cache = {}
 
         index_file = os.path.join(self.dataset_path, "index.csv")
-        stats_path = os.path.join(self.dataset_path, "stats.json")
 
         if not os.path.exists(index_file):
             raise FileNotFoundError(f"Index not found at {index_file}.")
@@ -164,19 +163,12 @@ class SWEEPDataset(Dataset):
         print(f"Loading index from {index_file}...")
         df = pd.read_csv(index_file)
 
-        '''
-        with open(stats_path, 'r') as f:
-            self.stats_lookup = json.load(f)
-        '''
-
-        indices = np.arange(len(df))
-        labels = df['emotion_id'].values
         if subj is not None:
 
             df = df[df['filename'].str.split('_').str[0] == str(subj)]
-            #df_train, df_val = train_test_split(df, test_size=0.2, random_state=42, stratify=df['emotion_id'])
+
             splitter = GroupShuffleSplit(n_splits=1, test_size=1.0 - self.train_size, random_state=42)
-            train_idx, val_idx = next(splitter.split(df, groups=df['group_id']))
+            train_idx, val_idx = next(splitter.split(df, groups=df['bag_id']))
 
             df_train = df.iloc[train_idx]
             df_val = df.iloc[val_idx]
@@ -187,39 +179,90 @@ class SWEEPDataset(Dataset):
     
 
         if split == 'train':
-            print(f"Selecting TRAINING set ({len(df_train)} samples)")
-            df_slice = df_train if not experiment else df_train.sample(25000, random_state=42) #[:25000]
+            print(f"Selecting TRAINING set ({len(df_train)} windows)")
+            df_slice = df_train 
         elif split == 'val':
-            print(f"Selecting VALIDATION set ({len(df_val)} samples)")
-            df_slice = df_val if not experiment else df_val.sample(6400, random_state=42)#[:6400]
+            print(f"Selecting VALIDATION set ({len(df_val)} windows)")
+            df_slice = df_val 
         else:
             raise ValueError(f"Unknown split '{split}'. Use 'train' or 'val'.")
         
-        self.samples = list(zip(df_slice['filename'], df_slice['emotion_id'], df_slice['stats_key']))
+        # --- BAG LEVEL RESTRUCTURING ---
+        self.bag_size_limit = config.data.get('mil_bag_size', 60) # Max windows per bag
+        self.bagging = config.training.get('bagging', True) if hasattr(config, 'training') else True
+        self.samples = []
+
+        if self.bagging:
+            # Group by 'bag_id' (each trial clip is one bag)
+            grouped = df_slice.groupby('bag_id')
+            for bag_id, group_df in grouped:
+                emotion_idx = group_df['emotion_id'].iloc[0]
+                # Maintain chronological order of files (s0, s1, s2, ...)
+                # Ensure proper string/int casting for consistent sorting if needed, but for now we expect the filenames to be chronological or we can just list them
+                files = group_df['filename'].tolist()
+                try:
+                    subject_idx = int(str(files[0]).split('_')[0])
+                except Exception:
+                    subject_idx = -1
+                # Parse video_id (= bag_id) and timestamps from filenames
+                video_id = int(bag_id)
+                timestamps = [self._parse_timestamp(f) for f in files]
+                self.samples.append((bag_id, files, emotion_idx, subject_idx, video_id, timestamps))
+
+            print(f"[{split.upper()}] Initialized with {len(self.samples)} Bags (Total Windows: {len(df_slice)})")
+        else:
+            for idx, row in df_slice.iterrows():
+                emotion_idx = row['emotion_id']
+                files = [row['filename']]
+                bag_id = row.get('bag_id', f"no_bag_{idx}")
+                try:
+                    subject_idx = int(str(files[0]).split('_')[0])
+                except Exception:
+                    subject_idx = -1
+                # Parse video_id (= bag_id) and timestamp from filename
+                video_id = int(bag_id) if str(bag_id).isdigit() else -1
+                timestamp = self._parse_timestamp(files[0])
+                self.samples.append((bag_id, files, emotion_idx, subject_idx, video_id, timestamp))
+                
+            print(f"[{split.upper()}] Initialized with {len(self.samples)} Individual Windows (Bagging OFF)")
 
         if self.preload:
             print("Preloading data into RAM...")
-            for fname, _ in self.samples:
-                file_path = os.path.join(self.samples_dir, fname)
-                try:
-                    # Use weights_only=True for security, map_location='cpu' to avoid GPU memory
-                    # Use half precision to reduce RAM by 50% if acceptable
-                    video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-                    # Share memory for multiprocessing efficiency
-                    video.share_memory_()
-                    self.cache[fname] = video
-                except Exception as e:
-                    print(f"Error loading {fname}: {e}")
+            # We must preload all possible files mentioned in any bag
+            for _, files, _, _, _, _ in self.samples:
+                for fname in files:
+                    # Skip if already cached
+                    if fname in self.cache: continue
+                    file_path = os.path.join(self.samples_dir, fname)
+                    try:
+                        # Use weights_only=True for security, map_location='cpu' to avoid GPU memory
+                        # Use half precision to reduce RAM by 50% if acceptable
+                        video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+                        # Share memory for multiprocessing efficiency
+                        video.share_memory_()
+                        self.cache[fname] = video
+                    except Exception as e:
+                        print(f"Error loading {fname}: {e}")
             print("Cache complete!")
 
 
-        sigma = config['mask'].get('sigma', 0.25)
-        radius = config['mask'].get('radius', 0.7)
+        sigma = config.mask.get('sigma', 0.25)
+        radius = config.mask.get('radius', 0.7)
         if prototypes is not None:
             self.prototypes = prototypes
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
     
+    @staticmethod
+    def _parse_timestamp(filename):
+        """Extract sample_global_id from filename format: {subject}_{bag}_s{id}.pt"""
+        try:
+            base = os.path.splitext(filename)[0]  # strip .pt
+            # The last part after 's' is the global sample id
+            s_part = base.split('_')[-1]  # e.g. 's123'
+            return int(s_part[1:])  # strip leading 's'
+        except Exception:
+            return -1
 
     @staticmethod
     def compute_prototypes(num_classes, grid_size, radius, sigma, device='cpu'):
@@ -242,49 +285,92 @@ class SWEEPDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        fname, label_idx, stats_key = self.samples[idx]
+        bag_id, files, label_idx, subject_idx, video_id, timestamp_data = self.samples[idx]
 
-        #mean = self.stats_lookup[stats_key]['mean']
-        #std = self.stats_lookup[stats_key]['std']
-
-        #print(label_idx)
-        file_path = os.path.join(self.samples_dir, fname)
-        if self.preload:
-            video = self.cache[fname]  # No clone needed - data is not modified in-place
+        # 1. Stratified Strided Sampling (Binning).
+        # We divide the trial into 'bag_size_limit' equal temporal bins,
+        # and randomly select exactly ONE window from each bin.
+        # This guarantees we sample from the beginning, middle, and end of the movie.
+        if self.bagging and len(files) > self.bag_size_limit:
+            bin_size = len(files) / self.bag_size_limit
+            selected_files = []
+            for i in range(self.bag_size_limit):
+                start_idx = int(i * bin_size)
+                end_idx = int((i + 1) * bin_size)
+                # Randomly pick ONE window from inside this bin
+                chosen_idx = random.randint(start_idx, max(start_idx, end_idx - 1))
+                selected_files.append(files[chosen_idx])
         else:
-            try:
-                video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-            except Exception as e:
-                print(f"Error loading {fname}: {e}")
-                return torch.zeros(5, 32, 32, 32), torch.zeros(32, 32), 0
+            selected_files = files
         
-        #mean = video.mean(dim=(2,3,4), keepdim=True)
-        #std = video.std(dim=(2,3,4), keepdim=True) + 1e-8
+        loaded_tensors = []
+        for fname in selected_files:
+            file_path = os.path.join(self.samples_dir, fname)
+            if self.preload:
+                video = self.cache[fname] 
+            else:
+                try:
+                    video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+                except Exception as e:
+                    print(f"Error loading {fname}: {e}")
+                    # Zero tensor fallback for missing window
+                    video = torch.zeros(5, 32, 32, 32)
+            loaded_tensors.append(video)
 
+        # Stack into [K, C, H, W, T] (or your specific shape)
+        bag_video = torch.stack(loaded_tensors, dim=0) 
 
-        #video = (video - mean) / (std)
-        #print(video.shape)
+        # 2. Pad if bag was smaller than the limit (to prevent collate_fn crash)
+        if self.bagging and bag_video.size(0) < self.bag_size_limit:
+            pad_size = self.bag_size_limit - bag_video.size(0)
+            pad_shape = list(bag_video.shape)
+            pad_shape[0] = pad_size
+            padding = torch.zeros(pad_shape, dtype=bag_video.dtype, device=bag_video.device)
+            bag_video = torch.cat([bag_video, padding], dim=0)
+            
+        elif not self.bagging:
+            # If bagging is turned off, drop the K dimension
+            bag_video = bag_video.squeeze(0)
+
+        # We keep the single prototype map for the whole bag
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
         target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
-        if self.augmentations is not None and self.split == 'train':
-            video1 = self.augmentations(video)
-            video2 = self.augmentations(video)
-            return video1, video2, target_map, label_idx, fname
         
-        return video, target_map, label_idx, fname
-    
+        # When augmentations happen, they need to handle the batched/bag 5D size 
+        # or we iteratively apply it. Assuming it's applied correctly later.
+        if self.augmentations is not None and self.split == 'train':
+            # Note: you may need to apply augmentations over the batch dimension K safely
+            video1 = self.augmentations(bag_video)
+            video2 = self.augmentations(bag_video)
+            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data
+
+        return bag_video, target_map, label_idx, bag_id, video_id, timestamp_data
 
 class PKSampler(Sampler):
-    def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None):
-        # Access labels directly from dataset.samples: (filename, emotion_id, stats_key)
-        self.labels = [s[1] for s in dataset.samples]
+    def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None, subject_diverse_k=True):
+        # Access labels directly from dataset.samples: (bag_id, files, emotion_idx, subject_idx)
+        self.labels = [s[2] for s in dataset.samples]
+        self.subjects = [s[3] for s in dataset.samples]
         print(f"PKSampler: {len(self.labels)} samples")
         
         self.labels = torch.tensor(self.labels).long()
+        self.subjects = torch.tensor(self.subjects).long()
         self.label_set = list(set(self.labels.numpy()))
+        self.subject_diverse_k = subject_diverse_k
         
         self.label_to_indices = {label: np.where(self.labels.numpy() == label)[0]
                                  for label in self.label_set}
+
+        # Per-class subject buckets for subject-diverse K sampling
+        self.label_subject_to_indices = {}
+        for label in self.label_set:
+            class_indices = self.label_to_indices[label]
+            subject_map = collections.defaultdict(list)
+            for idx in class_indices:
+                subject_map[int(self.subjects[idx].item())].append(int(idx))
+            for subject in subject_map:
+                random.shuffle(subject_map[subject])
+            self.label_subject_to_indices[label] = subject_map
         
         for l in self.label_set:
             np.random.shuffle(self.label_to_indices[l])
@@ -301,6 +387,15 @@ class PKSampler(Sampler):
         else:
             self.n_samples_per_class = n_samples_per_class
             
+        if self.subject_diverse_k:
+            min_subjects_per_class = min(len(subj_map) for subj_map in self.label_subject_to_indices.values())
+            if self.n_samples_per_class > min_subjects_per_class:
+                raise ValueError(
+                    f"PKSampler Error: subject_diverse_k is enabled, but n_samples_per_class (K={self.n_samples_per_class}) "
+                    f"exceeds the minimum number of unique subjects available for a single class ({min_subjects_per_class}).\n"
+                    f"Decrease your batch_size or explicit K parameter to prevent dimension/batch-size collapse during iteration!"
+                )
+            
         self.batch_size = self.n_samples_per_class * self.n_classes
         self.dataset_len = len(dataset)
 
@@ -311,15 +406,39 @@ class PKSampler(Sampler):
             indices = []
             
             for class_ in classes:
-                indices.extend(self.label_to_indices[class_][
-                               self.used_label_indices_count[class_]:
-                               self.used_label_indices_count[class_] + self.n_samples_per_class])
-                
-                self.used_label_indices_count[class_] += self.n_samples_per_class
-                
-                if self.used_label_indices_count[class_] + self.n_samples_per_class > len(self.label_to_indices[class_]):
-                    np.random.shuffle(self.label_to_indices[class_])
-                    self.used_label_indices_count[class_] = 0
+                if self.subject_diverse_k:
+                    selected = []
+                    subject_map = self.label_subject_to_indices[class_]
+                    available_subjects = list(subject_map.keys())
+                    random.shuffle(available_subjects)
+
+                    # Replenish empty subject buckets from current class indices.
+                    for subj in available_subjects:
+                        if len(subject_map[subj]) == 0:
+                            refill = [int(i) for i in self.label_to_indices[class_] if int(self.subjects[i].item()) == subj]
+                            random.shuffle(refill)
+                            subject_map[subj].extend(refill)
+
+                    # Pick EXACTLY one sample per subject until we reach n_samples_per_class
+                    for subj in available_subjects:
+                        if len(selected) >= self.n_samples_per_class:
+                            break
+                        bucket = subject_map[subj]
+                        if not bucket:
+                            continue
+                        selected.append(bucket.pop())
+
+                    indices.extend(selected)
+                else:
+                    indices.extend(self.label_to_indices[class_][
+                                   self.used_label_indices_count[class_]:
+                                   self.used_label_indices_count[class_] + self.n_samples_per_class])
+                    
+                    self.used_label_indices_count[class_] += self.n_samples_per_class
+                    
+                    if self.used_label_indices_count[class_] + self.n_samples_per_class > len(self.label_to_indices[class_]):
+                        np.random.shuffle(self.label_to_indices[class_])
+                        self.used_label_indices_count[class_] = 0
                     
             yield indices
             self.count += self.batch_size

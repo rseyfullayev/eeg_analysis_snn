@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import snntorch as snn
-from ..layers.neurons import ALIF, SwiGLU, TemporalOrderFix
+from ..layers.neurons import ALIF, SwiGLU, TemporalOrderFix, ODConv2d
 import numpy as np
 import os
 import pandas as pd
@@ -44,29 +44,35 @@ def calibrate_params(encoder, loader, device, num_batches=50, target_rate=0.1, t
     print(f"Calibrated Threshold: {thresh:.4f}, Beta: {beta:.4f}, Decay Adapt: {decay_adapt:.4f}, Gamma Adapt: {gamma_adapt:.4f}")
 
  
-def generate_masks(config, subject_id):
-    print(f"--- GENERATING MASKS USING MAHALANOBIS (STATISTICAL SALIENCE) FOR SUBJECT {subject_id} ---")
+def generate_masks(config, subject_id=None, loso_subject_id=None):
+
+    subj_id = subject_id if subject_id is not None else loso_subject_id
+    loso = loso_subject_id is not None
+    if subj_id is None:
+        raise ValueError("Either subject_id or loso_subject_id must be provided.")
+    
+    print(f"--- GENERATING MASKS USING MAHALANOBIS (STATISTICAL SALIENCE) {"EXCEPT" if loso else ""} FOR SUBJECT {subj_id} ---")
     
     # 1. Load Index
-    df = pd.read_csv(os.path.join(config['data']['dataset_path'], "index.csv"))
-    df = df[df['filename'].str.startswith(f"{subject_id}_")]
+    df = pd.read_csv(os.path.join(config.data.dataset_path, "index.csv"))
+    df = df[df['filename'].str.split('_').str[0] != str(subj_id)] if loso else df[df['filename'].str.split('_').str[0] == str(subj_id)]
     
-    if len(df) == 0: raise ValueError(f"No data found for Subject {subject_id}")
+    if len(df) == 0: raise ValueError(f"No data found for Subject {subj_id}")
 
     # 2. Welford's Online Algorithm for Mean/Std Calculation
     # We need accurate pixel-wise STD to punish noisy bands.
     n = 0
-    mean = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
-    m2 = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size']) # Sum of squares of differences
+    mean = torch.zeros(5, config.data.grid_size, config.data.grid_size)
+    m2 = torch.zeros(5, config.data.grid_size, config.data.grid_size) # Sum of squares of differences
     
     # We also need to accumulate class-specific sums
-    class_sums = torch.zeros(5, 5, config['data']['grid_size'], config['data']['grid_size'])
+    class_sums = torch.zeros(5, 5, config.data.grid_size, config.data.grid_size)
     class_counts = torch.zeros(5)
 
     print("Scanning Dataset for Statistics...")
     # NOTE: To save time, you can sample 20% of data, but full scan is better for GT.
     for _, row in tqdm(df.iterrows(), total=len(df)):
-        fpath = os.path.join(config['data']['dataset_path'], row['filename'])
+        fpath = os.path.join(config.data.dataset_path, row['filename'])
         try:
             # Load [T, 5, 32, 32] -> Mean over Time -> [5, 32, 32]
             # We treat the *Trial Average* as the data point.
@@ -99,7 +105,7 @@ def generate_masks(config, subject_id):
             class_prototypes[i] = class_sums[i] / class_counts[i]
 
     # 3. Compute Salience Masks (Z-Score Energy)
-    final_masks = torch.zeros(5, config['data']['grid_size'], config['data']['grid_size'])
+    final_masks = torch.zeros(5, config.data.grid_size, config.data.grid_size)
     
     print("Computing Z-Score Energy Maps...")
     for i in range(5):
@@ -122,7 +128,7 @@ def generate_masks(config, subject_id):
         final_masks[i] = energy_map
 
     # 4. Save
-    save_path = f"evidence/subject{subject_id}_statistical_GT.pt"
+    save_path = f"evidence/subject{"_loso_" if loso else ""}{subj_id}.pt"
     torch.save(final_masks, save_path)
     
     # Visualization (Optional but recommended)
@@ -134,7 +140,7 @@ def generate_masks(config, subject_id):
         axes[i].set_title(f"{emotions[i]}\nZ-Energy Mask")
         axes[i].axis('off')
     plt.colorbar(im, ax=axes.ravel().tolist())
-    plt.savefig(f"evidence/subject{subject_id}_statistical_GT.png")
+    plt.savefig(f"evidence/subject{"_loso_" if loso else ""}{subj_id}.png")
     print(f"Ground Truth saved to {save_path}")
 
 
@@ -368,10 +374,25 @@ def manual_reset(model):
                 module.reset_hidden()
 
 
-def apply_kaiming_init(model):
+def apply_kaiming_init(model, keep_odconv_attention_init=True):
     print("Applying Kaiming (He) Initialization...")
     count = 0
+    
+    # 1. Catalog all internal modules of ODConv2d to protect them
+    skip_ids = set()
+    if keep_odconv_attention_init:
+        for m in model.modules():
+            if isinstance(m, ODConv2d):
+                # Add the ODConv2d module itself and all its submodules
+                for sub_m in m.modules():
+                    skip_ids.add(id(sub_m))
+
+    # 2. Standard Initialization Loop
     for m in model.modules():
+        # Protect ODConv internals
+        if keep_odconv_attention_init and id(m) in skip_ids:
+            continue
+            
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
             # Fan_in preserves magnitude in the forward pass
             # Nonlinearity 'relu' is the standard proxy for SNN spikes
@@ -382,13 +403,13 @@ def apply_kaiming_init(model):
             count += 1
             
         elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.GroupNorm, nn.InstanceNorm2d, nn.InstanceNorm3d)):
-
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
                 
     print(f"   Initialized {count} Convolutional layers.")
+    
     count = 0
     for m in model.modules():
         if "GatedSkip" in m.__class__.__name__:
@@ -408,14 +429,39 @@ def run_bn_warmup(model, loader, device, num_batches=10):
     model.to(device)
     
     with torch.no_grad():
-        for i, (inputs, *_rest) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
+        for i, (batch, *_rest) in enumerate(tqdm(loader, total=num_batches, desc="Warming up")):
             if i >= num_batches:
                 break
-            inputs = inputs.to(device)
-            if inputs.dim() == 5:
-                inputs = inputs.permute(1, 0, 2, 3, 4)
+            batch = batch.to(device)
+            # Handle both augmented (5 items) and non-augmented (4 items) returns
+            if len(batch) == 5:
+                inp1, inp2, targets, targets_c, _ = batch
+                if 1 == 1:
+                    # Contrastive: concatenate both views
+                    inp1, inp2 = inp1.to(device), inp2.to(device)
+                    inputs = torch.cat([inp1, inp2], dim=0)
+                else:
+                    # Non-contrastive phases: just use first view
+                    inputs = inp1.to(device)
+            else:
+                inputs, targets, targets_c, _ = batch
+                inputs = inputs.to(device)
+                
+            targets, targets_c = targets.to(device), targets_c.to(device)
             
-            _ = model(inputs)
+            # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
+            K_bag = None
+            if inputs.dim() == 6:
+                B, K_bag, T, C, H, W = inputs.shape
+                # Flatten Bags into Batch dimension for the SNN Encoder
+                inputs = inputs.view(B * K_bag, T, C, H, W)
+            else:
+                B, T, C, H, W = inputs.shape
+            
+            # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
+            inputs = inputs.permute(1,0,2,3,4) 
+            _ = model(inputs, K=K_bag)
+            
             del inputs  # Free memory after each batch
     
     # Clear CUDA cache after warmup
@@ -489,7 +535,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
     model.eval()
     model.to(device)
     
-    df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
+    df = pd.read_csv(config.data.dataset_path + "/index.csv")
     
     all_subjects = df['filename'].str.split('_').str[0].unique()
     
@@ -507,7 +553,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
         
         with torch.no_grad():
             for fname in df_subj['filename']:
-                path = os.path.join(config['data']['dataset_path'], fname)
+                path = os.path.join(config.data.dataset_path, fname)
                 try:
                     data = torch.load(path).float()   
                     data = data.unsqueeze(0).to(device).permute(1,0,2,3,4)  # [T, 1, C, H, W]
@@ -551,7 +597,7 @@ def find_representative_subject(model, config, device, samples_per_subject=200):
 def run_bio_audit(config, device='cpu', samples=300):
     print("--- STARTING BIOLOGICAL AUDIT (MODEL-FREE, MAHALANOBIS) ---")
 
-    df = pd.read_csv(config['data']['dataset_path'] + "/index.csv")
+    df = pd.read_csv(config.data.dataset_path + "/index.csv")
     all_subjects = sorted(df['filename'].str.split('_').str[0].unique(), key=int)
 
     subject_maps = {}
@@ -569,7 +615,7 @@ def run_bio_audit(config, device='cpu', samples=300):
             count = 0
             
             for fname in subset['filename']:
-                path = os.path.join(config['data']['dataset_path'], fname)
+                path = os.path.join(config.data.dataset_path, fname)
                 try:
                     data = torch.load(path).float().permute(1,0,2,3).numpy() 
        

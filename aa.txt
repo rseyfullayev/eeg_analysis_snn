@@ -1,0 +1,11 @@
+Since you need this to survive even if your SSH session disconnects or the terminal closes, you should run it inside a terminal multiplexer like tmux or screen.
+
+Open your terminal on the lab computer.
+
+Make the script executable: chmod +x auto_runner.sh
+
+Start a new tmux session: tmux new -s runner
+
+Run the script: ./auto_runner.sh
+
+Detach from the tmux session by pressing Ctrl+B, then D.

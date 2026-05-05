@@ -12,6 +12,43 @@ import torch.nn.functional as F
 
 SELECTED_EMOTIONS = [0, 1, 2, 3, 4] 
 
+def compute_alignment_matrix(covs_list, device):
+    """
+    Computes the EA alignment matrix R^{-1/2} from a list of trial covariances.
+    """
+    mean_cov = torch.stack(covs_list).mean(dim=0)
+    C = mean_cov.shape[0]
+    
+    # Add small epsilon for numerical stability
+    mean_cov = mean_cov + torch.eye(C, device=device) * 1e-4
+    
+    # Compute R^{-1/2} using Eigen Decomposition
+    L, Q = torch.linalg.eigh(mean_cov)
+    L_inv_sqrt = torch.diag(1.0 / torch.sqrt(L.clamp(min=1e-6)))
+    R_inv_sqrt = torch.matmul(torch.matmul(Q, L_inv_sqrt), Q.t())
+    
+    return R_inv_sqrt
+
+def apply_alignment(x, R_inv_sqrt):
+    """
+    Applies the pre-computed alignment matrix to the raw signal.
+    """
+    is_batched = (x.dim() == 3)
+    if not is_batched:
+        x = x.unsqueeze(0)
+        
+    # Center the data
+    x_mean = x.mean(dim=-1, keepdim=True)
+    x_centered = x - x_mean
+    
+    R_inv_sqrt_batched = R_inv_sqrt.unsqueeze(0).expand(x.shape[0], -1, -1)
+    x_aligned = torch.bmm(R_inv_sqrt_batched, x_centered)
+    
+    if not is_batched:
+        x_aligned = x_aligned.squeeze(0)
+        
+    return x_aligned
+
 def parse_metadata(filename):
     """
     Format: SubjectID_SessionID_Date.cnt (e.g., "1_1_20180804.cnt")
@@ -29,24 +66,21 @@ def parse_metadata(filename):
         subject_id = parts[0]
         session_id = "unknown"
 
-    stats_key = f"{subject_id}_{session_id}"
     
-    trial_unique_id = clean_name 
-    
-    return stats_key, subject_id, trial_unique_id
+    return subject_id, session_id
 
 def run_data_setup(config=None):
     print("Initializing Pipeline...")
 
      # [Standard Config Setup - Same as before]
-    WINDOW_SIZE = config['data'].get('window_size', 256)
-    STEP_SIZE = config['data'].get('step_size', 128)
-    TARGET_STEPS = config['data'].get('num_timesteps', 32)
-    SAMPLING_RATE = config['data'].get('sampling_rate', 256) 
-    RAW_FOLDER = config['data']['raw_path']
-    COORDS_PATH = config['data']['coords_path']
-    OUTPUT_FOLDER = config['data']['dataset_path'] 
-    TOTAL_TARGET = config['data'].get('num_samples', None)
+    WINDOW_SIZE = config.data.get('window_size', 256)
+    STEP_SIZE = config.data.get('step_size', 128)
+    TARGET_STEPS = config.data.get('num_timesteps', 32)
+    SAMPLING_RATE = config.data.get('sampling_rate', 256) 
+    RAW_FOLDER = config.data.raw_path
+    COORDS_PATH = config.data.coords_path
+    OUTPUT_FOLDER = config.data.dataset_path 
+    TOTAL_TARGET = config.data.get('num_samples', None)
 
     # [Setup Limit Logic - Same as before]
     if TOTAL_TARGET:
@@ -62,33 +96,66 @@ def run_data_setup(config=None):
     dataset_reader = DatasetReader(RAW_FOLDER)
     wavelet = WaveletModule(fs=SAMPLING_RATE, target_steps=TARGET_STEPS, device=device)
     coords = pd.read_csv(COORDS_PATH, sep=',')
-    topo = TopoMapper(coords, grid_size=config['data'].get('grid_size', 32), device=device)
+    
+    # Allow perplexity to be dynamically configured
+    perplexity_val = config.data.get('perplexity', 5.0)
+    topo = TopoMapper(coords, grid_size=config.data.get('grid_size', 32), perplexity=perplexity_val, device=device)
 
     emotion_map = {original: idx for idx, original in enumerate(SELECTED_EMOTIONS)}
     
-    # --- STATISTICS COLLECTOR ---
+    # --- EA PASS 1: COMPUTE SESSION COVARIANCES ---
+    print(f"Phase 1: Computing Session-Level Euclidean Alignment Matrices across {len(dataset_reader)} files...")
+    subject_covs = defaultdict(list)
+    
+    for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader), desc="EA Pass 1"):
+        subject_id, session_id = parse_metadata(orig_filename)
+        session_key = f"{subject_id}_{session_id}"
+        
+        raw_eeg = raw_eeg.to(device)
+        
+        # Calculate single trial covariance
+        x_mean = raw_eeg.mean(dim=-1, keepdim=True)
+        x_centered = raw_eeg - x_mean
+        
+        if x_centered.dim() == 3:
+            x_centered = x_centered.squeeze(0) # (C, T)
+            
+        C, T = x_centered.shape
+        cov = torch.mm(x_centered, x_centered.t()) / max(T - 1, 1)
+        subject_covs[session_key].append(cov)
 
-    stats_reservoir = defaultdict(list)
-    RESERVOIR_LIMIT = 20000 
+    print("Phase 1 Complete: Resolving Alignment Matrices...")
+    subject_alignment_matrices = {}
+    for subj, covs in subject_covs.items():
+        subject_alignment_matrices[subj] = compute_alignment_matrix(covs, device)
+        
+    # --- STATISTICS COLLECTOR ---
 
     registry = []
     sample_global_id = 0
+    bag_id = 0
     class_counts = {i: 0 for i in range(len(SELECTED_EMOTIONS))}
     total_collected = 0
     GPU_BATCH_SIZE = 16 
     
-    print(f"Processing {len(dataset_reader)} raw files...")
+    print("Phase 2: Generating Dataset...")
     
     for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader)): 
-        
-        stats_key, subject_id, trial_id = parse_metadata(orig_filename)
+        bag_id += 1
+        subject_id, session_id = parse_metadata(orig_filename)
+        session_key = f"{subject_id}_{session_id}"
 
         if use_sampling_limit and total_collected >= TOTAL_TARGET: break
 
         raw_eeg = raw_eeg.to(device)
-        if raw_eeg.shape[1] < WINDOW_SIZE: continue
+        if raw_eeg.dim() == 2 and raw_eeg.shape[1] < WINDOW_SIZE: continue
+        elif raw_eeg.dim() == 3 and raw_eeg.shape[2] < WINDOW_SIZE: continue
 
         with torch.no_grad():
+            # Apply pre-computed Session-Level Euclidean Alignment
+            R_inv_sqrt = subject_alignment_matrices[session_key]
+            raw_eeg = apply_alignment(raw_eeg, R_inv_sqrt)
+            
             feats = wavelet(raw_eeg)
             feats = torch.log1p(feats)
             median = feats.median(dim=-1, keepdim=True).values
@@ -130,53 +197,28 @@ def run_data_setup(config=None):
             
             with torch.no_grad():
 
-                '''
-                # Collect Stats (Per Session/Subject)
-                if len(stats_reservoir[stats_key]) < RESERVOIR_LIMIT:
-                    flat_data = feats.flatten().cpu().numpy()
-                    indices = np.random.randint(0, len(flat_data), size=min(100, len(flat_data)))
-                    stats_reservoir[stats_key].extend(flat_data[indices])
-                '''
+    
 
                 # Topo & Save
                 video_batch = topo(batch_tensor)
-                #video_batch = torch.clamp(video_batch, min=0.0, max=50.0)  # 10^50 is impossible thus clipping
                 video_batch = video_batch.cpu()
 
                 for k in range(video_batch.shape[0]):
                     # Unique filename for the window
-                    fname = f"{subject_id}_{trial_id}_s{sample_global_id}.pt"
+                    fname = f"{subject_id}_{bag_id}_s{sample_global_id}.pt"
                     save_path = os.path.join(OUTPUT_FOLDER, fname)
                     
                     torch.save(video_batch[k].clone(), save_path)
                     
-                    # stats_key -> Used to look up Mean/Std later
-                    # trial_id -> Used for GroupShuffleSplit (The Video)
-                    registry.append(f"{fname},{stats_key},{trial_id},{emotion_id}")
+                    # bag_id -> Acts as our Bag ID (The unique Movie Clip)
+                    registry.append(f"{fname},{bag_id},{emotion_id}")
                     sample_global_id += 1
                 
             torch.cuda.empty_cache()
 
-
-    '''
-    # --- SAVE ---
-    print("Computing Stats...")
-    final_stats = {}
-    for key, values in stats_reservoir.items():
-        arr = np.array(values)
-        final_stats[key] = {
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
-            "p98": float(np.percentile(arr, 98))
-        }
-
-    with open(os.path.join(OUTPUT_FOLDER, "stats.json"), 'w') as f:
-        json.dump(final_stats, f, indent=4)
-    '''
-
     with open(os.path.join(OUTPUT_FOLDER, "index.csv"), 'w') as f:
 
-        f.write("filename,stats_key,group_id,emotion_id\n")
+        f.write("filename,bag_id,emotion_id\n")
         for line in registry:
             f.write(f"{line}\n")
             

@@ -76,8 +76,13 @@ class WaveletModule(nn.Module):
 
         # 1. CWT Convolution
         # result: (Batch*Channels, Freqs, Time_Padded)
-        cwt_complex = F.conv1d(x.to(dtype=torch.complex64), self.weights)
-        #print(cwt_complex.shape)
+        chunk_size = 16
+        cwt_chunks = []
+        for i in range(0, x.shape[0], chunk_size):
+            chunk = x[i:i+chunk_size]
+            cwt_chunk = F.conv1d(chunk.to(dtype=torch.complex64), self.weights)
+            cwt_chunks.append(cwt_chunk)
+        cwt_complex = torch.cat(cwt_chunks, dim=0)
 
         # 4. Power & Band Integration
         power = cwt_complex.abs().pow(2) 

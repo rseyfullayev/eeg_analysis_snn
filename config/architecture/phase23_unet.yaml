@@ -1,0 +1,5 @@
+_target_: src.snn_modeling.models.unet.SpikingUNet
+in_channels: 5
+num_classes: ${data.n_emotions}
+encoder_backbone: ${encoder}
+decoder_backbone: ${decoder}

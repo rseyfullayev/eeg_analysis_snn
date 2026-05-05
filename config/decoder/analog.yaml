@@ -1,0 +1,2 @@
+_target_: src.snn_modeling.models.decoders.SpikingResNetDecoder
+spike_model: "SiLU"

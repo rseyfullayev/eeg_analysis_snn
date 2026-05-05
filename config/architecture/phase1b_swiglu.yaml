@@ -1,0 +1,4 @@
+_target_: src.snn_modeling.models.unet.SpikingMobileNetProjector
+num_classes: ${data.n_emotions}
+use_swiglu: true # Uses SwiGLU Attention Heads
+encoder_backbone: ${encoder}

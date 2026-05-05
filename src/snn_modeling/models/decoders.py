@@ -2,11 +2,13 @@ import torch.nn as nn
 import snntorch as snn
 from ..layers.residual_blocks import *
 from ..layers.upsampling_blocks import *
+from ..layers.activations import resolve_activation, is_alif
 
 class SpikingResNetDecoder(nn.Module):
     def __init__(self, recurrent=True, spike_model=snn.Leaky, **neuron_params):
         super(SpikingResNetDecoder, self).__init__()
         self.recurrent = recurrent
+        spike_model = resolve_activation(spike_model)
 
         # up1: no recurrent
         self.up1 = SpikingUpsampleBlock(
@@ -19,7 +21,7 @@ class SpikingResNetDecoder(nn.Module):
         
         # up2 and up3: with recurrent for ALIF
         recurrent_params = neuron_params.copy()
-        if spike_model.__name__ == 'ALIF':
+        if is_alif(spike_model):
             recurrent_params['recurrent'] = recurrent
         
         self.up2 = SpikingUpsampleBlock(
@@ -31,7 +33,7 @@ class SpikingResNetDecoder(nn.Module):
 
         # up3: with recurrent and return_mem for ALIF
         last_layer_params = recurrent_params.copy()
-        if spike_model.__name__ == 'ALIF':
+        if is_alif(spike_model):
             last_layer_params['return_mem'] = True
             last_layer_params['norm_mem'] = nn.BatchNorm3d
         

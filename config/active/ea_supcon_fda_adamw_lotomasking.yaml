@@ -1,0 +1,61 @@
+defaults:
+  - data: seed_v_ea
+  - encoder: analog
+  - decoder: spiking        
+  - architecture: phase1a
+  - training: phase1a
+  - logger: default
+  - _self_
+
+encoder:
+  use_odconv: true
+  use_batchnorm: false
+  p_drop: 0.3
+
+training:
+  use_pk_sampler: true
+  subject_diverse_k: true
+  temporal_decay_enabled: false
+  temporal_decay_factor: 0.99
+  use_supmoco: true
+  supmoco_momentum: 0.9
+  supmoco_queue_size: 512
+  use_muon: false
+  use_fourier_mixup: true
+  fourier_mixup:
+    retention_ratio: 0.95       # % variance to retain (try 0.90–0.98)
+    p: 0.5                     # blend probability
+    beta_alpha: 1.0             # Beta distribution shape (1.0=uniform)
+  
+
+
+
+
+experiment_name: "MobileNet"
+description: "Phase 1 with MobileNet Encoder with Supervised MoCo and Differential Masking"
+
+mask:
+  type: "Statistical Mask"
+  sigma: 0.25
+  radius: 0.7
+
+loss:
+  smooth: 0.0
+  lambda_seg: 0.0
+  lambda_con: 0.0
+  temperature: 0.1
+  use_scda: false
+  decoupled: true
+  lambda_class: 1.0
+  lambda_fire: 0.0
+  target_rate: 0.1
+  alpha: 0.3
+  beta: 0.7
+  exclude_same_trial: true  # Make contrastive formulation adhere strictly to Leave-One-Trial-Out by filtering exact same video negatives
+  use_dann: false
+  dann_weight: 1.0
+  dann_alpha: 1.0
+  use_mmd: false
+  lambda_mmd: 0.1
+  cosface_margin: 0.0 # Not using cosface loss
+

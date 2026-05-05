@@ -1,0 +1,12 @@
+_target_: src.snn_modeling.models.decoders.SpikingResNetDecoder
+spike_model: "ALIF"
+beta: 0.8825
+threshold: 0.9388
+decay_adapt: 0.8825
+gamma_adapt: 0.1878
+spike_grad_alpha: 2.0
+learn_slope: false
+learn_threshold: false
+learn_beta: false
+learn_gamma: false
+learn_decay: false

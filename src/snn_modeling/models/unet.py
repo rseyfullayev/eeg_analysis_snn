@@ -2,36 +2,43 @@ import torch
 import torch.nn as nn
 import snntorch as snn
 from .decoders import ResNetDecoder, SpikingResNetDecoder
-from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead
-from ..layers.neurons import ALIF
+from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead, TemporalGCBlock
+from ..layers.neurons import ALIF, TimeDistributed, SwiGLU
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
 
-class SpikingUNet(nn.Module):
-    def __init__(self, encoder, in_channels, num_classes, config, spike_model=snn.Leaky, **neuron_params):
-        super(SpikingUNet, self).__init__()
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
 
-        snn_params = neuron_params.copy()
-        if spike_model.__name__  != "ALIF":
-            snn_params['init_hidden'] = True
-        self.encoding = config['data'].get('encoding_method', 'direct')
-        self.num_timesteps = config['data'].get('num_timesteps', 10)
-        encoder_mode = config['model'].get('encoder_mode', 'silu')
-        encoder_spike_model = ALIF if encoder_mode == 'snn' else nn.SiLU
-        self.encoder = encoder(
-            in_channels,
-            p_drop=config['model'].get('dropout', 0.2), 
-            vit_p_drop=config['model'].get('vit_dropout', 0.25),
-            vit=config['model'].get('vit_integration', False),
-            gc=config['model'].get('gc_integration', False),
-            spike_model=encoder_spike_model,
-            **(snn_params if encoder_mode == 'snn' else {})
-        )
-        self.bottleneck = BottleneckBlock(128, p_drop=config['model'].get('dropout', 0.2), spike_model=spike_model, **snn_params)
-        self.decoder = SpikingResNetDecoder(recurrent=config['model'].get('reccurent_decoder', False), spike_model=spike_model, **snn_params)
-        self.classifier = ClassifierHead(64, num_classes)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class GRL(nn.Module):
+    def __init__(self, alpha=1.0):
+        super(GRL, self).__init__()
+        self.alpha = alpha
 
     def forward(self, x):
+        return GradientReversalFunction.apply(x, self.alpha)
+
+class SpikingUNet(nn.Module):
+    def __init__(self, encoder_backbone, decoder_backbone, in_channels, num_classes, encoding_method='direct', num_timesteps=32):
+        super(SpikingUNet, self).__init__()
+
+        self.encoding = encoding_method
+        self.num_timesteps = num_timesteps
+        
+        self.encoder = encoder_backbone
+        
+        # We assume the decoder is also pre-built from the new Hydra configs!
+        self.bottleneck = BottleneckBlock(128, p_drop=0.2, spike_model=nn.SiLU) # Standardizing bottleneck to standard for simplicity right now unless we want to inject it too!
+        self.decoder = decoder_backbone
+
+    def forward(self, x, K=None):
         if self.encoding == 'latency':
             x_static = x.mean(dim=0)
             x = spikegen.latency(x_static, num_steps=self.num_timesteps, tau=5, threshold=0.01, normalize=True, clip=True)
@@ -59,21 +66,88 @@ class UNet(nn.Module):
     def forward(self, x):
         raise NotImplementedError("This is a placeholder for the ANN UNet.")
 
-class SpikingResNetClassifier(nn.Module):
-    def __init__(self, encoder_backbone, num_classes=5):
+class SpikingMobileNetProjector(nn.Module):
+    def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False, use_batchnorm=False, use_dann=False, num_subjects=15):
         super().__init__()
 
         self.encoder = encoder_backbone 
         self.num_classes = num_classes
-        self.classifier = ProjectionHead(256, 128) #ClassifierHead(128, num_classes)
+        self.feature_dim = feature_dim
+        self.use_swiglu = use_swiglu
+        self.use_dann = use_dann
+        self.num_subjects = num_subjects
+        
+        # --- SwiGLU MIL Attention Heads (Optional) ---
+        if self.use_swiglu:
+            self.mil_attention = nn.Sequential(
+                SwiGLU(feature_dim, p_drop=0.2),
+                nn.Linear(feature_dim, 1, bias=False)
+            )
+
+        if self.use_dann:
+            self.dann_head = nn.Sequential(
+                GRL(alpha=1.0),
+                nn.LayerNorm(feature_dim),
+                nn.Linear(feature_dim, feature_dim // 2),
+                nn.SiLU(),
+                nn.Linear(feature_dim // 2, num_subjects)
+            )
+        
+        # Auto-detect if encoder uses batchnorm to sync the ProjectionHead
+        has_bn = any(isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) for m in self.encoder.modules())
+        use_batchnorm = use_batchnorm or has_bn
+
+        self.classifier = ProjectionHead(feature_dim, 128, use_batchnorm=use_batchnorm)
         
         
 
-    def forward(self, x):
+    def extract_features(self, x, K=None):
+        """Extract backbone features (before projection head).
+        
+        Returns (B, feature_dim) tensor suitable for linear evaluation.
+        """
         features, _ = self.encoder(x)
-        #features = features.mean(dim=[3,4]).unsqueeze(3).unsqueeze(4) # Global Average Pooling
+        # Spatiotemporal GAP: (T, B, C, H, W) -> (B, C)
+        if features.dim() == 5:
+            out = features.mean(dim=[0, 3, 4])  # mean over T, H, W
+        else:
+            out = features.mean(dim=[-2, -1])   # mean over H, W if already collapsed
 
-        out = self.classifier(features)
-        #T,B,C,H,W = out.shape
-        #out = out.mean(dim=[0,3,4])
-        return out #.mean(dim=0) # Mean over time dimension
+        # === HYBRID MIL: Pre-Normalized RTFM Gating (or SwiGLU) ===
+        if K is not None and K > 1:
+            B_total, C_dim = out.shape
+            B = B_total // K
+            
+            # Reshape to [Bags, Windows, Channels]
+            out = out.view(B, K, C_dim)
+            
+            if self.use_swiglu:
+                # 1. Compute Attention Scores using SwiGLU
+                attn_scores = self.mil_attention(out)
+                # 2. Normalize via Softmax across the K windows
+                attn_weights = torch.softmax(attn_scores, dim=1)
+                # 3. Aggregate windows via weighted sum
+                out = torch.sum(out * attn_weights, dim=1)
+            else:
+                # --- Pre-Normalized RTFM Sieve ---
+                # 1. Calculate unnormalized L2 magnitude of embeddings
+                magnitudes = torch.linalg.norm(out, dim=-1) # [B, K]
+                
+                # 2. Extract Top-K (e.g., top 5) loudest bursts
+                top_k_val = min(5, K) 
+                _, topk_indices = torch.topk(magnitudes, k=top_k_val, dim=1) # [B, 5]
+                
+                gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, out.size(-1))
+                master_vectors = torch.gather(out, dim=1, index=gather_indices) # [B, min(5, K), C_dim]
+                    
+                out = torch.stack(master_vectors, dim=0) # [B, C_dim]
+        # ============================
+
+        return out
+
+    def forward(self, x, K=None):
+        out = self.extract_features(x, K=K)
+        # The backbone features are passed to the Projection Head
+        # which will apply F.normalize prior to SupCon!
+        out = self.classifier(out)
+        return out

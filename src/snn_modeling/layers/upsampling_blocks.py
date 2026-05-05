@@ -3,6 +3,7 @@ import snntorch as snn
 import torch
 from .residual_blocks import ConvSpiking
 from .neurons import TimeDistributed
+from .activations import instantiate_activation, is_alif
 
 class GatedSkip(nn.Module):
     def __init__(self, in_channels, spike_model=snn.Leaky, **neuron_params):
@@ -18,9 +19,9 @@ class GatedSkip(nn.Module):
             nn.SiLU(inplace=False)
         ))
         layer_params = neuron_params.copy()
-        if spike_model.__name__ == 'ALIF':
+        if is_alif(spike_model):
             layer_params['num_channels'] = in_channels
-        self.spike = spike_model(**layer_params)
+        self.spike = instantiate_activation(spike_model, **layer_params)
         nn.init.constant_(self.gate.module[0].bias, 2.0)
 
     def forward(self, x_skip):
