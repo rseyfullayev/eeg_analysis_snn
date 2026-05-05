@@ -165,8 +165,8 @@
 \node[stglbl] at (stem-top) [above=42pt] {Stem};
 \node[stglbl] at (s1-top) [above=2pt] {Stage 1};
 \node[stglbl] at (s2-top) [above=2pt] {Stage 2};
-\node[stglbl] at (s3-top) [above=2pt] {Stage 3};
-\node[stglbl] at (s4-top) [above=2pt] {Stage 4};
+\node[stglbl] at (s3-top) [above=6pt] {Stage 3};
+\node[stglbl] at (s4-top) [above=8pt] {Stage 4};
 
 % --- Dimension labels (below blocks) ---
 \node[dimlbl] at (input-south) [below=4pt] {$5$ ch\\[-1pt]$32{\times}32$};
@@ -208,7 +208,7 @@
 
 % --- Stem detail annotation (above the block) ---
 \node[dimlbl, anchor=south, text width=2.2cm] at (stem-top) [above=18pt]
-  {DW Conv$3{\times}3$\\InstanceNorm3d\\SiLU};
+  {DW Conv$3{\times}3$\\GroupNorm($n_g=1$)\\SiLU};
 
 
 % =====================================================================
@@ -308,7 +308,7 @@
 \node[modulebox={convcol}] (td) at (1.2, 0.4)
   {\textbf{TimeDistributed}(Conv2d)};
 \node[modulebox={normcol}, right=0.4cm of td] (tof)
-  {\textbf{TemporalOrderFix}(IN3d)};
+  {\textbf{TemporalOrderFix}(GN)};
 \node[modulebox={spikecol}, right=0.5cm of tof] (spike)
   {Activation (SiLU$^*$)};
 
@@ -328,9 +328,9 @@ $(T,B,C,H,W) \to (T{\cdot}B, C, H, W) \xrightarrow{\text{Conv2d}}
 (T{\cdot}B, C', H', W') \to (T, B, C', H', W')$
 \qquad Applies 2D operations independently per timestep.\\[4pt]
 \textbf{TemporalOrderFix:}\enspace 
-$(T,B,C,H,W) \to (B,C,T,H,W) \xrightarrow{\text{IN3d}} 
+$(T,B,C,H,W) \to (B,C,T,H,W) \xrightarrow{\text{GN}} 
 (B,C,T,H,W) \to (T,B,C,H,W)$
-\qquad Permutes for 3D normalization; used for InstanceNorm3d \& Dropout3d.\\[4pt]
+\qquad Permutes for 3D normalization; used for GroupNorm($n_g=1$) \& Dropout3d.\\[4pt]
 \textbf{Bi-Directional TSM} (Lin et al.~2019)\textbf{:}\enspace 
 $\frac{1}{8}$ channels $\leftarrow$ future-shift,\enspace
 $\frac{1}{8}$ channels $\rightarrow$ past-shift,\enspace
@@ -388,7 +388,7 @@ Regularizes deep stages.
 \node[font=\tiny\sffamily, text=black!50, anchor=west, text width=15cm] at (-0.3, -0.2) 
   {All feature maps carry shape $(T, B, C, H, W)$ with $T{=}32$ timesteps. 
    Temporal dimension is exchanged across frames via bidirectional TSM channel shifts, 
-   normalized via TemporalOrderFix(InstanceNorm3d), and collapsed by temporal mean pooling in the ProjectionHead.
+   normalized via TemporalOrderFix(GroupNorm($n_g=1$)), and collapsed by temporal mean pooling in the ProjectionHead.
    Encoder currently uses SiLU; ALIF replacement is a separate confounding-variable experiment.
    Total parameters: $\sim\!807$k.};
 
