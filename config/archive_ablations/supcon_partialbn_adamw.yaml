@@ -9,7 +9,7 @@ defaults:
 
 encoder:
   use_odconv: true
-  use_batchnorm: false
+  use_batchnorm: true
   p_drop: 0.3
 
 training:
@@ -22,7 +22,6 @@ training:
   supmoco_queue_size: 512
   use_muon: false
   use_fourier_mixup: false
-  
 
 
 
@@ -49,11 +48,18 @@ loss:
   target_rate: 0.1
   alpha: 0.3
   beta: 0.7
-  exclude_same_trial: true  # Make contrastive formulation adhere strictly to Leave-One-Trial-Out by filtering exact same video negatives
+  exclude_same_trial: false  
   use_dann: false
   dann_weight: 1.0
   dann_alpha: 1.0
   use_mmd: false
   lambda_mmd: 0.1
-  cosface_margin: 0.0 # Not using cosface loss
+  cosface_margin: 0.0
 
+logging:
+  project_name: "snn-encoding-showdown"
+  run_name: "MobileNet"
+  tags: ["mobilenet", "tsm", "phase1a"]
+  offline: false
+  log_interval: 1
+  

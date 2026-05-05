@@ -232,7 +232,7 @@ def test(config, loso, subj, device, model):
         prototypes=masks
     )
 
-    # 2. Training Set (The other 14 subjects) to act as probe support
+    # 2. Training Set (The other 15 subjects) to act as probe support
     train_set = SWEEPDataset(
         config,
         split='train',
