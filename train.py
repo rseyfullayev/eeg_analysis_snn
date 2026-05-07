@@ -465,7 +465,12 @@ def training_loop(phase,
                   probe_interval=5,
                   use_mmd=False,
                   lambda_mmd=0.0,
-                  live_tracker=None):
+                  live_tracker=None,
+                  use_ortho=False,
+                  lambda_ortho=0.1,
+                  ortho_ema_momentum=0.1,
+                  num_subjects_ortho=15,
+                  feature_dim_ortho=256):
     
     # Phase 1A trackers
     best_train_loss = float('inf') if phase == '1a' else None
@@ -475,6 +480,16 @@ def training_loop(phase,
     if live_tracker is None:
         live_tracker = LiveTracker()  # disabled fallback (no credentials)
     nan_monitor = NaNMonitor(model, verbose=True, max_reports_per_epoch=5, live_tracker=live_tracker)
+
+    # --- Latent Orthogonal Projection: Subject centroid EMA tracker ---
+    # Maintains a running centroid per subject in backbone feature space.
+    # The ortho penalty forces features to point 90° away from their subject's
+    # identity vector, destroying biometric leakage without an adversarial head.
+    subject_centroids = None
+    if use_ortho:
+        subject_centroids = torch.zeros(num_subjects_ortho, feature_dim_ortho, device=device)
+        print(f"[OrthoLOP] Initialized subject centroids: {num_subjects_ortho} subjects × {feature_dim_ortho}D, "
+              f"λ={lambda_ortho}, EMA={ortho_ema_momentum}")
 
     device_info = str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "CPU"
     live_tracker.training_started(phase, epochs, device_info=device_info)
@@ -502,6 +517,8 @@ def training_loop(phase,
         train_dann_correct = 0
         train_dann_total = 0
         dann_loss_total = 0.0
+        ortho_penalty_total = 0.0
+        ortho_penalty_count = 0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
             if live_tracker and getattr(live_tracker, 'is_cancelled', False):
@@ -665,6 +682,38 @@ def training_loop(phase,
                     annealed_lambda_mmd = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * lambda_mmd
                     
                     loss = loss + (annealed_lambda_mmd * loss_mmd)
+
+                # --- Latent Orthogonal Projection (Identity Erasure) ---
+                if use_ortho and subject_centroids is not None and torch.isfinite(backbone_feats).all():
+                    # Remap subject labels to contiguous indices for centroid lookup
+                    if subj_remapper is not None:
+                        mapped_subjs = torch.tensor(
+                            [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels],
+                            device=device, dtype=torch.long)
+                    else:
+                        mapped_subjs = subject_labels.long()
+
+                    # EMA update of per-subject centroids (no gradients)
+                    with torch.no_grad():
+                        for subj_idx in torch.unique(mapped_subjs):
+                            mask = (mapped_subjs == subj_idx)
+                            subj_mean = backbone_feats[mask].mean(dim=0)
+                            subject_centroids[subj_idx] = (
+                                (1 - ortho_ema_momentum) * subject_centroids[subj_idx]
+                                + ortho_ema_momentum * subj_mean
+                            )
+
+                    # Orthogonal penalty: squared cosine similarity → 0 = orthogonal
+                    batch_centroids = subject_centroids[mapped_subjs].detach()
+                    ortho_penalty = torch.mean(
+                        F.cosine_similarity(backbone_feats, batch_centroids, dim=-1) ** 2
+                    )
+                    loss = loss + (lambda_ortho * ortho_penalty)
+
+                    # Track for epoch logging
+                    with torch.no_grad():
+                        ortho_penalty_total += ortho_penalty.item()
+                        ortho_penalty_count += 1
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
@@ -868,6 +917,12 @@ def training_loop(phase,
             print(f"  DANN — Train Subject Accuracy: {train_dann_acc:.4f} | Loss: {avg_dann_loss:.4f}")
             log_dict[f'Phase{str(phase).upper()}/Train/DANN_Subject_Acc'] = train_dann_acc
             log_dict[f'Phase{str(phase).upper()}/Train/DANN_Loss'] = avg_dann_loss
+
+        # --- Ortho Projection Logging ---
+        if use_ortho and ortho_penalty_count > 0:
+            avg_ortho = ortho_penalty_total / ortho_penalty_count
+            print(f"  OrthoLOP — Avg Penalty: {avg_ortho:.4f}")
+            log_dict[f'Phase{str(phase).upper()}/Train/Ortho_Penalty'] = avg_ortho
 
 
 
@@ -1089,7 +1144,12 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         subj_remapper=subj_remapper,
         use_mmd=config.loss.get('use_mmd', False),
         lambda_mmd=config.loss.get('lambda_mmd', 0.0),
-        live_tracker=live_tracker
+        live_tracker=live_tracker,
+        use_ortho=config.loss.get('use_ortho', False),
+        lambda_ortho=config.loss.get('lambda_ortho', 0.1),
+        ortho_ema_momentum=config.loss.get('ortho_ema_momentum', 0.1),
+        num_subjects_ortho=num_dynamic_subjects,
+        feature_dim_ortho=config.model.get('feature_dim', 256)
     )
    
 
@@ -1220,7 +1280,12 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         subj_remapper=subj_remapper,
         use_mmd=config.loss.get('use_mmd', False),
         lambda_mmd=config.loss.get('lambda_mmd', 0.0),
-        live_tracker=live_tracker
+        live_tracker=live_tracker,
+        use_ortho=config.loss.get('use_ortho', False),
+        lambda_ortho=config.loss.get('lambda_ortho', 0.1),
+        ortho_ema_momentum=config.loss.get('ortho_ema_momentum', 0.1),
+        num_subjects_ortho=num_dynamic_subjects,
+        feature_dim_ortho=config.model.get('feature_dim', 256)
     )
 
     

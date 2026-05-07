@@ -566,10 +566,10 @@ def test(config, loso, subj, device, model):
     print(f"  Saved {umap3_path}")
 
     # =================================================================
-    # Intra-Bag Cosine Similarity Heatmap (sampled from train set)
+    # Intra-Bag Cosine Similarity Heatmaps (sampled from train set)
     # =================================================================
     print(f"\n{'='*60}")
-    print(f"  Intra-Bag Cosine Similarity Heatmap")
+    print(f"  Intra-Bag Cosine Similarity Heatmaps")
     print(f"{'='*60}")
 
     # Gather all unique bag_ids, sample one, then collect ALL windows for that bag_id
@@ -581,64 +581,94 @@ def test(config, loso, subj, device, model):
             bag_id_to_info[bid] = {"files": [], "emotion": s[2], "subject": s[3]}
         bag_id_to_info[bid]["files"].extend(s[1])  # accumulate all window files
 
-    valid_bag_ids = [bid for bid, info in bag_id_to_info.items() if len(info["files"]) > 100 and info["emotion"] != 3]
-    if not valid_bag_ids:
-        print("  [IntraBag] No non-neutral bag found with W > 100. Falling back to all bags.")
-        valid_bag_ids = list(bag_id_to_info.keys())
+    def _sample_and_render_intrabag(bag_id_to_info, emotion_filter, exclude_neutral, rng_seed, tag_name, log_dict):
+        """Sample a bag matching the filter criteria, extract window embeddings, render heatmap.
         
-    rng = np.random.RandomState(42)
-    sampled_bag_id = valid_bag_ids[rng.randint(0, len(valid_bag_ids))]
-    sampled_info = bag_id_to_info[sampled_bag_id]
-    sampled_files = sampled_info["files"]
-    sampled_emotion = sampled_info["emotion"]
-    sampled_subject = sampled_info["subject"]
-    print(f"  Sampled bag_id={sampled_bag_id} (subject={sampled_subject}, emotion={sampled_emotion}, "
-          f"windows={len(sampled_files)})")
+        Args:
+            emotion_filter: If not None, only bags with this emotion are considered.
+            exclude_neutral: If True, exclude emotion==3 from candidates.
+            rng_seed: Random seed for reproducible sampling.
+            tag_name: W&B log key suffix and filename suffix.
+        """
+        if emotion_filter is not None:
+            candidates = [bid for bid, info in bag_id_to_info.items()
+                          if len(info["files"]) > 100 and info["emotion"] == emotion_filter]
+            if not candidates:
+                print(f"  [IntraBag-{tag_name}] No bag with emotion={emotion_filter} and W>100. Falling back to any bag with emotion={emotion_filter}.")
+                candidates = [bid for bid, info in bag_id_to_info.items()
+                              if info["emotion"] == emotion_filter]
+        else:
+            candidates = [bid for bid, info in bag_id_to_info.items()
+                          if len(info["files"]) > 100 and (not exclude_neutral or info["emotion"] != 3)]
+            if not candidates:
+                print(f"  [IntraBag-{tag_name}] No matching bag with W>100. Falling back to all bags.")
+                candidates = list(bag_id_to_info.keys())
 
-    # Load all windows in the bag and extract per-window embeddings
-    window_embs = []
-    model.eval()
-    with torch.no_grad():
-        for fname in sampled_files:
-            fpath = os.path.join(train_set.samples_dir, fname)
-            try:
-                win = torch.load(fpath, weights_only=True, map_location='cpu').float()
-            except Exception as e:
-                print(f"    Skipping {fname}: {e}")
-                continue
-            # win shape: [T, C, H, W] — add batch dim
-            win = win.unsqueeze(0).to(device)            # [1, T, C, H, W]
-            win = win.permute(1, 0, 2, 3, 4)             # [T, 1, C, H, W]
-            feat, _ = model.encoder(win)                  # encoder output
-            if feat.dim() == 5:
-                emb_w = feat.mean(dim=[0, 3, 4])          # [1, D]
-            else:
-                emb_w = feat.mean(dim=[-2, -1])           # [1, D]
-            emb_w = F.normalize(emb_w, dim=1, eps=1e-6)
-            window_embs.append(emb_w.cpu())
+        if not candidates:
+            print(f"  [IntraBag-{tag_name}] No bags found at all. Skipping.")
+            return
 
-    if len(window_embs) >= 2:
-        bag_embs = torch.cat(window_embs, dim=0).numpy()  # [W, D]
-        bag_cos_sim = cosine_similarity(bag_embs)          # [W, W]
+        rng = np.random.RandomState(rng_seed)
+        sampled_bag_id = candidates[rng.randint(0, len(candidates))]
+        sampled_info = bag_id_to_info[sampled_bag_id]
+        sampled_files = sampled_info["files"]
+        sampled_emotion = sampled_info["emotion"]
+        sampled_subject = sampled_info["subject"]
+        print(f"  [{tag_name}] Sampled bag_id={sampled_bag_id} (subject={sampled_subject}, emotion={sampled_emotion}, "
+              f"windows={len(sampled_files)})")
 
-        fig_bag, ax_bag = plt.subplots(figsize=(8, 7))
-        sns.heatmap(
-            bag_cos_sim, cmap="viridis", vmin=-0.2, vmax=1.0,
-            square=True, ax=ax_bag,
-            xticklabels=False, yticklabels=False
-        )
-        ax_bag.set_title(f"Intra-Bag Cosine Sim · bag={sampled_bag_id} "
-                         f"(subj={sampled_subject}, emo={sampled_emotion}, W={len(bag_embs)})")
-        ax_bag.set_xlabel("Window Index")
-        ax_bag.set_ylabel("Window Index")
-        fig_bag.tight_layout()
-        bag_hm_path = f"evidence/intrabag_cossim_{suffix}.png"
-        fig_bag.savefig(bag_hm_path, dpi=150)
-        plt.close(fig_bag)
-        log_dict["Eval/IntraBag_CosSim"] = wandb.Image(bag_hm_path, caption=f"Intra-Bag Cosine Sim (bag {sampled_bag_id})")
-        print(f"  Saved {bag_hm_path}")
-    else:
-        print("  [IntraBag] Not enough windows to compute pairwise similarity.")
+        # Load all windows in the bag and extract per-window embeddings
+        window_embs = []
+        model.eval()
+        with torch.no_grad():
+            for fname in sampled_files:
+                fpath = os.path.join(train_set.samples_dir, fname)
+                try:
+                    win = torch.load(fpath, weights_only=True, map_location='cpu').float()
+                except Exception as e:
+                    print(f"    Skipping {fname}: {e}")
+                    continue
+                # win shape: [T, C, H, W] — add batch dim
+                win = win.unsqueeze(0).to(device)            # [1, T, C, H, W]
+                win = win.permute(1, 0, 2, 3, 4)             # [T, 1, C, H, W]
+                feat, _ = model.encoder(win)                  # encoder output
+                if feat.dim() == 5:
+                    emb_w = feat.mean(dim=[0, 3, 4])          # [1, D]
+                else:
+                    emb_w = feat.mean(dim=[-2, -1])           # [1, D]
+                emb_w = F.normalize(emb_w, dim=1, eps=1e-6)
+                window_embs.append(emb_w.cpu())
+
+        if len(window_embs) >= 2:
+            bag_embs = torch.cat(window_embs, dim=0).numpy()  # [W, D]
+            bag_cos_sim = cosine_similarity(bag_embs)          # [W, W]
+
+            fig_bag, ax_bag = plt.subplots(figsize=(8, 7))
+            sns.heatmap(
+                bag_cos_sim, cmap="viridis", vmin=-0.2, vmax=1.0,
+                square=True, ax=ax_bag,
+                xticklabels=False, yticklabels=False
+            )
+            ax_bag.set_title(f"Intra-Bag Cosine Sim · bag={sampled_bag_id} "
+                             f"(subj={sampled_subject}, emo={sampled_emotion}, W={len(bag_embs)})")
+            ax_bag.set_xlabel("Window Index")
+            ax_bag.set_ylabel("Window Index")
+            fig_bag.tight_layout()
+            bag_hm_path = f"evidence/intrabag_cossim_{tag_name}_{suffix}.png"
+            fig_bag.savefig(bag_hm_path, dpi=150)
+            plt.close(fig_bag)
+            log_dict[f"Eval/IntraBag_CosSim_{tag_name}"] = wandb.Image(bag_hm_path, caption=f"Intra-Bag Cosine Sim {tag_name} (bag {sampled_bag_id})")
+            print(f"  Saved {bag_hm_path}")
+        else:
+            print(f"  [IntraBag-{tag_name}] Not enough windows to compute pairwise similarity.")
+
+    # 1. Non-Neutral emotion bag (original behavior)
+    _sample_and_render_intrabag(bag_id_to_info, emotion_filter=None, exclude_neutral=True,
+                                rng_seed=42, tag_name="Active", log_dict=log_dict)
+
+    # 2. Neutral emotion bag (emotion_id == 3)
+    _sample_and_render_intrabag(bag_id_to_info, emotion_filter=3, exclude_neutral=False,
+                                rng_seed=42, tag_name="Neutral", log_dict=log_dict)
 
     wandb.log(log_dict)
     print(f"\nLogged to W&B under Eval/ and EvalTrain/ prefixes.")

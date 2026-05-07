@@ -4,6 +4,7 @@ import os
 import pandas as pd
 from tqdm import tqdm
 from collections import defaultdict
+import copy
 from data_process.data_loader import DatasetReader
 from data_process.wavelet import WaveletModule
 from src.snn_modeling.dataloader.dataset import TopoMapper
@@ -11,6 +12,7 @@ import json
 import torch.nn.functional as F
 
 SELECTED_EMOTIONS = [0, 1, 2, 3, 4] 
+NEUTRAL_EMOTION_ID = 3  # Index mapping: 0=Disgust, 1=Fear, 2=Sad, 3=Neutral, 4=Happy
 
 def compute_alignment_matrix(covs_list, device):
     """
@@ -128,7 +130,66 @@ def run_data_setup(config=None):
     subject_alignment_matrices = {}
     for subj, covs in subject_covs.items():
         subject_alignment_matrices[subj] = compute_alignment_matrix(covs, device)
-        
+
+    # --- ERD Phase 1.5: Compute per-subject Neutral CWT baseline (C_k) ---
+    # For each subject, compute the mean CWT magnitude spectrum across all their
+    # Neutral trials. This captures the stationary IAF signature that will be
+    # subtracted from every active emotion window.
+    print(f"Phase 1.5: Computing per-subject Neutral CWT baselines (ERD)...")
+    subject_neutral_accum = {}   # subject_id -> running sum of CWT magnitude
+    subject_neutral_count = {}   # subject_id -> number of accumulated samples
+
+    for raw_eeg, emotion_id, orig_filename in tqdm(
+            dataset_reader.iterate_file_based(), total=len(dataset_reader), desc="ERD Neutral Scan"):
+        if emotion_id != NEUTRAL_EMOTION_ID:
+            continue
+
+        subject_id, session_id = parse_metadata(orig_filename)
+        session_key = f"{subject_id}_{session_id}"
+
+        raw_eeg = raw_eeg.to(device)
+        if raw_eeg.dim() == 2 and raw_eeg.shape[1] < WINDOW_SIZE:
+            continue
+        elif raw_eeg.dim() == 3 and raw_eeg.shape[2] < WINDOW_SIZE:
+            continue
+
+        with torch.no_grad():
+            # Apply the same EA alignment as the main pipeline
+            R_inv_sqrt = subject_alignment_matrices[session_key]
+            raw_eeg = apply_alignment(raw_eeg, R_inv_sqrt)
+
+            # CWT + log1p (same as Phase 2 below)
+            feats = wavelet(raw_eeg)
+            feats = torch.log1p(feats)
+            # Robust scaling (same IQR normalization)
+            median = feats.median(dim=-1, keepdim=True).values
+            q1 = torch.quantile(feats, 0.25, dim=-1, keepdim=True)
+            q3 = torch.quantile(feats, 0.75, dim=-1, keepdim=True)
+            iqr = q3 - q1 + 1e-6
+            feats = (feats - median) / iqr
+            feats = torch.clamp(feats, -4.0, 4.0)
+
+            # Mean across time dimension -> subject-level neutral spectrum
+            # feats shape: [1, C, Bands, T] -> mean over T -> [1, C, Bands]
+            neutral_mean = feats.mean(dim=-1)  # [1, C, Bands]
+
+        if subject_id not in subject_neutral_accum:
+            subject_neutral_accum[subject_id] = neutral_mean.clone()
+            subject_neutral_count[subject_id] = 1
+        else:
+            subject_neutral_accum[subject_id] += neutral_mean
+            subject_neutral_count[subject_id] += 1
+
+    # Finalize: C_k = mean neutral CWT per subject
+    subject_neutral_baselines = {}
+    for subj_id in subject_neutral_accum:
+        C_k = subject_neutral_accum[subj_id] / subject_neutral_count[subj_id]  # [1, C, Bands]
+        subject_neutral_baselines[subj_id] = C_k
+        print(f"  Subject {subj_id}: Neutral baseline from {subject_neutral_count[subj_id]} trials")
+
+    if not subject_neutral_baselines:
+        print("  WARNING: No neutral baselines computed! ERD subtraction will be skipped.")
+
     # --- STATISTICS COLLECTOR ---
 
     registry = []
@@ -138,8 +199,7 @@ def run_data_setup(config=None):
     total_collected = 0
     GPU_BATCH_SIZE = 16 
     
-    print("Phase 2: Generating Dataset...")
-    
+    print("Phase 2: Generating Dataset (with ERD subtraction)...")    
     for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader)): 
         bag_id += 1
         subject_id, session_id = parse_metadata(orig_filename)
@@ -165,6 +225,13 @@ def run_data_setup(config=None):
 
             feats = (feats - median) / iqr
             feats = torch.clamp(feats, -4.0, 4.0) # 1 iqr is typically ~1.5 std, so this is roughly 6 stds from the median, which should be safe for outliers
+
+            # --- ERD: Subtract neutral baseline from active emotion windows ---
+            # X_pure_emotion = X_active - C_k (broadcast over time dimension)
+            if subject_id in subject_neutral_baselines:
+                C_k = subject_neutral_baselines[subject_id]  # [1, C, Bands]
+                # C_k has no time dim; feats is [1, C, Bands, T] -> broadcast subtract
+                feats = feats - C_k.unsqueeze(-1)
 
             windows = feats.unfold(dimension=-1, size=WINDOW_SIZE, step=STEP_SIZE)
 
