@@ -397,13 +397,21 @@ class SupMoCoLoss(ContrastiveLoss):
             pos_weights = pos_weights * temporal_weights.unsqueeze(0)
 
         # --- Trial Exclusion Mask (Leave-One-Trial-Out) ---
-        # Zero out ALL negatives that come from the exact same video (trial)
+        # Zero out POSITIVES from the same trial.  Under weak supervision
+        # (1 trial = 1 label) the neg_mask already excludes same-label pairs,
+        # so masking negatives here was a no-op.  Instead, we prevent same-trial
+        # windows from being pulled together as positives.  This combats the
+        # "gaslighting" problem: not every window in a trial is equally
+        # emotional, and anchoring to intra-trial climax peaks drags
+        # neutral-ish windows toward a trial-specific representation.
+        # Same-trial windows become ghosts (neither pos nor neg), and the
+        # model is forced to learn cross-trial emotion agreement only.
         if self.exclude_same_trial and query_video_ids is not None:
             q_vid = query_video_ids.view(-1, 1)    # (B, 1)
             c_vid = all_video_ids.view(1, -1)       # (1, M)
 
             same_video = (q_vid == c_vid)  # (B, M)
-            neg_weights = neg_weights * (~same_video).float()
+            pos_weights = pos_weights * (~same_video).float()
 
         # Decoupled denominator: negatives only (no positive terms in partition).
         # Use unpenalized logits for denominator so margin only affects numerator
@@ -447,9 +455,9 @@ class SupMoCoLoss(ContrastiveLoss):
                 print(f"Max Logit (shifted): {logits_max.mean().item():.4f}")
                 print(f"Denominator (Exp Neg Sum): {neg_partition.mean().item():.4f}")
                 if self.exclude_same_trial and query_video_ids is not None:
-                    excluded_count = same_video.sum().item()
-                    total_neg_pairs = neg_mask.sum().item()
-                    print(f"Trial Exclusions: {excluded_count:.0f} / {total_neg_pairs:.0f} neg pairs masked")
+                    ghosted_count = (same_video & pos_mask.bool()).sum().item()
+                    total_pos_pairs = pos_mask.sum().item()
+                    print(f"LOTO Ghosted: {ghosted_count:.0f} / {total_pos_pairs:.0f} pos pairs excluded (cross-trial only)")
                 print(f"Final Loss: {loss_val.item():.4f}\n")
                 
         self.step_count = step_count + 1

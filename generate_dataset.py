@@ -16,7 +16,7 @@ NEUTRAL_EMOTION_ID = 3  # Index mapping: 0=Disgust, 1=Fear, 2=Sad, 3=Neutral, 4=
 
 def compute_alignment_matrix(covs_list, device):
     """
-    Computes the EA alignment matrix R^{-1/2} from a list of trial covariances.
+    Computes the EA alignment matrix R^{-1/2} and R^{1/2} from a list of trial covariances.
     """
     mean_cov = torch.stack(covs_list).mean(dim=0)
     C = mean_cov.shape[0]
@@ -24,12 +24,15 @@ def compute_alignment_matrix(covs_list, device):
     # Add small epsilon for numerical stability
     mean_cov = mean_cov + torch.eye(C, device=device) * 1e-4
     
-    # Compute R^{-1/2} using Eigen Decomposition
+    # Compute R^{-1/2} and R^{1/2} using Eigen Decomposition
     L, Q = torch.linalg.eigh(mean_cov)
     L_inv_sqrt = torch.diag(1.0 / torch.sqrt(L.clamp(min=1e-6)))
     R_inv_sqrt = torch.matmul(torch.matmul(Q, L_inv_sqrt), Q.t())
     
-    return R_inv_sqrt
+    L_sqrt = torch.diag(torch.sqrt(L.clamp(min=1e-6)))
+    R_sqrt = torch.matmul(torch.matmul(Q, L_sqrt), Q.t())
+    
+    return R_inv_sqrt, R_sqrt
 
 def apply_alignment(x, R_inv_sqrt):
     """
@@ -128,8 +131,17 @@ def run_data_setup(config=None):
 
     print("Phase 1 Complete: Resolving Alignment Matrices...")
     subject_alignment_matrices = {}
+    subject_r_sqrt_matrices = {}
     for subj, covs in subject_covs.items():
-        subject_alignment_matrices[subj] = compute_alignment_matrix(covs, device)
+        r_inv, r_sqrt = compute_alignment_matrix(covs, device)
+        subject_alignment_matrices[subj] = r_inv
+        subject_r_sqrt_matrices[subj] = r_sqrt
+        
+    torch.save({
+        'R_inv_sqrt': subject_alignment_matrices,
+        'R_sqrt': subject_r_sqrt_matrices
+    }, os.path.join(OUTPUT_FOLDER, "R_matrices.pt"))
+    print(f"Saved R matrices to {os.path.join(OUTPUT_FOLDER, 'R_matrices.pt')}")
 
     # --- ERD Phase 1.5: Compute per-subject Neutral CWT baseline (C_k) ---
     # For each subject, compute the mean CWT magnitude spectrum across all their
@@ -189,6 +201,9 @@ def run_data_setup(config=None):
 
     if not subject_neutral_baselines:
         print("  WARNING: No neutral baselines computed! ERD subtraction will be skipped.")
+    else:
+        torch.save(subject_neutral_baselines, os.path.join(OUTPUT_FOLDER, "C_baselines.pt"))
+        print(f"Saved C baselines to {os.path.join(OUTPUT_FOLDER, 'C_baselines.pt')}")
 
     # --- STATISTICS COLLECTOR ---
 

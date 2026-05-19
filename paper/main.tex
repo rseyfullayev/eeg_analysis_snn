@@ -1,0 +1,489 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usetikzlibrary{svg.path}
+\usepackage{multirow}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\usepackage{tikz}
+\usetikzlibrary{
+  calc,
+  backgrounds,
+  arrows.meta,
+  positioning,
+  decorations.pathreplacing
+}
+
+% Architecture Colors
+\definecolor{zoneInput}{HTML}{E1D5E7} 
+\definecolor{zoneRetina}{HTML}{D5E8D4} 
+\definecolor{zoneBridge}{HTML}{DAE8FC} 
+\definecolor{zoneDecoder}{HTML}{FFF2CC} 
+\definecolor{zoneHead}{HTML}{F8CECC}
+
+\tikzset{
+  pics/shadowed node/.style 2 args={
+    code={
+      \begin{scope}[on background layer]
+        \foreach \i in {2,1} {
+          \node[n, fill=#1, shift={(\i*0.06,\i*0.06)}, opacity=0.4]
+            at (0,0) {\vphantom{Ag}#2};
+        }
+      \end{scope}
+      \node[n, fill=#1] (-main) at (0,0) {\vphantom{Ag}#2};
+    }
+  },
+  n/.style={
+    rounded corners=1pt,
+    draw=black!60,
+    thick,
+    minimum width=4.8cm,
+    inner sep=6pt,
+    font=\sffamily,
+    align=center
+  },
+  shape_label/.style={font=\scriptsize\ttfamily, text=black!80, right=0.3cm of #1},
+  zone_label/.style={font=\sffamily\bfseries, left=1.2cm of #1},
+  >={Stealth[round]}
+}
+
+
+
+\begin{document}
+
+
+
+
+\title{SWEEP-Net - Spiking Weakly-supervised EEG Emotion Prototyping Network*\\
+
+}
+
+
+\author{
+\IEEEauthorblockN{\textsuperscript{} Elnur Mammadli\textsuperscript{*}}
+\IEEEauthorblockA{\textit{IT and Engineering} \\
+\textit{ADA University}\\
+Baku, Azerbaijan \\
+ORCID: 0009-0008-2983-3969}
+\thanks{\textsuperscript{*}The first three authors contributed equally to this work.} % 
+\and
+
+\IEEEauthorblockN{\textsuperscript{} Omar Gadimli\textsuperscript{*}} %
+\IEEEauthorblockA{\textit{IT and Engineering} \\
+\textit{ADA University}\\
+Baku, Azerbaijan \\
+ogadimli23943@ada.edu.az}
+\and
+
+\IEEEauthorblockN{\textsuperscript{} Ravan Seyfullayev\textsuperscript{*}}
+\IEEEauthorblockA{\textit{Computer Engineering and Informatics} \\
+\textit{Istanbul Technical University}\\
+Istanbul, Turkiye \\
+seyfullayev24@itu.edu.tr}
+
+}
+
+\maketitle
+
+\begin{abstract}
+
+\end{abstract}
+
+\begin{IEEEkeywords}
+component, formatting, style, styling, insert
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+
+\section{Related Work}
+
+\subsection{The Fidelity-Sparsity Trade-off}
+A key disagreement in neuromorphic literature regards the trade-off between coding sparsity and information fidelity. While traditional Poisson-based rate coding offers significant sparsity benefits, as demonstrated by Kim et al. \cite{Kim2022}, it suffers from inherent stochasticity and long integration latency, which makes it less optimal for capturing transient EEG dynamics. In contrast, Direct Coding has demonstrated superior accuracy and convergence speed on standard benchmarks (e.g., CIFAR10) by eliminating this stochastic variance \cite{Kim2022}. Furthermore, while temporal coding schemes like Time-to-First-Spike (TTFS) maximize energy efficiency, they historically underperformed compared to rate-based methods in high-noise regimes \cite{Oh2021}. 
+
+SWEEP-Net addresses this by employing a Hybrid architecture that leverages the stability of Direct inputs while enforcing the sparsity of temporal routing. Recent works including Aydin et al. \cite{Aydin2024} show that hybrid approach is effective as ANN doesn't cause state decay or require long time periods while SNN provides energy saving. 
+
+However, while Aydin et al. \cite{Aydin2024} utilize the ANN primarily for one-shot injection to startup the network, we introduce a \textbf{Gated Cross-Modality Interface} adapted from \cite{Oktay2018}. By placing learnable gates at the Analog-to-Spike bottleneck and Skip Connections, the network dynamically selects which continuous features to transform into spikes, effectively learning an optimal, task-specific neural code that balances fidelity and sparsity.
+
+Moreover, common pre-processing approaches employed in the literature rely on static spectral windows. Current State-Of-The-Art (SOTA) models, such as Bi-GAN \cite{Niaki2025} and EEGSNet \cite{Shi2025}, utilize Differential Entropy (DE) features, a method that assumes EEG signals follow a Gaussian Distribution within short time windows. However, reducing a window to a single statistic dampens the temporal and spatial precision by collapsing complex time-series data into a scalar value. Furthermore, as DE highly depends on signal variance $\sigma^2$ which is volatile due to EEG having different distribution across subject domain, prior works incorporate Domain-Adversarial Neural Network \cite{Sicilia2023} to drive the network to learn generalized subject-independent features. As Guo et al. \cite{Guo2025} recently highlighted, excessive incorporation of multi-domain features---such as frequency-band correlations and spatial dependencies---may lead to significant information loss, a limitation related to earlier frameworks like those proposed in \cite{Nie2011, Shi2013}. By contrast, SWEEP-Net utilizes Continuous Wavelet Transform (CWT) to capture transient temporal dynamics at a sub-second scale, effectively treating EEG as a high-definition spatiotemporal video rather than a sequence of static images.
+
+\subsection{Challenges in Deep SNN Training: The Hybrid Necessity}
+While Spiking Neural Networks offer significant energy advantages, training deep architectures remains an open optimization challenge. The non-differentiable nature of spike generation via Heaviside function necessitates the use of Surrogate Gradients (SG) \cite{Neftchi2019, Wu2022, Rathi2023}. Nevertheless, Guo et al. \cite{Guo2024} point out a major limitation of this approach: gradient vanishing. 
+
+To combat gradient vanishing and explosion, one of the approaches is to apply threshold-dependent Batch Normalization (tdBN) \cite{Zheng2021} which normalizes inputs on spatiotemporal dimension and making variance dependent on threshold. Extending this, Batch Normalization Through Time (BNTT) \cite{Kim2021} deconstructs statistics across time steps to capture dynamics. In SWEEP-Net, we employ \textbf{Spatio-Temporal Batch Normalization (ST-BN)} via 3D Batch Norm. Unlike tdBN, ST-BN allows learnable affine parameter $\gamma$ to dynamically optimize the signal scale relative to threshold, stabilizing the injection current without rigid constraints. Furthermore, to prevent saturation in the recurrent dynamics, we adopt the \textbf{Adaptive Leaky Integrate-and-Fire (ALIF)} neuron model \cite{Brette2005}. The ALIF's adaptive threshold acts as a homeostatic regulator, preventing the network from falling into `silent' or saturation regimes during the processing of noisy EEG feature maps. 
+
+\subsection{Weakly-Supervised Segmentation: The Routing Paradigm}
+While stabilization of temporal dynamics via ALIFs is crucial, it does not, however, resolve the spatial difference of EEG signals. Traditional classification models treat the brain state as a feature map that must eventually be collapsed into a flat classification vector \cite{Zheng2015, Liu2016}. While effective for global accuracy, Shi et al.'s \cite{Shi2025} paradigm of using ``Global Pooling'' neglects the spatial structure of the signal during the classification phase.
+
+SWEEP-Net breaks from this convention by re-framing emotion recognition not as classification, but as \textbf{Neuromorphic Spatial Routing} via Weakly-Supervised Segmentation. Following the taxonomy established by Li et al. \cite{Li2021}, EEG emotion recognition faces two distinct weakly-supervised challenges. First, the problem of Inexact Supervision, where only coarse-grained trial-level labels are available, but the objective is to identify fine-grained spatiotemporal patterns. SWEEP-Net addresses this through \textbf{Neuromorphic Spatial Routing} idea, using coarse labels to generate precise spatial prototypes. Secondly, the problem of Domain Adaptation (under 'Incomplete Supervision') \cite{Li2021}, where the distribution of data shifts between subjects. We resolve this via Instance Normalization, enabling the model to generalize topology across the domains of different subjects without explicit training.
+
+
+\section{Methods}
+
+% --- Ravan begin ---
+\subsection{High-Fidelity Spatiotemporal Encoding. DyT-adapted Input Scaling} % Describe CWT (morlet 1.0-1.5), Topographic Mapping using Azimuthal Equidistant Projection and Gaussian splatting
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.85\columnwidth]{distribution_evidence.png}
+    
+    \caption{\textbf{Distributional Analysis of Preprocessed EEG.} (Left) Log-probability density reveals a bimodal distribution induced by Instance-Adaptive Scaling, diverging significantly from the Gaussian assumption. (Right) Q-Q plot confirms the non-normal nature of the input features.}
+    \label{fig:distribution}
+\end{figure}
+
+Standard Global Z-Score normalization or Min-Max scaling fails on EEG data due to the ``Subject Gap''---inter-subject amplitude variability causes global statistics zero out low-voltage subjects. We propose instance-based scaling method inspired by Dynamic Tanh layer \cite{Zhu2025}.
+
+For each input tensor $X_{i}$, we compute the 98th percentile ($P_{98}$) to estimate the robust signal ceiling, ignoring the top 2\% of outlier artifacts:
+
+\begin{equation}
+    \hat{X}_i = \tanh \left(3.0 \cdot \frac{X_i}{P_{98} + \epsilon} \right)
+\end{equation}
+
+This creates a normalized input space bounded to $[-1, 1]$. We use 3.0 amount of gain to foregrounds subtle topological variance. Crucially, this transformation aligns the input distribution with bimodal regime 0 or 1 \ref{fig:distribution}, effectively digitalizing the analog signal for optimal transduction by the subsequent Spiking Layers.
+
+Following spectral decomposition and mapping, the resulting topological maps exhibit a highly Leptokurtic (heavy-tailed) bimodal distribution around $[0.0, 1.0]$. Statistical analysis of the randomly chosen $n = 2 \times 10^6$ data points reveal excess kurtosis $\kappa - 3 \approx 1.53$, skewness of $\gamma_{1}1.68$, mean $\bar{x} = 0.19$, and standard deviation $S = 0.29$, confirming that significant signal information is encoded in short-lived high-magnitude events rather than the Gaussian mean.
+
+\subsection{Target Generation: The Neuromorphic Spatial Clock}
+To enable the weakly-supervised routing paradigm, we map discrete emotion labels to continuous spatial coordinates on the $32 \times 32$ topographic grid. Before deciding the target coordinates, we investigated whether the EEG-driven topological grids possessed innate spatial discriminability. We computer \textit{Differential Topology Map} by subtracting pixel-wise mean intensity of opposing emotion classes (Happy vs. Sad) from random sample size $n = 3200$. Excess Kurtosis of $\kappa - 3 \approx 0.94$  statistically confirms that the discriminative features are spatially localized (non-Gaussian hotspots) rather than diffuse noise.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.85\columnwidth]{topology_proof.png}
+    
+    \caption{\textbf{Differential Topology Analysis.} (Left/Center) Mean spectral activation for 'Happy' and 'Sad' classes exhibits high overlap due to global signal energy. (Right) The difference map ($\bar{x}_{Happy} - \bar{x}_{Sad}$) reveals naturally orthogonal spatial routing: positive valence (red) routes to bilateral regions, while negative valence (blue) concentrates along the central midline.}
+    \label{fig:topo}
+\end{figure}
+
+With that being said, while biological topology provides the existence proof, raw activity is noisy and subject-dependent. To create a robust, standardized achievable target masks, we propose a Geometric Prior via the Spatial Clock. We assign each emotion class $c$ a center of a Gaussian Blob $(c_x, c_y)$ equidistantly spaced on a circle of radius $r = 0.7$ and total class number $C$:
+
+\begin{equation}
+\theta_c = \frac{2\pi c}{C}, \quad c_x = r \cos \theta_c, \quad c_y = r \sin \theta_c
+\end{equation}
+
+By forcing network to project naturally occurring messy biological hotspots \ref{fig:topo} onto this smooth, maximized-intensity geometric manifold, we enforce SNN to learn routing biological feature maps onto specified Canonical Representation.
+
+\subsection{Adaptive Spiking Dynamics} % Describe ALIF, mention Soft Reset. Introduce Recurrent ALIF (Bellec2018 describes adaptive threshold, and additive recursion)
+
+\subsubsection{Recurrent Spiking Dynamics: RALIF} 
+% --- Ravan end ---
+
+% --- Omar begin ---
+
+\subsection{SWEEP-Net Architecture: Hybrid U-Net}
+
+The central innovation of SWEEP-Net is the \textbf{Neuromorphic Spatial Routing} mechanism. The analog features $F_t$ extracted by the Deep Retina are injected into the Spiking Cortex via a learnable bottleneck. We employ Gated Skip Connections \cite{Oktay2018} to dynamically synthesize the spikes from analog data, preventing information flooding and bypassing traditional encoding methods.
+
+The decoder operates purely in spiking domain, utilizing the temporal latency of the spikes to act as quasi-attention mechanism for routing information to the target mask at emotion-dependent coordinates. 
+
+To impose spatiotemporal regulation and enable temporal feedback between spiking neurons, in second layer of decoder we augment traditional ALIF layer with convolutional recurrent spike gain: Recurrent ALIF (RALIF).
+
+\begin{table}[htbp]
+    \caption{\textbf{SWEEP-Net Macro-Architecture Specification}}
+    \label{tab:architecture}
+    \centering
+    \renewcommand{\arraystretch}{1.2}
+    \resizebox{\columnwidth}{!}{
+    \begin{tabular}{ll ccl}
+        \toprule
+        \textbf{Zone} & \textbf{Component} & \textbf{Input Shape} & \textbf{Output Shape} & \textbf{Operational Detail} \\
+        \midrule
+        
+        \multirow{2}{*}{\textbf{Input}} 
+        & \textit{EEG Topographic Video} & $-$ & $(T, B, N_{b}, 32, 32)$ & Spatiotemporal Frames \\
+        \midrule
+        
+        \textbf{Zone 1} 
+        & Deep Retina & $(T, B, N_{b}, 32, 32)$ & $(T, B 512, 4, 4)$ & ResNet-18 (S1-S4), InstNorm \\
+        \midrule
+        
+        \textbf{Zone 2} 
+        & Latent Bridge & $(T, B, 512, 4, 4)$ & $(T, B, 512, 4, 4)$ & \textbf{Spiking Bottleneck} (ALIF) \\
+        \midrule
+        
+        \multirow{3}{*}{\textbf{Zone 3}} 
+        & Decoder Block 1 & $(T, B, 512, 4, 4)$ & $(T, B, 256, 8, 8)$ & Upsample, Cat GatedSkip3 ($256$), Conv-ALIF x2 \\
+        & Decoder Block 2 & $(T, B, 256, 8, 8)$ & $(T, B, 128, 16, 16)$ & Upsample, Cat GatedSkip2 ($128$), Conv-RALIF x2 \\
+        & Decoder Block 3 & $(T, B, 128, 16, 16)$ & $(T, B, 64, 32, 32)$ & Upsample, Cat GatedSkip1 ($64$), Conv-ALIF x2 \\
+        & Final Upsampling & $(T, B, 64, 32, 32)$ & $(T, B, 64, 32, 32)$ & Denoise \\
+        \midrule
+        
+        \textbf{Head} 
+        & Class Projector & $(T, B, 64, 32, 32)$ & $(T, B, N_{c}, 32, 32)$ & $1\times1$ Conv ($64 \to N_{c}$) \\
+        \midrule
+        
+        \textbf{Output} 
+        & Integrator & $(B, T, N_{c}, 32, 32)$ & $(B, N_{c}, 32, 32)$ & \textbf{Temporal Mean} (Collapse $T$) \\
+        \bottomrule
+        \multicolumn{5}{l}{\footnotesize \textit{Notation:} $B$=Batch Size, $T$=Time Steps, $N_{b}$=Bands (5), $N_{c}$=Classes (5), RALIF for Recurrent ALIF.} \\
+    \end{tabular}
+    }
+\end{table}
+
+
+
+
+\subsection{The Deep Retina: Analog Feature Extracting Encoder} % Describe ResNet 18  \cite{He2016}, we use SiLU instead of ReLU (describe why its better for gradients flow), and InstanceNorm instead of BatchNorm (look at last sentence of related work). Keep it brief, mention it takes raw video without averaging out (no static) using customly implemented TimeDistributed wrapper.
+
+
+
+
+% ViT section
+\subsubsection{The Spatiotemporal Backbone: Bidirectional TSM}
+Standard 2D Convolutional Networks (CNNs) treat video frames as independent static images ($T \times [B, C, H, W]$), discarding the crucial temporal evolution of EEG topography. While 3D convolutions or (2+1)D blocks can capture these dynamics, they introduce significant computational overhead and parameter explosion, which contradicts our goal of neuromorphic efficiency.
+
+To resolve this, we integrate a \textbf{Bidirectional Temporal Shift Module (Bi-TSM)} \cite{Lin2019} directly into the residual blocks of the ResNet-18 encoder. Bi-TSM facilitates information exchange between neighboring frames by shifting a fraction of channels along the temporal dimension, mimicking \textit{synaptic delays} in biological neural networks.
+
+Formally, given a feature tensor $\mathbf{X} \in \mathbb{R}^{T \times C \times H \times W}$ (batch dimension omitted for clarity), we split the channels into shifting and static folds. Since emotion recognition is performed offline on complete 1-second windows, we employ bidirectional shift to capture both past and future context:
+
+\begin{equation}
+    \mathbf{X}_{t, c}^{shifted} = 
+    \begin{cases} 
+      \mathbf{X}_{t-1, c} & \text{if } 0 \le c < \frac{C}{8} \quad (\text{Past}) \\
+      \mathbf{X}_{t+1, c} & \text{if } \frac{C}{8} \le c < \frac{2C}{8} \quad (\text{Future}) \\
+      \mathbf{X}_{t, c} & \text{otherwise} \quad (\text{Static})
+   \end{cases}
+\end{equation}
+
+This operation is inserted inside the residual branch before the convolution, allowing 2D kernels to learn spatiotemporal features with \textbf{zero additional overhead}.
+
+
+\subsubsection{The Temporal Context Module}
+While Bi-TSM effectively captures \textit{local} short-term dynamics, it lacks a global receptive field over the entire sequence duration. To bridge the gap between local frame features and the video-level emotional label, we augment the backbone with a Global Context mechanism. We define two variants to address different data regimes: a high-capacity \textbf{Temporal Vision Transformer (TViT)} and a lightweight \textbf{Global Context (GC) Block}.
+
+\paragraph{Variant A: Temporal Vision Transformer (TViT)}
+Following the Video Transformer Network paradigm \cite{Neimark2021}, we employ Multi-Head Self-Attention (MHSA) \cite{Vaswani2017} to model the dependencies between $T = 16$ frame embeddings extracted by the ResNet. We adopt the Global Context Block construction by Cao et al. \cite{Cao2019}, but simplify the context modeling stage. Let $\mathbf{X} \in \mathbb{R}^{T \times B \times C \times H \times W}$ represent the spatial feature tensor. Given the high semantic density of the ResNet output ($4 \times 4$ ``Active Regions''), we derive a global temporal sequence $\mathbf{Z} \in \mathbb{R}^{T \times B \times C}$ via Global Average Pooling (GAP) rather than learned masking:
+
+\begin{equation}
+    \mathbf{Z} = \text{GAP}(\mathbf{X})
+\end{equation}
+
+We compute the Query ($Q$), Key ($K$), and Value ($V$) matrices from $\mathbf{Z}$ via learned linear projections. The scaled dot-product attention is defined as:
+
+\begin{equation}
+    \text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\end{equation}
+
+where $d_k$ is the scaling factor to prevent gradient vanishing in the softmax function. To further refine the features, we replace standard Feed-Forward Network with a \textbf{Swish-Gated Linear Unit} (SwiGLU) \cite{Shazeer2020}, introducing a multiplicative gating mechanism that selectively filters noise in the latent space.
+
+The complete temporal context injection is formulated as a residual block:
+
+\begin{align}
+    \mathbf{Z}' &= \mathbf{Z} + \text{MHSA}(\text{LN}(\mathbf{Z})) \\
+    \mathbf{Z}'' &= \mathbf{Z}' + \text{SwiGLU}(\text{LN}(\mathbf{Z}')) \\
+    \mathbf{X}_{out} &= \mathbf{X} + \text{Broadcast}(\mathbf{Z}'')
+\end{align}
+
+where $\text{LN}$ denotes Layer Normalization. This mechanism injects global temporal context back into the spatial feature map via broadcast addition, shifting the feature distribution to reflect the video-level emotional state.
+
+\paragraph{Variant B: Global Context (GC) Block}
+For ablation studies and low-data regimes, we adapt the Global Context block by Cao et al. \cite{Cao2019}. Unlike the $O(T^2)$ complexity of MHSA, the GC block computes a query-independent attention map via a linear projection $W_{k}$:
+
+\begin{equation}
+    \alpha_t = \frac{\exp(W_k \mathbf{z}_t)}{\sum{j=1}^{T} \exp(W_k \mathbf{z}_j)}
+\end{equation}
+
+This attention map weights the frames to produce a single global context vector $\mathbf{g} = \sum_{t=1}^{T} \alpha_t \mathbf{z}_t$. T capture channel dependencies, this vector is processed by a bottleneck transform:
+
+\begin{equation}
+    \mathbf{g}' = W_{v2} \cdot \text{SiLU}(\textbf{LN}(W_{v1} \mathbf{g}))
+\end{equation}
+
+Finally, the transformed global context $\mathbf{z}'$ is broadcast and added to the original feature map ($\mathbf{X}_{out} = \mathbf{X} + \mathbf{g}'$, injecting video-level emotional context into every frame.
+
+
+
+\subsection{The Bottleneck: Spiking Latent Space} % Spatiotemporal Feature Compression (latent space)
+
+\subsection{The Spiking Decoder} % Gated Skip Connections, ALIF at Final Layer of Decoder integrates the potentials, without any decay (its called Non-Leaky Integrator) - to provide analog activations of neurons for better segmentation. Mention that we perform temporal mean to get average mask over time. Final Upsampling layers do not change spatial resolution or channel depth (64 -> 64) but act as denoising filter for accumulated membrane potentials.
+
+
+% --- Omar end ---
+
+\subsection{Objective Function: The Sparsity-Enforcing Hybrid}
+We avoid minimizing global energy (probability) of masks in for of a multi-objective ``Sparsity-Enforcing Hybrid`` loss that induces precise spatial routing. This total loss $\mathcal{L}_{total}$ is defined as:
+\begin{equation}
+    \mathcal{L}_{total} = \lambda_{cls} \mathcal{L}_{TopK} + \lambda_{seg} \mathcal{L}_{Tversky} + \lambda_{fire} \mathcal{L}_{Tax} \label{eq_hybridloss}
+\end{equation}
+
+\subsubsection{Tversky Segmentation}
+To penalize the ``Ghost Cloud`` phenomenon (High Recall, Low Precision), we employ an asymmetric Tversky loss \cite{Salehi2017} with $\alpha=0.7$ and $\beta=0.3$, strictly penalizing False Positives to sharpen the spatial output.
+
+\subsubsection{Top-K Classification}
+A naive approach to weakly-supervised classification would be to integrate the total energy within the output map to drive the Cross-Entropy loss. However, this creates a fundamental paradox with our Tversky segmentation objective:
+
+
+\begin{itemize}
+    \item The \textbf{Tversky Loss} (with $\alpha=0.7$) aggressively penalizes False Positives, encouraging the network to be metabolically efficient and produce sparse, low-energy high precision activations.
+    \item A \textbf{Total Energy Loss} would encourage the network to maximize activation across the target region, creating a dense, high-energy inaccurate (high recall) masks.
+\end{itemize}
+
+This conflict of producing less vs. more high-intensity pixels leads to unstable training dynamics. To resolve this, we divert the classification from global energy by focusing exclusively on high-confidence regions, a motivation for a \textbf{Top-K Classification} strategy. 
+
+To ignore background noise during classification, we compute the Cross-Entropy loss only on the top $K$ percent of active pixels in the output map (``Hotspots``), where $K$ is dynamically set to 5\% of the grid size. 
+
+Given the accumulated membrane potential map $U \in \mathbb{R}^{C \times H \times W}$, we identify the set of indices $\Omega_c$ corresponding to the top $K$ active pixels in each class channel $c$, where $K = \lfloor H \cdot W \cdot 0.05 \rfloor$. The aggregated class logit $z_c$ is computed as:
+\begin{equation}
+    z_c = \frac{1}{K} \sum_{(i,j) \in \Omega_c} U_{c,i,j}
+\end{equation}
+
+To ensure the aggregated logits has sufficient magnitude for the Softmax distribution and backpropagation, we introduce a learnable parameter $\gamma$ (initialized to $5.0$), constrained via a Softplus activation to remain positive. The final classification loss is:
+
+\begin{equation}
+    L_{cls} = \text{CrossEntropy}(\gamma \cdot \mathbf{z}, y_{target})
+\end{equation}
+
+By doing so, we ensure that even weak albeit precise spike clusters are scaled into a range suitable for stable classification and gradient flow.
+
+\subsubsection{Biologic Firing Tax}
+As Rentzeperis et al. \cite{Rentzeperis2023} demonstrated in the visual cortex (V1), biological systems operate under a strict regime closer to $\ell_{0}$ pseudo-norm sparsity (minimizing the count of active neurons) rather than simple $\ell_{1}$ minimization.
+
+Aligning with these findings, We impose a metabolic constraint on energy consumption, mimicking the spiking cost in biological brain \cite{Lennie2003}, via an $L_2$ regularization term on the mean firing rate $\bar{r}$:
+\begin{equation}
+    \mathcal{L}_{Tax} = (\bar{r} - \rho_{target})^2
+\end{equation}
+where $\rho_{target} = 0.02$. This forces the network to convey information using only 2\% of the spikes, aligning with the sparsity of the Ground Truth prototypes.
+
+
+\begin{figure}[t]
+  \centering
+  \input{figures/architecture}
+  \caption{Overall architecture of the proposed spiking EEG model.}
+  \label{fig:architecture}
+\end{figure}
+
+
+
+\subsection{Three-Phase Learning}
+
+
+
+To solve the non-convex objective function landscape and the gradient vanishing problem of this hybrid architecture, we employ a progressive training plan:
+\begin{itemize}
+    % will rewrite this based on ablation
+    \item \textbf{Phase 1 (The Deep Retina):} The ANN Encoder is pre-trained on the full video dataset using spatial supervision to establish robust feature extractors. Since this phase operates in the continuous analog domain prior to spiking transduction, the segmentation and metabolic constraints are deactivated ($\lambda_{seg} = \lambda_{fire} = 0, \lambda_{cls} = 1.0$):
+    \begin{equation}
+        \mathcal{L}_{Phase1} = \mathcal{L}_{TopK}
+    \end{equation}
+    The Phase 1 architecture is architecturally identical to the Baseline Analog U-Net's Encoder \ref{tab:architecture}.
+
+    
+    
+    \item \textbf{Phase 2 (Transplantation):} The Encoder is frozen. The SNN BottleNeck, Decoder, and Gated Skip Connections are attached and trained to adapt to the analog features.
+    
+    \item \textbf{Phase 3 (The Fine-Tuning):} The interface is fully unfrozen. We employ Differential learning rates ($\eta_{ANN} \ll \eta_{SNN}$ to align the analog and spiking domains without catastrophic forgetting caused by toxic surrogate gradients.
+\end{itemize}
+
+
+
+\subsection{Hybrid Initialization Protocols}
+Standard initialization methods (e.g., Xavier, Kaiming) assume linear or rectified-linear activations. They fail to account for the gating dynamics of hybrid ANN-SNN interfaces, often leading to ``Dead Neuron'' problem at first epoch \cite{Micheli2025}.
+
+\subsubsection{Baseline Initialization Strategy}
+Prior to any training phase, we apply a standardized initialization protocol across the entire architecture to ensure consistent variance scaling.
+
+\begin{itemize}
+    \item \textbf{Convolutional Kernels:} Weights are initialized using the Kaiming (He) Normal strategy \cite{He2015}:
+    \begin{equation}
+        W \sim \mathcal{N}\left(0, \sqrt{\frac{2}{n_{in}}}\right)
+    \end{equation}
+    where $n_{in}$ is the number of input units. We utilize the 'fan-in' mode with a rectified-linear nonlinearity slope proxy ($a=0$) to match the initial linear regime of the LIF/ALIF surrogate gradients. Convolutional weights of Recurrent ALIF and TViT, however, and all biases are initialized to zero.
+    
+    \item \textbf{Normalization Layers:} Instance Normalization (Encoder), Layer Normalization (ViT), and Batch Normalization 3D (Decoder) affine parameters are initialized to the identity mapping ($\gamma=1, \beta=0$).
+\end{itemize}
+
+\subsubsection{The ``Open Gate'' Bias}
+The \textit{GatedSkip} blocks in our decoder utilize a sigmoid gating mechanism: $g = \sigma(W x + b)$. Standard initialization sets $b = 0$, resulting in $\sigma(0) = 0.5$. This dampens the signal magnitude by 50\% at every skip connection, effectively blurring the high-frequency spatial details required for the segmentation task.
+
+Following aforementioned baseline, we strictly enforce an initialization of $b=+2.0$ for all gating convolutions after global weight initialization step to  prevent signal starvation.
+
+\begin{equation}
+    \sigma(0 \cdot x + 2.0) \approx 0.88
+\end{equation}
+
+This ensures the gates start in a nearly ``transparent`` or open state ($g \approx 1$), allowing fragile surrogate gradient pass freely from the Spiking Decoder back to the Analog Encoder during training phases. The network then learns to selectively tune gates to suppress noise via backpropagation.
+\section{Results}
+
+\subsection{Subject Selection}
+To decouple architectural efficacy from biological variance (inter-subject distributional shifts), we first conducted a \textbf{Biological Compatibility Audit} (Fig. \ref{fig:bio_matrix}). We computed the Pearson correlation coefficient between the class-averaged topological maps of all subjects, estimated via randomized subsampling ($N=500$) with a fixed seed.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\columnwidth]{bio_compatibility.png}
+    \caption{\textbf{Biological Compatibility Matrix.} Pearson correlation of spatial topology. \textbf{Subject 3} (Rank 1, $\rho=0.95$) represents the topological median and was selected for ablation. The high global correlation ($\mu > 0.9$) confirms that Instance Normalization effectively aligns spatial statistics, rendering spatial domain adaptation redundant.}
+    \label{fig:bio_matrix}
+\end{figure}
+
+
+This analysis yielded two critical insights for the experimental design:
+\begin{enumerate}
+    \item \textbf{Subject Selection:} \textbf{Subject 3} exhibited the highest mean correlation ($\rho=0.948$) with the population, identifying it as the "Universal Donor" (Topological Median). Consequently, all architectural ablation experiments (Table \ref{tab:ablation_arch}) were conducted using Subject 3 as the validation target to ensure metric stability.
+    
+    \item \textbf{The Redundancy of Spatial Adaptation:} The high inter-subject spatial correlation ($\rho > 0.93$ for 14/16 subjects) indicates that Instance Normalization successfully resolves static domain shifts. This finding supports our decision to exclude adversarial and contrastive spatial objectives from the final architecture, as the residual error is driven by \textit{temporal} rather than \textit{spatial} mismatch.
+\end{enumerate}
+
+\subsection{Upper Bound Analysis (Subject-Dependent)}
+To establish the theoretical performance ceiling of the architecture, we conducted a Subject-Dependent training run (training and testing on non-overlapping splits of the same subject). SWEEP-Net achieved an accuracy of 76.9\% within 8 epochs. This confirms that the Deep Retina is capable of extracting high-fidelity emotional features when the inter-subject domain shift is removed.
+
+
+\subsection{Impact of Spatial Pooling on Temporal Context}
+
+\begin{table}[htbp]
+    \caption{\textbf{Architectural Ablation (Subj 3)}}
+    \label{tab:ablation_arch}
+    \centering
+    \begin{tabular}{lccc}
+        \toprule
+        \textbf{Architecture} & \textbf{Accuracy} & \textbf{Conclusion} \\
+        \midrule
+        \textit{Subject-Dependent} & - & 76.9\% & - \\
+        \midrule
+        \textbf{ResNet + IN + GC} & 43.07\% &  \\ 
+        + Bidirectional TSM & 39.64\% & Negative Result: TSM increased representational power \\ 
+        \bottomrule
+    \end{tabular}
+    \vspace{2mm}
+\end{table}
+
+Table \ref{tab:ablation_arch} demonstrates that introducing Early Fusion (TSM) dramatically accelerates convergence. The TSM variant reached optimal training loss ($\mathcal{L} < 0.9$) in just 10 epochs, compared to 25+ epochs for the Late Fusion variant. However, this increased representational power led to manifold overfitting on the limited subset, widening the generalization gap. This confirms that TSM effectively captures temporal dynamics but necessitates the regularization provided by the full dataset.
+
+\section{Discussion}
+
+
+
+
+
+\section{Future Work}
+
+\section{Conclusion}
+
+
+
+
+
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}

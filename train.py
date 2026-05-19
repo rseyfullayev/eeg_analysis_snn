@@ -693,15 +693,21 @@ def training_loop(phase,
                     else:
                         mapped_subjs = subject_labels.long()
 
-                    # EMA update of per-subject centroids (no gradients)
+                    # EMA update of per-subject centroids using ONLY Neutral (DMN) windows.
+                    # Neutral = emotion_id 3. This ensures the centroid captures the
+                    # stationary IAF/resting-state signature, not emotion-evoked transients.
+                    neutral_mask = (targets_c.squeeze() == 3)  # [B] boolean
                     with torch.no_grad():
-                        for subj_idx in torch.unique(mapped_subjs):
-                            mask = (mapped_subjs == subj_idx)
-                            subj_mean = backbone_feats[mask].mean(dim=0)
-                            subject_centroids[subj_idx] = (
-                                (1 - ortho_ema_momentum) * subject_centroids[subj_idx]
-                                + ortho_ema_momentum * subj_mean
-                            )
+                        if neutral_mask.any():
+                            neutral_feats = backbone_feats[neutral_mask]
+                            neutral_subjs = mapped_subjs[neutral_mask]
+                            for subj_idx in torch.unique(neutral_subjs):
+                                smask = (neutral_subjs == subj_idx)
+                                subj_mean = neutral_feats[smask].mean(dim=0)
+                                subject_centroids[subj_idx] = (
+                                    (1 - ortho_ema_momentum) * subject_centroids[subj_idx]
+                                    + ortho_ema_momentum * subj_mean
+                                )
 
                     # Orthogonal penalty: squared cosine similarity → 0 = orthogonal
                     batch_centroids = subject_centroids[mapped_subjs].detach()
