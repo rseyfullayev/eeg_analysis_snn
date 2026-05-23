@@ -182,6 +182,12 @@ def run_data_setup(config=None):
             actual_samples = min(T_len, anticipation_samples)
             if actual_samples > 0:
                 anticipation = feats[..., :actual_samples].mean(dim=-1, keepdim=True)  # [1, C, Bands, 1]
+                
+                # Save C_local separately for this subject and bag_id
+                c_local_fname = f"C_local_{subject_id}_{bag_id}.pt"
+                c_local_path = os.path.join(OUTPUT_FOLDER, c_local_fname)
+                torch.save(anticipation.squeeze(0).squeeze(-1).cpu(), c_local_path)
+                
                 feats = feats - anticipation
 
             # --- ROBUST SCALING & CLAMPING ---
@@ -237,15 +243,19 @@ def run_data_setup(config=None):
                     
                     torch.save(video_batch[k].clone(), save_path)
                     
+                    # Calculate if this window starts after the baseline period
+                    window_start_idx = (i + k) * STEP_SIZE
+                    is_trainable = window_start_idx >= anticipation_samples
+                    
                     # bag_id -> Acts as our Bag ID (The unique Movie Clip)
-                    registry.append(f"{fname},{bag_id},{emotion_id}")
+                    registry.append(f"{fname},{bag_id},{emotion_id},{is_trainable}")
                     sample_global_id += 1
                 
             torch.cuda.empty_cache()
 
     with open(os.path.join(OUTPUT_FOLDER, "index.csv"), 'w') as f:
 
-        f.write("filename,bag_id,emotion_id\n")
+        f.write("filename,bag_id,emotion_id,is_trainable\n")
         for line in registry:
             f.write(f"{line}\n")
             

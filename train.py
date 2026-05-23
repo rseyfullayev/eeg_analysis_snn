@@ -531,10 +531,11 @@ def training_loop(phase,
                 import sys
                 sys.exit(0)
                 
-            # Unpack batch dynamically based on length to handle is_baseline if provided
+            # Unpack batch dynamically based on length to handle is_baseline or baseline_windows if provided
             is_baseline = None
+            baseline_windows = None
             if len(batch) == 9:
-                inp1, inp2, targets, targets_c, subject_labels, _, video_ids, timestamps, is_baseline = batch
+                inp1, inp2, targets, targets_c, subject_labels, _, video_ids, timestamps, baseline_info = batch
                 video_ids = video_ids.to(device)
                 timestamps = timestamps.to(device)
                 if phase in [1, '1a', '1b']:
@@ -545,6 +546,13 @@ def training_loop(phase,
                         k_inputs = inp2
                     else:
                         inputs = torch.cat([inp1, inp2], dim=0)
+                
+                # Check if baseline_info is boolean mask or actual baseline windows tensor
+                if isinstance(baseline_info, torch.Tensor):
+                    if baseline_info.dtype == torch.bool:
+                        is_baseline = baseline_info
+                    else:
+                        baseline_windows = baseline_info
             elif len(batch) == 8:
                 inp1, inp2, targets, targets_c, subject_labels, _, video_ids, timestamps = batch
                 video_ids = video_ids.to(device)
@@ -694,8 +702,40 @@ def training_loop(phase,
                     progress = min(1.0, float(current_step) / total_steps)
                     curr_lambda = actual_lambda_min + (actual_lambda_max - actual_lambda_min) * (progress ** 2)
 
-                    if is_baseline is not None:
-                        # Ensure is_baseline is a boolean tensor on the correct device
+                    if baseline_windows is not None:
+                        # Non-bagging (Phase 1A) dynamic baseline updates
+                        baseline_windows = baseline_windows.to(device)
+                        baseline_windows_snn = baseline_windows.permute(1, 0, 2, 3, 4) # [T, B, C, H, W]
+                        
+                        with torch.no_grad():
+                            h_base = model.extract_features(baseline_windows_snn, K=None)
+                            h_base = F.normalize(h_base, dim=1, eps=1e-6)
+
+                        if subj_remapper is not None:
+                            mapped_subjs = torch.tensor(
+                                [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels],
+                                device=device, dtype=torch.long)
+                        else:
+                            mapped_subjs = subject_labels.long()
+
+                        # --- 1. UPDATE THE EMA NULL-SPACE (Using h_base) ---
+                        for subj_idx in torch.unique(mapped_subjs):
+                            smask = (mapped_subjs == subj_idx)
+                            if smask.any():
+                                subj_base_mean = h_base[smask].mean(dim=0)
+                                subject_centroids[subj_idx] = (
+                                    (1 - ortho_ema_momentum) * subject_centroids[subj_idx]
+                                    + ortho_ema_momentum * subj_base_mean
+                                )
+                        
+                        # --- 2. CALCULATE NULL-SPACE ORTHOGONAL PENALTY (Using active features: backbone_feats) ---
+                        batch_centroids = subject_centroids[mapped_subjs].detach()
+                        ortho_penalty = torch.mean(
+                            F.cosine_similarity(backbone_feats, batch_centroids, dim=-1, eps=1e-8) ** 2
+                        )
+
+                    elif is_baseline is not None:
+                        # Original bagging-based baseline updates (Phase 1B)
                         is_baseline = is_baseline.to(device).bool()
                         
                         # Extract window-level features h: [B * K_bag, D]

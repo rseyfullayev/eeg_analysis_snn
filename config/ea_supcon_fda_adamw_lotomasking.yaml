@@ -22,6 +22,7 @@ training:
   supmoco_queue_size: 512
   use_muon: false
   use_fourier_mixup: true
+  filter_baseline_windows: false
   fourier_mixup:
     retention_ratio: 0.95       # % variance to retain (try 0.90–0.98)
     p: 0.5                     # blend probability
