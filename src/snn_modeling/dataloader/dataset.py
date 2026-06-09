@@ -5,7 +5,7 @@ import numpy as np
 from torch.utils.data import Dataset
 import torch.nn as nn
 import pandas as pd     
-from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from torch.utils.data.sampler import Sampler
 import random
 import collections
@@ -167,8 +167,9 @@ class SWEEPDataset(Dataset):
 
             df = df[df['filename'].str.split('_').str[0] == str(subj)]
 
-            splitter = GroupShuffleSplit(n_splits=1, test_size=1.0 - self.train_size, random_state=42)
-            train_idx, val_idx = next(splitter.split(df, groups=df['bag_id']))
+            n_splits = int(1.0 / (1.0 - self.train_size + 1e-6))
+            splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            train_idx, val_idx = next(splitter.split(df, y=df['emotion_id'], groups=df['bag_id']))
 
             df_train = df.iloc[train_idx]
             df_val = df.iloc[val_idx]
