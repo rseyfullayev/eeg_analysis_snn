@@ -4,7 +4,6 @@ import os
 import pandas as pd
 from tqdm import tqdm
 from collections import defaultdict
-import copy
 from data_process.data_loader import DatasetReader
 from data_process.wavelet import WaveletModule
 from src.snn_modeling.dataloader.dataset import TopoMapper
@@ -12,11 +11,10 @@ import json
 import torch.nn.functional as F
 
 SELECTED_EMOTIONS = [0, 1, 2, 3, 4] 
-NEUTRAL_EMOTION_ID = 3  # Index mapping: 0=Disgust, 1=Fear, 2=Sad, 3=Neutral, 4=Happy
 
 def compute_alignment_matrix(covs_list, device):
     """
-    Computes the EA alignment matrix R^{-1/2} and R^{1/2} from a list of trial covariances.
+    Computes the EA alignment matrix R^{-1/2} from a list of trial covariances.
     """
     mean_cov = torch.stack(covs_list).mean(dim=0)
     C = mean_cov.shape[0]
@@ -24,15 +22,12 @@ def compute_alignment_matrix(covs_list, device):
     # Add small epsilon for numerical stability
     mean_cov = mean_cov + torch.eye(C, device=device) * 1e-4
     
-    # Compute R^{-1/2} and R^{1/2} using Eigen Decomposition
+    # Compute R^{-1/2} using Eigen Decomposition
     L, Q = torch.linalg.eigh(mean_cov)
     L_inv_sqrt = torch.diag(1.0 / torch.sqrt(L.clamp(min=1e-6)))
     R_inv_sqrt = torch.matmul(torch.matmul(Q, L_inv_sqrt), Q.t())
     
-    L_sqrt = torch.diag(torch.sqrt(L.clamp(min=1e-6)))
-    R_sqrt = torch.matmul(torch.matmul(Q, L_sqrt), Q.t())
-    
-    return R_inv_sqrt, R_sqrt
+    return R_inv_sqrt
 
 def apply_alignment(x, R_inv_sqrt):
     """
@@ -131,21 +126,9 @@ def run_data_setup(config=None):
 
     print("Phase 1 Complete: Resolving Alignment Matrices...")
     subject_alignment_matrices = {}
-    subject_r_sqrt_matrices = {}
     for subj, covs in subject_covs.items():
-        r_inv, r_sqrt = compute_alignment_matrix(covs, device)
-        subject_alignment_matrices[subj] = r_inv
-        subject_r_sqrt_matrices[subj] = r_sqrt
+        subject_alignment_matrices[subj] = compute_alignment_matrix(covs, device)
         
-    torch.save({
-        'R_inv_sqrt': subject_alignment_matrices,
-        'R_sqrt': subject_r_sqrt_matrices
-    }, os.path.join(OUTPUT_FOLDER, "R_matrices.pt"))
-    print(f"Saved R matrices to {os.path.join(OUTPUT_FOLDER, 'R_matrices.pt')}")
-
-    # --- ERD Phase 1.5: Local ERD enabled (Phase 1.5 global neutral scan bypassed) ---
-    print("Phase 1.5: Bypassing global neutral scan. Using trial-specific local ERD baseline subtraction in Phase 2.")
-
     # --- STATISTICS COLLECTOR ---
 
     registry = []
@@ -155,7 +138,8 @@ def run_data_setup(config=None):
     total_collected = 0
     GPU_BATCH_SIZE = 16 
     
-    print("Phase 2: Generating Dataset (with local ERD subtraction)...")    
+    print("Phase 2: Generating Dataset...")
+    
     for raw_eeg, emotion_id, orig_filename in tqdm(dataset_reader.iterate_file_based(), total=len(dataset_reader)): 
         bag_id += 1
         subject_id, session_id = parse_metadata(orig_filename)
@@ -174,23 +158,6 @@ def run_data_setup(config=None):
             
             feats = wavelet(raw_eeg)
             feats = torch.log1p(feats)
-
-            # --- LOCAL ERD: Subtract trial-specific anticipation baseline ---
-            anticipation_duration = config.data.get('anticipation_duration', 5.0)
-            anticipation_samples = int(anticipation_duration * SAMPLING_RATE)
-            T_len = feats.shape[-1]
-            actual_samples = min(T_len, anticipation_samples)
-            if actual_samples > 0:
-                anticipation = feats[..., :actual_samples].mean(dim=-1, keepdim=True)  # [1, C, Bands, 1]
-                
-                # Save C_local separately for this subject and bag_id
-                c_local_fname = f"C_local_{subject_id}_{bag_id}.pt"
-                c_local_path = os.path.join(OUTPUT_FOLDER, c_local_fname)
-                torch.save(anticipation.squeeze(0).squeeze(-1).cpu(), c_local_path)
-                
-                feats = feats - anticipation
-
-            # --- ROBUST SCALING & CLAMPING ---
             median = feats.median(dim=-1, keepdim=True).values
             q1 = torch.quantile(feats, 0.25, dim=-1, keepdim=True)
             q3 = torch.quantile(feats, 0.75, dim=-1, keepdim=True)
@@ -229,9 +196,6 @@ def run_data_setup(config=None):
             batch_tensor = full_batch_tensor[i : i + GPU_BATCH_SIZE]
             
             with torch.no_grad():
-
-    
-
                 # Topo & Save
                 video_batch = topo(batch_tensor)
                 video_batch = video_batch.cpu()
@@ -243,19 +207,15 @@ def run_data_setup(config=None):
                     
                     torch.save(video_batch[k].clone(), save_path)
                     
-                    # Calculate if this window starts after the baseline period
-                    window_start_idx = (i + k) * STEP_SIZE
-                    is_trainable = window_start_idx >= anticipation_samples
-                    
                     # bag_id -> Acts as our Bag ID (The unique Movie Clip)
-                    registry.append(f"{fname},{bag_id},{emotion_id},{is_trainable}")
+                    registry.append(f"{fname},{bag_id},{emotion_id}")
                     sample_global_id += 1
                 
             torch.cuda.empty_cache()
 
     with open(os.path.join(OUTPUT_FOLDER, "index.csv"), 'w') as f:
 
-        f.write("filename,bag_id,emotion_id,is_trainable\n")
+        f.write("filename,bag_id,emotion_id\n")
         for line in registry:
             f.write(f"{line}\n")
             

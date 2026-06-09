@@ -163,19 +163,6 @@ class SWEEPDataset(Dataset):
         print(f"Loading index from {index_file}...")
         df = pd.read_csv(index_file)
 
-        # Collect baseline files per bag_id for sampling baseline windows
-        self.bag_to_baseline_files = {}
-        if 'is_trainable' in df.columns:
-            is_trainable_bool = df['is_trainable'].astype(str) == 'True'
-            for bid, grp in df.groupby('bag_id'):
-                grp_bool = grp['is_trainable'].astype(str) == 'True'
-                self.bag_to_baseline_files[bid] = grp[~grp_bool]['filename'].tolist()
-        else:
-            # Fallback if is_trainable is missing: assume first 5s (approx first 8 windows) are baseline
-            for bid, grp in df.groupby('bag_id'):
-                sorted_files = sorted(grp['filename'].tolist(), key=self._parse_timestamp)
-                self.bag_to_baseline_files[bid] = sorted_files[:8]
-
         if subj is not None:
 
             df = df[df['filename'].str.split('_').str[0] == str(subj)]
@@ -190,26 +177,6 @@ class SWEEPDataset(Dataset):
             df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
             df_val = df[df['filename'].str.split('_').str[0] == str(loso)]
     
-        self.bagging = config.training.get('bagging', True) if hasattr(config, 'training') else True
-        self.filter_baseline = config.training.get('filter_baseline_windows', False) if hasattr(config, 'training') else False
-
-        # For Phase 1A single-window mode, we block baseline windows from active trainable samples
-        if not self.bagging and self.filter_baseline:
-            if 'is_trainable' in df.columns:
-                df_train = df_train[df_train['is_trainable'].astype(str) == 'True']
-                df_val = df_val[df_val['is_trainable'].astype(str) == 'True']
-            else:
-                train_trainable = []
-                for bid, grp in df_train.groupby('bag_id'):
-                    sorted_files = sorted(grp['filename'].tolist(), key=self._parse_timestamp)
-                    train_trainable.extend(sorted_files[8:])
-                df_train = df_train[df_train['filename'].isin(train_trainable)]
-                
-                val_trainable = []
-                for bid, grp in df_val.groupby('bag_id'):
-                    sorted_files = sorted(grp['filename'].tolist(), key=self._parse_timestamp)
-                    val_trainable.extend(sorted_files[8:])
-                df_val = df_val[df_val['filename'].isin(val_trainable)]
 
         if split == 'train':
             print(f"Selecting TRAINING set ({len(df_train)} windows)")
@@ -219,14 +186,11 @@ class SWEEPDataset(Dataset):
             df_slice = df_val 
         else:
             raise ValueError(f"Unknown split '{split}'. Use 'train' or 'val'.")
+        
         # --- BAG LEVEL RESTRUCTURING ---
         self.bag_size_limit = config.data.get('mil_bag_size', 60) # Max windows per bag
+        self.bagging = config.training.get('bagging', True) if hasattr(config, 'training') else True
         self.samples = []
-
-        # Precompute the sorted list of files per bag_id for single-window lookup
-        self.bag_to_files = {}
-        for bid, grp in df.groupby('bag_id'):
-            self.bag_to_files[bid] = sorted(grp['filename'].tolist(), key=self._parse_timestamp)
 
         if self.bagging:
             # Group by 'bag_id' (each trial clip is one bag)
@@ -234,7 +198,8 @@ class SWEEPDataset(Dataset):
             for bag_id, group_df in grouped:
                 emotion_idx = group_df['emotion_id'].iloc[0]
                 # Maintain chronological order of files (s0, s1, s2, ...)
-                files = sorted(group_df['filename'].tolist(), key=self._parse_timestamp)
+                # Ensure proper string/int casting for consistent sorting if needed, but for now we expect the filenames to be chronological or we can just list them
+                files = group_df['filename'].tolist()
                 try:
                     subject_idx = int(str(files[0]).split('_')[0])
                 except Exception:
@@ -278,19 +243,6 @@ class SWEEPDataset(Dataset):
                         self.cache[fname] = video
                     except Exception as e:
                         print(f"Error loading {fname}: {e}")
-            
-            # Also preload all baseline files if bagging is False and baseline filtering is active
-            if not self.bagging and self.filter_baseline:
-                for bid, bfiles in self.bag_to_baseline_files.items():
-                    for fname in bfiles:
-                        if fname in self.cache: continue
-                        file_path = os.path.join(self.samples_dir, fname)
-                        try:
-                            video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-                            video.share_memory_()
-                            self.cache[fname] = video
-                        except Exception as e:
-                            print(f"Error loading baseline {fname}: {e}")
             print("Cache complete!")
 
 
@@ -300,7 +252,7 @@ class SWEEPDataset(Dataset):
             self.prototypes = prototypes
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
-
+    
     @staticmethod
     def _parse_timestamp(filename):
         """Extract sample_global_id from filename format: {subject}_{bag}_s{id}.pt"""
@@ -339,42 +291,17 @@ class SWEEPDataset(Dataset):
         # We divide the trial into 'bag_size_limit' equal temporal bins,
         # and randomly select exactly ONE window from each bin.
         # This guarantees we sample from the beginning, middle, and end of the movie.
-        is_baseline_list = []
-        step_size = self.config.data.get('step_size', 128)
-        sampling_rate = self.config.data.get('sampling_rate', 256)
-        anticipation_duration = self.config.data.get('anticipation_duration', 5.0)
-
-        if self.bagging:
-            if len(files) > self.bag_size_limit:
-                bin_size = len(files) / self.bag_size_limit
-                selected_files = []
-                for i in range(self.bag_size_limit):
-                    start_idx = int(i * bin_size)
-                    end_idx = int((i + 1) * bin_size)
-                    # Randomly pick ONE window from inside this bin
-                    chosen_idx = random.randint(start_idx, max(start_idx, end_idx - 1))
-                    selected_files.append(files[chosen_idx])
-                    
-                    is_base = (chosen_idx * step_size) < (anticipation_duration * sampling_rate)
-                    is_baseline_list.append(is_base)
-            else:
-                selected_files = files
-                for chosen_idx in range(len(selected_files)):
-                    is_base = (chosen_idx * step_size) < (anticipation_duration * sampling_rate)
-                    is_baseline_list.append(is_base)
+        if self.bagging and len(files) > self.bag_size_limit:
+            bin_size = len(files) / self.bag_size_limit
+            selected_files = []
+            for i in range(self.bag_size_limit):
+                start_idx = int(i * bin_size)
+                end_idx = int((i + 1) * bin_size)
+                # Randomly pick ONE window from inside this bin
+                chosen_idx = random.randint(start_idx, max(start_idx, end_idx - 1))
+                selected_files.append(files[chosen_idx])
         else:
             selected_files = files
-            fname = files[0]
-            if bag_id in self.bag_to_files:
-                parent_files = self.bag_to_files[bag_id]
-                if fname in parent_files:
-                    chosen_idx = parent_files.index(fname)
-                else:
-                    chosen_idx = 0
-            else:
-                chosen_idx = 0
-            is_base = (chosen_idx * step_size) < (anticipation_duration * sampling_rate)
-            is_baseline_list.append(is_base)
         
         loaded_tensors = []
         for fname in selected_files:
@@ -400,31 +327,10 @@ class SWEEPDataset(Dataset):
             pad_shape[0] = pad_size
             padding = torch.zeros(pad_shape, dtype=bag_video.dtype, device=bag_video.device)
             bag_video = torch.cat([bag_video, padding], dim=0)
-            is_baseline_list.extend([False] * pad_size)
             
         elif not self.bagging:
             # If bagging is turned off, drop the K dimension
             bag_video = bag_video.squeeze(0)
-
-        # Load baseline window for Phase 1A Nullspace updates if not bagging and filtering is active
-        video_base = None
-        if not self.bagging and getattr(self, 'filter_baseline', False):
-            base_files = getattr(self, 'bag_to_baseline_files', {}).get(bag_id, [])
-            if base_files:
-                fname_base = random.choice(base_files)
-                if self.preload and fname_base in self.cache:
-                    video_base = self.cache[fname_base]
-                else:
-                    file_path_base = os.path.join(self.samples_dir, fname_base)
-                    try:
-                        video_base = torch.load(file_path_base, weights_only=True, map_location='cpu').float()
-                    except Exception as e:
-                        print(f"Error loading baseline window {fname_base}: {e}")
-                        video_base = torch.zeros_like(bag_video)
-            else:
-                video_base = torch.zeros_like(bag_video)
-
-        is_baseline_tensor = torch.tensor(is_baseline_list, dtype=torch.bool)
 
         # We keep the single prototype map for the whole bag
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
@@ -436,11 +342,9 @@ class SWEEPDataset(Dataset):
             # Note: you may need to apply augmentations over the batch dimension K safely
             video1 = self.augmentations(bag_video)
             video2 = self.augmentations(bag_video)
-            if not self.bagging and getattr(self, 'filter_baseline', False) and video_base is not None:
-                return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data, video_base
-            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data, is_baseline_tensor
+            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data
 
-        return bag_video, target_map, label_idx, bag_id, video_id, timestamp_data, is_baseline_tensor
+        return bag_video, target_map, label_idx, bag_id, video_id, timestamp_data
 
 class PKSampler(Sampler):
     def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None, subject_diverse_k=True):

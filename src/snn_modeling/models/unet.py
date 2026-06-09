@@ -83,6 +83,8 @@ class SpikingMobileNetProjector(nn.Module):
                 SwiGLU(feature_dim, p_drop=0.2),
                 nn.Linear(feature_dim, 1, bias=False)
             )
+            self.vib_mu = nn.Linear(feature_dim, feature_dim)
+            self.vib_logvar = nn.Linear(feature_dim, feature_dim)
 
         if self.use_dann:
             self.dann_head = nn.Sequential(
@@ -98,10 +100,11 @@ class SpikingMobileNetProjector(nn.Module):
         use_batchnorm = use_batchnorm or has_bn
 
         self.classifier = ProjectionHead(feature_dim, 128, use_batchnorm=use_batchnorm)
+        self.cls_head = nn.Linear(128, num_classes)
         
         
 
-    def extract_features(self, x, K=None):
+    def extract_features(self, x, K=None, return_vib=False):
         """Extract backbone features (before projection head).
         
         Returns (B, feature_dim) tensor suitable for linear evaluation.
@@ -112,6 +115,8 @@ class SpikingMobileNetProjector(nn.Module):
             out = features.mean(dim=[0, 3, 4])  # mean over T, H, W
         else:
             out = features.mean(dim=[-2, -1])   # mean over H, W if already collapsed
+
+        mu, logvar = None, None
 
         # === HYBRID MIL: Pre-Normalized RTFM Gating (or SwiGLU) ===
         if K is not None and K > 1:
@@ -127,7 +132,23 @@ class SpikingMobileNetProjector(nn.Module):
                 # 2. Normalize via Softmax across the K windows
                 attn_weights = torch.softmax(attn_scores, dim=1)
                 # 3. Aggregate windows via weighted sum
-                out = torch.sum(out * attn_weights, dim=1)
+                h_agg = torch.sum(out * attn_weights, dim=1)
+                
+                # Variational Info Bottleneck (VIB)
+                mu = self.vib_mu(h_agg)
+                logvar = self.vib_logvar(h_agg)
+                std = torch.exp(0.5 * logvar)
+                eps = torch.randn_like(std)
+                z = mu + eps * std if self.training else mu # look into this (sampling may be requried)
+
+                # Inverse attention baseline
+                inv_weights = (1.0 - attn_weights)
+                inv_weights = inv_weights / (inv_weights.sum(dim=1, keepdim=True) + 1e-8)
+                h_base = torch.sum(out * inv_weights, dim=1)
+
+                # Gram-Schmidt Orthogonalization
+                proj = (torch.sum(z * h_base, dim=1, keepdim=True) / (torch.sum(h_base * h_base, dim=1, keepdim=True) + 1e-8)) * h_base
+                out = z - proj
             else:
                 # --- Pre-Normalized RTFM Sieve ---
                 # 1. Calculate unnormalized L2 magnitude of embeddings
@@ -140,14 +161,20 @@ class SpikingMobileNetProjector(nn.Module):
                 gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, out.size(-1))
                 master_vectors = torch.gather(out, dim=1, index=gather_indices) # [B, min(5, K), C_dim]
                     
-                out = torch.stack(master_vectors, dim=0) # [B, C_dim]
+                out = torch.stack(master_vectors, dim=0).mean(dim=1) # [B, C_dim]
         # ============================
 
+        if return_vib:
+            return out, mu, logvar
         return out
 
-    def forward(self, x, K=None):
+    def forward(self, x, K=None, return_vib=False):
+        if return_vib:
+            out, mu, logvar = self.extract_features(x, K=K, return_vib=True)
+            out = self.classifier(out)
+            logits = self.cls_head(out)
+            return logits, mu, logvar
+            
         out = self.extract_features(x, K=K)
-        # The backbone features are passed to the Projection Head
-        # which will apply F.normalize prior to SupCon!
         out = self.classifier(out)
         return out

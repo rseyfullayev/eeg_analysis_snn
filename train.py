@@ -465,14 +465,7 @@ def training_loop(phase,
                   probe_interval=5,
                   use_mmd=False,
                   lambda_mmd=0.0,
-                  live_tracker=None,
-                  use_ortho=False,
-                  lambda_ortho=0.1,
-                  ortho_ema_momentum=0.1,
-                  num_subjects_ortho=15,
-                  feature_dim_ortho=256,
-                  lambda_min=None,
-                  lambda_max=None):
+                  live_tracker=None):
     
     # Phase 1A trackers
     best_train_loss = float('inf') if phase == '1a' else None
@@ -483,17 +476,7 @@ def training_loop(phase,
         live_tracker = LiveTracker()  # disabled fallback (no credentials)
     nan_monitor = NaNMonitor(model, verbose=True, max_reports_per_epoch=5, live_tracker=live_tracker)
 
-    # --- Latent Orthogonal Projection: Subject centroid EMA tracker ---
-    # Maintains a running centroid per subject in backbone feature space.
-    # The ortho penalty forces features to point 90° away from their subject's
-    # identity vector, destroying biometric leakage without an adversarial head.
     subject_centroids = None
-    if use_ortho:
-        actual_lambda_min = lambda_min if lambda_min is not None else 0.0
-        actual_lambda_max = lambda_max if lambda_max is not None else lambda_ortho
-        subject_centroids = torch.zeros(num_subjects_ortho, feature_dim_ortho, device=device)
-        print(f"[OrthoLOP] Initialized subject centroids: {num_subjects_ortho} subjects × {feature_dim_ortho}D, "
-              f"λ_min={actual_lambda_min}, λ_max={actual_lambda_max}, EMA={ortho_ema_momentum}")
 
     device_info = str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "CPU"
     live_tracker.training_started(phase, epochs, device_info=device_info)
@@ -694,136 +677,7 @@ def training_loop(phase,
                     
                     loss = loss + (annealed_lambda_mmd * loss_mmd)
 
-                # --- Latent Orthogonal Projection (Identity Erasure) ---
-                if use_ortho and subject_centroids is not None and torch.isfinite(backbone_feats).all():
-                    # Compute Shepard warmup schedule
-                    total_steps = epochs * len(train_loader)
-                    current_step = epoch * len(train_loader) + batch_idx
-                    progress = min(1.0, float(current_step) / total_steps)
-                    curr_lambda = actual_lambda_min + (actual_lambda_max - actual_lambda_min) * (progress ** 2)
 
-                    if baseline_windows is not None:
-                        # Non-bagging (Phase 1A) dynamic baseline updates
-                        baseline_windows = baseline_windows.to(device)
-                        baseline_windows_snn = baseline_windows.permute(1, 0, 2, 3, 4) # [T, B, C, H, W]
-                        
-                        with torch.no_grad():
-                            h_base = model.extract_features(baseline_windows_snn, K=None)
-                            h_base = F.normalize(h_base, dim=1, eps=1e-6)
-
-                        if subj_remapper is not None:
-                            mapped_subjs = torch.tensor(
-                                [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels],
-                                device=device, dtype=torch.long)
-                        else:
-                            mapped_subjs = subject_labels.long()
-
-                        # --- 1. UPDATE THE EMA NULL-SPACE (Using h_base) ---
-                        for subj_idx in torch.unique(mapped_subjs):
-                            smask = (mapped_subjs == subj_idx)
-                            if smask.any():
-                                subj_base_mean = h_base[smask].mean(dim=0)
-                                subject_centroids[subj_idx] = (
-                                    (1 - ortho_ema_momentum) * subject_centroids[subj_idx]
-                                    + ortho_ema_momentum * subj_base_mean
-                                )
-                        
-                        # --- 2. CALCULATE NULL-SPACE ORTHOGONAL PENALTY (Using active features: backbone_feats) ---
-                        batch_centroids = subject_centroids[mapped_subjs].detach()
-                        ortho_penalty = torch.mean(
-                            F.cosine_similarity(backbone_feats, batch_centroids, dim=-1, eps=1e-8) ** 2
-                        )
-
-                    elif is_baseline is not None:
-                        # Original bagging-based baseline updates (Phase 1B)
-                        is_baseline = is_baseline.to(device).bool()
-                        
-                        # Extract window-level features h: [B * K_bag, D]
-                        if use_supmoco:
-                            h = model.extract_features(q_inputs, K=None)
-                        else:
-                            h = model.extract_features(inputs, K=None)
-
-                        if is_baseline.dim() == 2:
-                            B_dim, K_bag_dim = is_baseline.shape
-                            is_baseline_flat = is_baseline.flatten() # [B * K_bag]
-                            
-                            if subj_remapper is not None:
-                                mapped_subjs = torch.tensor(
-                                    [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels],
-                                    device=device, dtype=torch.long)
-                            else:
-                                mapped_subjs = subject_labels.long()
-                            
-                            mapped_subjs_flat = mapped_subjs.unsqueeze(1).expand(-1, K_bag_dim).flatten() # [B * K_bag]
-                        else:
-                            is_baseline_flat = is_baseline # [B]
-                            if subj_remapper is not None:
-                                mapped_subjs_flat = torch.tensor(
-                                    [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels],
-                                    device=device, dtype=torch.long)
-                            else:
-                                mapped_subjs_flat = subject_labels.long()
-
-                        h_base_mask = is_baseline_flat
-                        h_active_mask = ~is_baseline_flat
-                        
-                        h_base = h[h_base_mask]
-                        subjs_base = mapped_subjs_flat[h_base_mask]
-                        
-                        h_active = h[h_active_mask]
-                        subjs_active = mapped_subjs_flat[h_active_mask]
-
-                        if h_base.size(0) > 0:
-                            with torch.no_grad():
-                                for subj_idx in torch.unique(subjs_base):
-                                    smask = (subjs_base == subj_idx)
-                                    subj_mean = h_base[smask].mean(dim=0)
-                                    subject_centroids[subj_idx] = (
-                                        (1 - ortho_ema_momentum) * subject_centroids[subj_idx]
-                                        + ortho_ema_momentum * subj_mean
-                                    )
-
-                        if h_active.size(0) > 0:
-                            batch_v_k = subject_centroids[subjs_active].detach()
-                            ortho_penalty = torch.mean(
-                                F.cosine_similarity(h_active, batch_v_k, dim=-1, eps=1e-8) ** 2
-                            )
-                        else:
-                            ortho_penalty = torch.tensor(0.0, device=device)
-                    else:
-                        # Fallback for backward compatibility when is_baseline is not in the batch
-                        if subj_remapper is not None:
-                            mapped_subjs = torch.tensor(
-                                [subj_remapper.get(s.item() if hasattr(s, 'item') else s, 0) for s in subject_labels],
-                                device=device, dtype=torch.long)
-                        else:
-                            mapped_subjs = subject_labels.long()
-
-                        neutral_mask = (targets_c.squeeze() == 3)  # [B] boolean
-                        with torch.no_grad():
-                            if neutral_mask.any():
-                                neutral_feats = backbone_feats[neutral_mask]
-                                neutral_subjs = mapped_subjs[neutral_mask]
-                                for subj_idx in torch.unique(neutral_subjs):
-                                    smask = (neutral_subjs == subj_idx)
-                                    subj_mean = neutral_feats[smask].mean(dim=0)
-                                    subject_centroids[subj_idx] = (
-                                        (1 - ortho_ema_momentum) * subject_centroids[subj_idx]
-                                        + ortho_ema_momentum * subj_mean
-                                    )
-
-                        batch_centroids = subject_centroids[mapped_subjs].detach()
-                        ortho_penalty = torch.mean(
-                            F.cosine_similarity(backbone_feats, batch_centroids, dim=-1, eps=1e-8) ** 2
-                        )
-
-                    loss = loss + (curr_lambda * ortho_penalty)
-
-                    # Track for epoch logging
-                    with torch.no_grad():
-                        ortho_penalty_total += ortho_penalty.item()
-                        ortho_penalty_count += 1
             else:
                 # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                 K_bag = None
@@ -836,19 +690,31 @@ def training_loop(phase,
                 
                 # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
                 inputs = inputs.permute(1,0,2,3,4) 
-                outputs = model(inputs, K=K_bag)
-
-                # If the model didn't internally reduce K (e.g. Phase 2 UNet)
-                if K_bag is not None and outputs.shape[0] == B * K_bag:
-                    # Average all windows in the bag so it matches the B targets
-                    outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
-
-                if phase in [1, '1a', '1b']:
-                    f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)
-                    features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-                    loss = loss_fn(features, targets_c)
+                if phase == '1b':
+                    half_idx = (B // 2) * K_bag if K_bag is not None else B // 2
+                    inp1b = inputs[:, :half_idx]
+                    
+                    logits, mu, logvar = model(inp1b, K=K_bag, return_vib=True)
+                    ce_loss = loss_fn(logits, targets_c.squeeze())
+                    
+                    probs = torch.softmax(logits, dim=1)
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).mean()
+                    
+                    loss = ce_loss + 0.1 * entropy
                 else:
-                    loss = loss_fn(outputs, targets, targets_c)
+                    outputs = model(inputs, K=K_bag)
+
+                    # If the model didn't internally reduce K (e.g. Phase 2 UNet)
+                    if K_bag is not None and outputs.shape[0] == B * K_bag:
+                        # Average all windows in the bag so it matches the B targets
+                        outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
+
+                    if phase == '1a':
+                        f1, f2 = torch.split(outputs, [B//2, B//2], dim=0)
+                        features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                        loss = loss_fn(features, targets_c)
+                    else:
+                        loss = loss_fn(outputs, targets, targets_c)
            
             loss = loss / accumulation_steps
             loss.backward()
@@ -1291,34 +1157,8 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         print("WARNING: use_dann is True but model has no dann_head. Ignoring DANN for this phase.")
         enc_class.use_dann = False
 
-    use_scda = config.loss.get('use_scda', False)
-    iic_intra_weight = config.loss.get('iic_intra_weight', 1.0)
-    iic_inter_weight = config.loss.get('iic_inter_weight', 1.0)
-    decoupled = config.loss.get('decoupled', False)
-    con_temp = config.loss.get('temperature', 0.07)
-    use_supmoco = config.training.get('use_supmoco', False)
-
-    if use_supmoco:
-        loss_fn = SupMoCoLoss(
-            train_loader.dataset.prototypes,
-            temperature=con_temp,
-            iic_enabled=use_scda,
-            iic_intra_weight=iic_intra_weight,
-            iic_inter_weight=iic_inter_weight,
-            temporal_decay_enabled=config.training.get('temporal_decay_enabled', False),
-            temporal_decay_factor=config.training.get('temporal_decay_factor', 0.999),
-            exclude_same_trial=config.loss.get('exclude_same_trial', True),
-            cosface_margin=config.loss.get('cosface_margin', 0.0)
-        )
-    else:
-        loss_fn = ContrastiveLoss(
-            train_loader.dataset.prototypes,
-            temperature=con_temp,
-            iic_enabled=use_scda,
-            iic_intra_weight=iic_intra_weight,
-            iic_inter_weight=iic_inter_weight,
-            decoupled=decoupled,
-        )
+    use_supmoco = False
+    loss_fn = nn.CrossEntropyLoss()
 
     loss_fn.to(device)
 
@@ -1329,7 +1169,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
     warmup_epochs = config.training.get('warmup_epochs', 0)
     accumulation_steps = config.training.get('accumulation_steps', 1)
     
-    unfreeze_epoch = config.training.get('freeze_encoder_epochs', 0)
+    unfreeze_epoch = epochs + 1 # Fix encoder
     
     # In 1B, if resuming, normal resume.
     # If not resuming but checkpoint provided, it's a backbone transfer!
@@ -1392,14 +1232,7 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         subj_remapper=subj_remapper,
         use_mmd=config.loss.get('use_mmd', False),
         lambda_mmd=config.loss.get('lambda_mmd', 0.0),
-        live_tracker=live_tracker,
-        use_ortho=config.loss.get('use_ortho', False),
-        lambda_ortho=config.loss.get('lambda_ortho', 0.1),
-        ortho_ema_momentum=config.loss.get('ortho_ema_momentum', 0.1),
-        num_subjects_ortho=num_dynamic_subjects,
-        feature_dim_ortho=config.model.get('feature_dim', 256),
-        lambda_min=config.loss.get('lambda_min', 0.0),
-        lambda_max=config.loss.get('lambda_max', 0.1)
+        live_tracker=live_tracker
     )
 
     
