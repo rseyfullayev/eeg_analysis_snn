@@ -82,18 +82,19 @@ while true; do
         fi
     fi
 
-    # --- BLOCK 3: Handle VENV (Arbitrary commands) ---
+    # --- BLOCK 3: Handle VENV ---
     if [ -f "VENV" ]; then
         if [ ! -f ".last_venv_commit" ] || [ "$(cat .last_venv_commit)" != "$CURRENT_COMMIT" ]; then
             echo "$(date): New VENV file detected on commit $CURRENT_COMMIT."
             echo "$CURRENT_COMMIT" > .last_venv_commit
 
-            echo "  Executing commands from VENV file..."
+            echo "  Executing python commands from VENV file..."
 
+            PYTHON_ARGS = $(sed -n '1p' VENV)
+            echo "  Args:     $PYTHON_ARGS"
             # Launch in background
             (
-                source "$VENV_PATH"
-                bash VENV
+                python "$PYTHON_ARGS"
                 echo "$(date): VENV commands finished (commit $CURRENT_COMMIT)."
             ) &
         fi
