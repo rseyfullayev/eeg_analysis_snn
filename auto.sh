@@ -14,10 +14,10 @@
 # ============================================================
 
 # --- FILL THESE IN ---
-VENV_PATH="/home/temporaryuser3/Documents/ERO/eeg_analysis_snn/venv/bin/activate"
-REPO_DIR="/home/temporaryuser3/Documents/ERO/eeg_analysis_snn/"
+VENV_PATH="/home/tempuser2/Documents/eeg_analysis_snn/venv/bin/activate"
+REPO_DIR="/home/tempuser2/Documents/eeg_analysis_snn/"
 BRANCH="features/odconv"
-TEST_CHECKPOINT_BASE="/media/temporaryuser3/STORAGE/ERO/saved_models/"               # e.g. "/home/temporaryuser3/checkpoints"
+TEST_CHECKPOINT_BASE="/home/tempuser2/Documents/saved_models/"               # e.g. "/home/tempuser2/checkpoints"
 
 POLL_INTERVAL=60
 # ============================================================

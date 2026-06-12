@@ -1,7 +1,7 @@
-dataset_path: "/media/temporaryuser3/STORAGE/SEED-V/preprocessed_eeg_ea"
-raw_path: "/media/temporaryuser3/STORAGE/SEED-V/"
-coords_path: "/media/temporaryuser3/STORAGE/SEED-V/coords.csv"
-save_path: "/media/temporaryuser3/STORAGE/ERO/"
+dataset_path: "/home/tempuser2/Documents/SEED-V/preprocessed_eeg_ea"
+raw_path: "/home/tempuser2/Documents/SEED-V/"
+coords_path: "/home/tempuser2/Documents/SEED-V/coords.csv"
+save_path: "/home/tempuser2/Documents/"
 dataset_mode: "eeg"
 encoding_method: "direct"
 num_timesteps: 32
