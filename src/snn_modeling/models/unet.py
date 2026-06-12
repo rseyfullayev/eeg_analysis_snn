@@ -83,8 +83,7 @@ class SpikingMobileNetProjector(nn.Module):
                 SwiGLU(feature_dim, p_drop=0.2),
                 nn.Linear(feature_dim, 1, bias=False)
             )
-            self.vib_mu = nn.Linear(feature_dim, feature_dim)
-            self.vib_logvar = nn.Linear(feature_dim, feature_dim)
+            self.cls_head = nn.Linear(128, num_classes)
 
         if self.use_dann:
             self.dann_head = nn.Sequential(
@@ -100,11 +99,9 @@ class SpikingMobileNetProjector(nn.Module):
         use_batchnorm = use_batchnorm or has_bn
 
         self.classifier = ProjectionHead(feature_dim, 128, use_batchnorm=use_batchnorm)
-        self.cls_head = nn.Linear(128, num_classes)
         
         
-
-    def extract_features(self, x, K=None, return_vib=False):
+    def extract_features(self, x, K=None):
         """Extract backbone features (before projection head).
         
         Returns (B, feature_dim) tensor suitable for linear evaluation.
@@ -115,8 +112,6 @@ class SpikingMobileNetProjector(nn.Module):
             out = features.mean(dim=[0, 3, 4])  # mean over T, H, W
         else:
             out = features.mean(dim=[-2, -1])   # mean over H, W if already collapsed
-
-        mu, logvar = None, None
 
         # === HYBRID MIL: Pre-Normalized RTFM Gating (or SwiGLU) ===
         if K is not None and K > 1:
@@ -135,11 +130,7 @@ class SpikingMobileNetProjector(nn.Module):
                 h_agg = torch.sum(out * attn_weights, dim=1)
                 
                 # Variational Info Bottleneck (VIB)
-                mu = self.vib_mu(h_agg)
-                logvar = self.vib_logvar(h_agg)
-                std = torch.exp(0.5 * logvar)
-                eps = torch.randn_like(std)
-                z = mu + eps * std if self.training else mu # look into this (sampling may be requried)
+                z = h_agg # look into this (sampling may be requried)
 
                 # Inverse attention baseline
                 inv_weights = (1.0 - attn_weights)
@@ -164,16 +155,13 @@ class SpikingMobileNetProjector(nn.Module):
                 out = torch.stack(master_vectors, dim=0).mean(dim=1) # [B, C_dim]
         # ============================
 
-        if return_vib:
-            return out, mu, logvar
         return out
 
-    def forward(self, x, K=None, return_vib=False):
-        if return_vib:
-            out, mu, logvar = self.extract_features(x, K=K, return_vib=True)
-            out = self.classifier(out)
+    def forward(self, x, K=None):
+        if K is not None and K > 1:
+            out = self.extract_features(x, K=K)
             logits = self.cls_head(out)
-            return logits, mu, logvar
+            return logits
             
         out = self.extract_features(x, K=K)
         out = self.classifier(out)

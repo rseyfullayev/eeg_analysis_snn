@@ -694,7 +694,7 @@ def training_loop(phase,
                     half_idx = (B // 2) * K_bag if K_bag is not None else B // 2
                     inp1b = inputs[:, :half_idx]
                     
-                    logits, mu, logvar = model(inp1b, K=K_bag, return_vib=True)
+                    logits = model(inp1b, K=K_bag)
                     ce_loss = loss_fn(logits, targets_c.squeeze())
                     
                     probs = torch.softmax(logits, dim=1)

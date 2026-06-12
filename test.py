@@ -238,7 +238,8 @@ def _class_cosine_matrix(emb, labels, num_classes=5):
         centroids.append(class_emb.mean(axis=0))
         # Intra-class: mean pairwise cosine (sample up to 500 for speed)
         if len(class_emb) > 500:
-            idx = np.random.choice(len(class_emb), 500, replace=False)
+            rng = np.random.RandomState(42)
+            idx = rng.choice(len(class_emb), 500, replace=False)
             class_emb = class_emb[idx]
         pair_sim = cosine_similarity(class_emb)
         # Exclude self-similarity diagonal
@@ -320,9 +321,8 @@ def test(config, loso, subj, device, model):
         embs, labels_list, groups_list, subjects_list = [], [], [], []
         with torch.no_grad():
             for batch in tqdm(loader, desc=desc):
-                vid = batch[0]
-                lbl = batch[2] if len(batch) >= 4 else batch[1]
-                bag_id = batch[3]  # bag_id is always at index 3
+                # Unpack: (bag_video, target_map, label_idx, bag_id, video_id, timestamp_data)
+                vid, _target_map, lbl, bag_id, _video_id, _timestamps = batch[:6]
                 
                 K_bag = None
                 if vid.dim() == 6:
@@ -527,7 +527,7 @@ def test(config, loso, subj, device, model):
     # =================================================================
     suffix = f"loso{loso}" if loso else f"subj{subj}"
     print(f"\n{'='*60}")
-    print(f"  UMAP 1: Subject Font Proof")
+    print(f"  UMAP 1: Subject Fingerprint")
     print(f"{'='*60}")
     # Fit on x_train, transform x_train, color by Subject ID
     reducer1 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
@@ -545,7 +545,7 @@ def test(config, loso, subj, device, model):
             c=[palette_subj[i]], s=12, alpha=0.65, edgecolors='none',
             label=f'S{sid}', rasterized=True
         )
-    ax1.set_title(f"Subject Fingerprint — {id_label}", fontweight='bold', pad=10)
+    ax1.set_title(f"Subject Fingerprint \u2014 {id_label}", fontweight='bold', pad=10)
     ax1.set_xlabel('UMAP-1')
     ax1.set_ylabel('UMAP-2')
     ax1.legend(title='Subject', loc='lower right',
@@ -656,8 +656,11 @@ def test(config, loso, subj, device, model):
     for s in train_set.samples:
         bid = s[0]
         if bid not in bag_id_to_info:
-            bag_id_to_info[bid] = {"files": [], "emotion": s[2], "subject": s[3]}
-        bag_id_to_info[bid]["files"].extend(s[1])  # accumulate all window files
+            bag_id_to_info[bid] = {"files": set(), "emotion": s[2], "subject": s[3]}
+        bag_id_to_info[bid]["files"].update(s[1])  # deduplicated window files
+    # Convert sets to sorted lists for deterministic ordering
+    for bid in bag_id_to_info:
+        bag_id_to_info[bid]["files"] = sorted(bag_id_to_info[bid]["files"])
 
     def _sample_and_render_intrabag(bag_id_to_info, emotion_filter, exclude_neutral, rng_seed, tag_name, log_dict):
         """Sample a bag matching the filter criteria, extract window embeddings, render heatmap.
