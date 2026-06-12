@@ -59,8 +59,4 @@ loss:
   use_mmd: false
   lambda_mmd: 0.1
   cosface_margin: 0.0 # Not using cosface loss
-  use_ortho: true
-  lambda_min: 0.0
-  lambda_max: 0.1
-  ortho_ema_momentum: 0.05
 

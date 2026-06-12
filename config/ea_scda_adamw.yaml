@@ -45,7 +45,7 @@ loss:
   lambda_seg: 0.0
   lambda_con: 0.0
   temperature: 0.1
-  use_scda: false
+  use_scda: true
   decoupled: true
   lambda_class: 1.0
   lambda_fire: 0.0
@@ -59,8 +59,4 @@ loss:
   use_mmd: false
   lambda_mmd: 0.1
   cosface_margin: 0.0 # Not using cosface loss
-  use_ortho: true
-  lambda_min: 0.0
-  lambda_max: 0.1
-  ortho_ema_momentum: 0.05
 
