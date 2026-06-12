@@ -66,63 +66,12 @@ def make_umap(**kwargs):
         return umap.UMAP(**kwargs)
 
 import matplotlib.pyplot as plt
-import matplotlib.lines as mlines
 import seaborn as sns
 import wandb
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-
-# =====================================================================
-# Publication-Quality Plot Configuration
-# =====================================================================
-EMOTION_NAMES = ['Disgust', 'Fear', 'Sad', 'Neutral', 'Happy']
-
-# Curated palette — perceptually distinct, colorblind-friendly, print-safe
-_PALETTE_EMO = [
-    '#8B5CF6',  # Disgust  — violet
-    '#EF4444',  # Fear     — red
-    '#3B82F6',  # Sad      — blue
-    '#6B7280',  # Neutral  — slate grey
-    '#F59E0B',  # Happy    — amber
-]
-
-def _apply_pub_style():
-    """Set matplotlib rcParams for publication-quality output.
-
-    Font sizes are calibrated so that labels remain legible when the
-    figure is shrunk to a single IEEE two-column width (~3.5 in).
-    """
-    plt.rcParams.update({
-        # --- fonts (sized for 3.5" IEEE column) ---
-        'font.family': 'serif',
-        'font.serif': ['Times New Roman', 'DejaVu Serif'],
-        'font.size': 13,
-        'axes.titlesize': 15,
-        'axes.labelsize': 14,
-        'xtick.labelsize': 12,
-        'ytick.labelsize': 12,
-        'legend.fontsize': 11,
-        'legend.title_fontsize': 12,
-        # --- figure ---
-        'figure.dpi': 300,
-        'savefig.dpi': 300,
-        'savefig.bbox': 'tight',
-        'savefig.pad_inches': 0.05,
-        # --- axes ---
-        'axes.linewidth': 0.8,
-        'axes.edgecolor': '#333333',
-        'axes.facecolor': '#FAFAFA',
-        'figure.facecolor': 'white',
-        # --- ticks ---
-        'xtick.major.width': 0.6,
-        'ytick.major.width': 0.6,
-        'xtick.direction': 'in',
-        'ytick.direction': 'in',
-    })
-
-_apply_pub_style()
 
 
 def _knn_accuracy(emb_train, labels_train, emb_val, labels_val, k_values=(1, 3, 5, 10)):
@@ -238,8 +187,7 @@ def _class_cosine_matrix(emb, labels, num_classes=5):
         centroids.append(class_emb.mean(axis=0))
         # Intra-class: mean pairwise cosine (sample up to 500 for speed)
         if len(class_emb) > 500:
-            rng = np.random.RandomState(42)
-            idx = rng.choice(len(class_emb), 500, replace=False)
+            idx = np.random.choice(len(class_emb), 500, replace=False)
             class_emb = class_emb[idx]
         pair_sim = cosine_similarity(class_emb)
         # Exclude self-similarity diagonal
@@ -284,7 +232,7 @@ def test(config, loso, subj, device, model):
         prototypes=masks
     )
 
-    # 2. Training Set (The other 15 subjects) to act as probe support
+    # 2. Training Set (The other 14 subjects) to act as probe support
     train_set = SWEEPDataset(
         config,
         split='train',
@@ -321,8 +269,9 @@ def test(config, loso, subj, device, model):
         embs, labels_list, groups_list, subjects_list = [], [], [], []
         with torch.no_grad():
             for batch in tqdm(loader, desc=desc):
-                # Unpack: (bag_video, target_map, label_idx, bag_id, video_id, timestamp_data)
-                vid, _target_map, lbl, bag_id, _video_id, _timestamps = batch[:6]
+                vid = batch[0]
+                lbl = batch[2] if len(batch) >= 4 else batch[1]
+                bag_id = batch[3]  # bag_id is always at index 3
                 
                 K_bag = None
                 if vid.dim() == 6:
@@ -359,8 +308,9 @@ def test(config, loso, subj, device, model):
 
         emb_all = torch.cat(embs, dim=0).numpy()
         labels_all = torch.cat(labels_list, dim=0).numpy()
-        # Map string bag_ids directly to integers to match train.py for deterministic CV
-        groups_all = np.array([int(b) for b in groups_list])
+        # Map string bag_ids to integer groups for CV
+        unique_groups = {b: i for i, b in enumerate(set(groups_list))}
+        groups_all = np.array([unique_groups[b] for b in groups_list])
         subjects_all = np.array(subjects_list)
         return emb_all, labels_all, groups_all, subjects_all
 
@@ -417,26 +367,21 @@ def test(config, loso, subj, device, model):
         # 5. Cosine Similarity Heatmap
         suffix = f"loso{loso}" if loso else f"subj{subj}"
 
-        tick_labels = EMOTION_NAMES[:num_classes]
-        fig_sim, ax_sim = plt.subplots(figsize=(5.5, 4.8))
+        fig_sim, ax_sim = plt.subplots(figsize=(6, 5))
         sns.heatmap(
-            sim, annot=True, fmt=".3f", annot_kws={'size': 10, 'weight': 'bold'},
-            cmap='RdYlGn', vmin=-0.2, vmax=1.0,
-            xticklabels=tick_labels, yticklabels=tick_labels,
-            square=True, linewidths=1.2, linecolor='white',
-            cbar_kws={'shrink': 0.82, 'label': 'Cosine Similarity'},
+            sim, annot=True, fmt=".3f",
+            cmap="RdYlGn", vmin=-0.2, vmax=1.0,
+            xticklabels=range(num_classes),
+            yticklabels=range(num_classes),
             ax=ax_sim
         )
-        ax_sim.set_title(f"Class Cosine Similarity ({split_name}) — {id_label}",
-                         pad=10, fontweight='bold')
-        ax_sim.set_xlabel("Emotion Class")
-        ax_sim.set_ylabel("Emotion Class")
-        ax_sim.tick_params(axis='x', rotation=35)
-        ax_sim.tick_params(axis='y', rotation=0)
+        ax_sim.set_title(f"Cosine Similarity {split_name} — {id_label}")
+        ax_sim.set_xlabel("Class")
+        ax_sim.set_ylabel("Class")
         fig_sim.tight_layout()
 
         sim_path = f"evidence/cossim_{split_name.lower()}_{suffix}.png"
-        fig_sim.savefig(sim_path)
+        fig_sim.savefig(sim_path, dpi=150)
         plt.close(fig_sim)
         print(f"Cosine similarity heatmap saved to {sim_path}")
 
@@ -526,39 +471,31 @@ def test(config, loso, subj, device, model):
     # UMAP Visualizations (3 purpose-built plots)
     # =================================================================
     suffix = f"loso{loso}" if loso else f"subj{subj}"
+    palette_emo = sns.color_palette("husl", num_classes)
+
     print(f"\n{'='*60}")
-    print(f"  UMAP 1: Subject Fingerprint")
+    print(f"  UMAP 1: Subject Font Proof")
     print(f"{'='*60}")
     # Fit on x_train, transform x_train, color by Subject ID
     reducer1 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
     emb_train_2d_s = reducer1.fit_transform(emb_train)
 
     unique_train_subjs = np.unique(subj_train)
-    n_subjs = len(unique_train_subjs)
-    palette_subj = sns.color_palette('husl', n_subjs)
+    palette_subj = sns.color_palette("husl", len(unique_train_subjs))
 
-    fig1, ax1 = plt.subplots(figsize=(7.5, 6))
-    for i, sid in enumerate(unique_train_subjs):
-        mask = subj_train == sid
-        ax1.scatter(
-            emb_train_2d_s[mask, 0], emb_train_2d_s[mask, 1],
-            c=[palette_subj[i]], s=12, alpha=0.65, edgecolors='none',
-            label=f'S{sid}', rasterized=True
-        )
-    ax1.set_title(f"Subject Fingerprint \u2014 {id_label}", fontweight='bold', pad=10)
-    ax1.set_xlabel('UMAP-1')
-    ax1.set_ylabel('UMAP-2')
-    ax1.legend(title='Subject', loc='lower right',
-               ncol=max(1, n_subjs // 8), frameon=True, framealpha=0.85,
-               facecolor='white', edgecolor='#CCCCCC',
-               markerscale=1.8, handletextpad=0.3)
-    ax1.set_facecolor('#F5F5F5')
-    ax1.grid(True, alpha=0.15, linewidth=0.4)
+    fig1, ax1 = plt.subplots(figsize=(10, 8))
+    sns.scatterplot(
+        x=emb_train_2d_s[:, 0], y=emb_train_2d_s[:, 1],
+        hue=subj_train, palette=palette_subj,
+        s=15, alpha=0.7, ax=ax1, legend='full'
+    )
+    ax1.set_title(f"UMAP 1 · Subject Font Proof (fit train) — {id_label}")
+    ax1.legend(title='Subject ID', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
     fig1.tight_layout()
     umap1_path = f"evidence/umap1_subject_font_{suffix}.png"
-    fig1.savefig(umap1_path)
+    fig1.savefig(umap1_path, dpi=150)
     plt.close(fig1)
-    log_dict["Eval/UMAP1_SubjectFont"] = wandb.Image(umap1_path, caption="UMAP 1 · Subject Fingerprint")
+    log_dict["Eval/UMAP1_SubjectFont"] = wandb.Image(umap1_path, caption="UMAP 1 · Subject Font Proof")
     print(f"  Saved {umap1_path}")
 
     print(f"\n{'='*60}")
@@ -569,46 +506,39 @@ def test(config, loso, subj, device, model):
     emb_train_2d_d = reducer2.fit_transform(emb_train)
     emb_val_2d_d = reducer2.transform(emb_val)
 
-    fig2, ax2 = plt.subplots(figsize=(7.5, 6))
-    # Train points: semi-transparent circles
+    fig2, ax2 = plt.subplots(figsize=(10, 8))
+    # Train points: light circles
     for c in range(num_classes):
         mask_c = labels_train == c
         ax2.scatter(
             emb_train_2d_d[mask_c, 0], emb_train_2d_d[mask_c, 1],
-            c=[_PALETTE_EMO[c]], s=10, alpha=0.25, marker='o',
-            edgecolors='none', rasterized=True
+            c=[palette_emo[c]], s=12, alpha=0.3, marker='o',
+            label=f"Train Emo {c}" if c == 0 else None  # Only one legend entry for train
         )
-    # Val points: bold stars with dark edge
+    # Val points: dark stars with black outline
     for c in range(num_classes):
         mask_c = labels_val == c
         ax2.scatter(
             emb_val_2d_d[mask_c, 0], emb_val_2d_d[mask_c, 1],
-            c=[_PALETTE_EMO[c]], s=70, alpha=0.92, marker='*',
-            edgecolors='#222222', linewidths=0.4, rasterized=True
+            c=[palette_emo[c]], s=60, alpha=0.9, marker='*',
+            edgecolors='black', linewidths=0.5,
+            label=f"Val Emo {c}" if c == 0 else None  # Only one legend entry for val
         )
-    # Build a proper two-column legend
+    # Build a proper legend
+    import matplotlib.lines as mlines
     legend_handles = []
     for c in range(num_classes):
-        legend_handles.append(mlines.Line2D(
-            [], [], color=_PALETTE_EMO[c], marker='o', linestyle='None',
-            markersize=5, alpha=0.5, label=f'Train — {EMOTION_NAMES[c]}'))
+        legend_handles.append(mlines.Line2D([], [], color=palette_emo[c], marker='o',
+                              linestyle='None', markersize=5, alpha=0.4, label=f'Train Emo {c}'))
     for c in range(num_classes):
-        legend_handles.append(mlines.Line2D(
-            [], [], color=_PALETTE_EMO[c], marker='*', linestyle='None',
-            markersize=9, markeredgecolor='#222222', markeredgewidth=0.4,
-            label=f'Val — {EMOTION_NAMES[c]}'))
-    ax2.legend(handles=legend_handles, loc='lower left',
-               ncol=2, frameon=True, framealpha=0.85,
-               facecolor='white', edgecolor='#CCCCCC',
-               handletextpad=0.3, columnspacing=0.8)
-    ax2.set_title(f"Domain Shift — {id_label}", fontweight='bold', pad=10)
-    ax2.set_xlabel('UMAP-1')
-    ax2.set_ylabel('UMAP-2')
-    ax2.set_facecolor('#F5F5F5')
-    ax2.grid(True, alpha=0.15, linewidth=0.4)
+        legend_handles.append(mlines.Line2D([], [], color=palette_emo[c], marker='*',
+                              linestyle='None', markersize=8, markeredgecolor='black',
+                              markeredgewidth=0.5, label=f'Val Emo {c}'))
+    ax2.legend(handles=legend_handles, bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2, fontsize=7)
+    ax2.set_title(f"UMAP 2 · Domain Shift (fit train) — {id_label}")
     fig2.tight_layout()
     umap2_path = f"evidence/umap2_domain_shift_{suffix}.png"
-    fig2.savefig(umap2_path)
+    fig2.savefig(umap2_path, dpi=150)
     plt.close(fig2)
     log_dict["Eval/UMAP2_DomainShift"] = wandb.Image(umap2_path, caption="UMAP 2 · Domain Shift")
     print(f"  Saved {umap2_path}")
@@ -620,34 +550,26 @@ def test(config, loso, subj, device, model):
     reducer3 = make_umap(n_neighbors=50, min_dist=0.01, metric='cosine', random_state=42, n_jobs=-1)
     emb_val_2d_v = reducer3.fit_transform(emb_val)
 
-    fig3, ax3 = plt.subplots(figsize=(7.5, 6))
-    for c in range(num_classes):
-        mask_c = labels_val == c
-        ax3.scatter(
-            emb_val_2d_v[mask_c, 0], emb_val_2d_v[mask_c, 1],
-            c=[_PALETTE_EMO[c]], s=16, alpha=0.7, edgecolors='none',
-            label=EMOTION_NAMES[c], rasterized=True
-        )
-    ax3.set_title(f"Validation Separability — {id_label}", fontweight='bold', pad=10)
-    ax3.set_xlabel('UMAP-1')
-    ax3.set_ylabel('UMAP-2')
-    ax3.legend(title='Emotion', loc='lower right',
-               frameon=True, framealpha=0.85, facecolor='white',
-               edgecolor='#CCCCCC', markerscale=1.8)
-    ax3.set_facecolor('#F5F5F5')
-    ax3.grid(True, alpha=0.15, linewidth=0.4)
+    fig3, ax3 = plt.subplots(figsize=(10, 8))
+    sns.scatterplot(
+        x=emb_val_2d_v[:, 0], y=emb_val_2d_v[:, 1],
+        hue=labels_val, palette=palette_emo,
+        s=15, alpha=0.7, ax=ax3
+    )
+    ax3.set_title(f"UMAP 3 · Validation Separability (fit val) — {id_label}")
+    ax3.legend(title='Emotion', bbox_to_anchor=(1.05, 1), loc='upper left')
     fig3.tight_layout()
     umap3_path = f"evidence/umap3_val_sep_{suffix}.png"
-    fig3.savefig(umap3_path)
+    fig3.savefig(umap3_path, dpi=150)
     plt.close(fig3)
     log_dict["Eval/UMAP3_ValSeparability"] = wandb.Image(umap3_path, caption="UMAP 3 · Validation Separability")
     print(f"  Saved {umap3_path}")
 
     # =================================================================
-    # Intra-Bag Cosine Similarity Heatmaps (sampled from train set)
+    # Intra-Bag Cosine Similarity Heatmap (sampled from train set)
     # =================================================================
     print(f"\n{'='*60}")
-    print(f"  Intra-Bag Cosine Similarity Heatmaps")
+    print(f"  Intra-Bag Cosine Similarity Heatmap")
     print(f"{'='*60}")
 
     # Gather all unique bag_ids, sample one, then collect ALL windows for that bag_id
@@ -656,106 +578,67 @@ def test(config, loso, subj, device, model):
     for s in train_set.samples:
         bid = s[0]
         if bid not in bag_id_to_info:
-            bag_id_to_info[bid] = {"files": set(), "emotion": s[2], "subject": s[3]}
-        bag_id_to_info[bid]["files"].update(s[1])  # deduplicated window files
-    # Convert sets to sorted lists for deterministic ordering
-    for bid in bag_id_to_info:
-        bag_id_to_info[bid]["files"] = sorted(bag_id_to_info[bid]["files"])
+            bag_id_to_info[bid] = {"files": [], "emotion": s[2], "subject": s[3]}
+        bag_id_to_info[bid]["files"].extend(s[1])  # accumulate all window files
 
-    def _sample_and_render_intrabag(bag_id_to_info, emotion_filter, exclude_neutral, rng_seed, tag_name, log_dict):
-        """Sample a bag matching the filter criteria, extract window embeddings, render heatmap.
+    valid_bag_ids = [bid for bid, info in bag_id_to_info.items() if len(info["files"]) > 100 and info["emotion"] != 3]
+    if not valid_bag_ids:
+        print("  [IntraBag] No non-neutral bag found with W > 100. Falling back to all bags.")
+        valid_bag_ids = list(bag_id_to_info.keys())
         
-        Args:
-            emotion_filter: If not None, only bags with this emotion are considered.
-            exclude_neutral: If True, exclude emotion==3 from candidates.
-            rng_seed: Random seed for reproducible sampling.
-            tag_name: W&B log key suffix and filename suffix.
-        """
-        if emotion_filter is not None:
-            candidates = [bid for bid, info in bag_id_to_info.items()
-                          if len(info["files"]) > 100 and info["emotion"] == emotion_filter]
-            if not candidates:
-                print(f"  [IntraBag-{tag_name}] No bag with emotion={emotion_filter} and W>100. Falling back to any bag with emotion={emotion_filter}.")
-                candidates = [bid for bid, info in bag_id_to_info.items()
-                              if info["emotion"] == emotion_filter]
-        else:
-            candidates = [bid for bid, info in bag_id_to_info.items()
-                          if len(info["files"]) > 100 and (not exclude_neutral or info["emotion"] != 3)]
-            if not candidates:
-                print(f"  [IntraBag-{tag_name}] No matching bag with W>100. Falling back to all bags.")
-                candidates = list(bag_id_to_info.keys())
+    rng = np.random.RandomState(42)
+    sampled_bag_id = valid_bag_ids[rng.randint(0, len(valid_bag_ids))]
+    sampled_info = bag_id_to_info[sampled_bag_id]
+    sampled_files = sampled_info["files"]
+    sampled_emotion = sampled_info["emotion"]
+    sampled_subject = sampled_info["subject"]
+    print(f"  Sampled bag_id={sampled_bag_id} (subject={sampled_subject}, emotion={sampled_emotion}, "
+          f"windows={len(sampled_files)})")
 
-        if not candidates:
-            print(f"  [IntraBag-{tag_name}] No bags found at all. Skipping.")
-            return
+    # Load all windows in the bag and extract per-window embeddings
+    window_embs = []
+    model.eval()
+    with torch.no_grad():
+        for fname in sampled_files:
+            fpath = os.path.join(train_set.samples_dir, fname)
+            try:
+                win = torch.load(fpath, weights_only=True, map_location='cpu').float()
+            except Exception as e:
+                print(f"    Skipping {fname}: {e}")
+                continue
+            # win shape: [T, C, H, W] — add batch dim
+            win = win.unsqueeze(0).to(device)            # [1, T, C, H, W]
+            win = win.permute(1, 0, 2, 3, 4)             # [T, 1, C, H, W]
+            feat, _ = model.encoder(win)                  # encoder output
+            if feat.dim() == 5:
+                emb_w = feat.mean(dim=[0, 3, 4])          # [1, D]
+            else:
+                emb_w = feat.mean(dim=[-2, -1])           # [1, D]
+            emb_w = F.normalize(emb_w, dim=1, eps=1e-6)
+            window_embs.append(emb_w.cpu())
 
-        rng = np.random.RandomState(rng_seed)
-        sampled_bag_id = candidates[rng.randint(0, len(candidates))]
-        sampled_info = bag_id_to_info[sampled_bag_id]
-        sampled_files = sampled_info["files"]
-        sampled_emotion = sampled_info["emotion"]
-        sampled_subject = sampled_info["subject"]
-        print(f"  [{tag_name}] Sampled bag_id={sampled_bag_id} (subject={sampled_subject}, emotion={sampled_emotion}, "
-              f"windows={len(sampled_files)})")
+    if len(window_embs) >= 2:
+        bag_embs = torch.cat(window_embs, dim=0).numpy()  # [W, D]
+        bag_cos_sim = cosine_similarity(bag_embs)          # [W, W]
 
-        # Load all windows in the bag and extract per-window embeddings
-        window_embs = []
-        model.eval()
-        with torch.no_grad():
-            for fname in sampled_files:
-                fpath = os.path.join(train_set.samples_dir, fname)
-                try:
-                    win = torch.load(fpath, weights_only=True, map_location='cpu').float()
-                except Exception as e:
-                    print(f"    Skipping {fname}: {e}")
-                    continue
-                # win shape: [T, C, H, W] — add batch dim
-                win = win.unsqueeze(0).to(device)            # [1, T, C, H, W]
-                win = win.permute(1, 0, 2, 3, 4)             # [T, 1, C, H, W]
-                feat, _ = model.encoder(win)                  # encoder output
-                if feat.dim() == 5:
-                    emb_w = feat.mean(dim=[0, 3, 4])          # [1, D]
-                else:
-                    emb_w = feat.mean(dim=[-2, -1])           # [1, D]
-                emb_w = F.normalize(emb_w, dim=1, eps=1e-6)
-                window_embs.append(emb_w.cpu())
-
-        if len(window_embs) >= 2:
-            bag_embs = torch.cat(window_embs, dim=0).numpy()  # [W, D]
-            bag_cos_sim = cosine_similarity(bag_embs)          # [W, W]
-
-            emo_str = EMOTION_NAMES[sampled_emotion] if sampled_emotion < len(EMOTION_NAMES) else str(sampled_emotion)
-            fig_bag, ax_bag = plt.subplots(figsize=(6.5, 5.8))
-            sns.heatmap(
-                bag_cos_sim, cmap='magma', vmin=-0.1, vmax=1.0,
-                square=True, ax=ax_bag,
-                xticklabels=False, yticklabels=False,
-                linewidths=0, rasterized=True,
-                cbar_kws={'shrink': 0.82, 'label': 'Cosine Similarity'}
-            )
-            ax_bag.set_title(
-                f"Intra-Bag Cosine Similarity\n"
-                f"Subject {sampled_subject} · {emo_str} · W={len(bag_embs)}",
-                fontweight='bold', pad=10
-            )
-            ax_bag.set_xlabel('Window Index')
-            ax_bag.set_ylabel('Window Index')
-            fig_bag.tight_layout()
-            bag_hm_path = f"evidence/intrabag_cossim_{tag_name}_{suffix}.png"
-            fig_bag.savefig(bag_hm_path)
-            plt.close(fig_bag)
-            log_dict[f"Eval/IntraBag_CosSim_{tag_name}"] = wandb.Image(bag_hm_path, caption=f"Intra-Bag CosSim · {emo_str} (bag {sampled_bag_id})")
-            print(f"  Saved {bag_hm_path}")
-        else:
-            print(f"  [IntraBag-{tag_name}] Not enough windows to compute pairwise similarity.")
-
-    # 1. Non-Neutral emotion bag (original behavior)
-    _sample_and_render_intrabag(bag_id_to_info, emotion_filter=None, exclude_neutral=True,
-                                rng_seed=42, tag_name="Active", log_dict=log_dict)
-
-    # 2. Neutral emotion bag (emotion_id == 3)
-    _sample_and_render_intrabag(bag_id_to_info, emotion_filter=3, exclude_neutral=False,
-                                rng_seed=42, tag_name="Neutral", log_dict=log_dict)
+        fig_bag, ax_bag = plt.subplots(figsize=(8, 7))
+        sns.heatmap(
+            bag_cos_sim, cmap="viridis", vmin=-0.2, vmax=1.0,
+            square=True, ax=ax_bag,
+            xticklabels=False, yticklabels=False
+        )
+        ax_bag.set_title(f"Intra-Bag Cosine Sim · bag={sampled_bag_id} "
+                         f"(subj={sampled_subject}, emo={sampled_emotion}, W={len(bag_embs)})")
+        ax_bag.set_xlabel("Window Index")
+        ax_bag.set_ylabel("Window Index")
+        fig_bag.tight_layout()
+        bag_hm_path = f"evidence/intrabag_cossim_{suffix}.png"
+        fig_bag.savefig(bag_hm_path, dpi=150)
+        plt.close(fig_bag)
+        log_dict["Eval/IntraBag_CosSim"] = wandb.Image(bag_hm_path, caption=f"Intra-Bag Cosine Sim (bag {sampled_bag_id})")
+        print(f"  Saved {bag_hm_path}")
+    else:
+        print("  [IntraBag] Not enough windows to compute pairwise similarity.")
 
     wandb.log(log_dict)
     print(f"\nLogged to W&B under Eval/ and EvalTrain/ prefixes.")
