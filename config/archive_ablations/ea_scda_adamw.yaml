@@ -1,5 +1,5 @@
 defaults:
-  - data: seed_v_ea
+  - data: seed_v
   - encoder: analog
   - decoder: spiking        
   - architecture: phase1a
