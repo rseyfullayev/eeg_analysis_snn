@@ -11,6 +11,10 @@
 #   config/config.yaml
 #   phase1a/MobileNet_20260410/checkpoint_best.pt
 #   --loso 1
+#
+# VENV file format (bash script):
+#   pip install some-package
+#   python script.py
 # ============================================================
 
 # --- FILL THESE IN ---
@@ -74,6 +78,23 @@ while true; do
             (
                 python main.py --config "$TEST_CONFIG" --test --checkpoint "$FULL_CHECKPOINT" $TEST_ARGS
                 echo "$(date): Test finished (commit $CURRENT_COMMIT)."
+            ) &
+        fi
+    fi
+
+    # --- BLOCK 3: Handle VENV (Arbitrary commands) ---
+    if [ -f "VENV" ]; then
+        if [ ! -f ".last_venv_commit" ] || [ "$(cat .last_venv_commit)" != "$CURRENT_COMMIT" ]; then
+            echo "$(date): New VENV file detected on commit $CURRENT_COMMIT."
+            echo "$CURRENT_COMMIT" > .last_venv_commit
+
+            echo "  Executing commands from VENV file..."
+
+            # Launch in background
+            (
+                source "$VENV_PATH"
+                bash VENV
+                echo "$(date): VENV commands finished (commit $CURRENT_COMMIT)."
             ) &
         fi
     fi
