@@ -504,8 +504,6 @@ def training_loop(phase,
         train_dann_correct = 0
         train_dann_total = 0
         dann_loss_total = 0.0
-        ortho_penalty_total = 0.0
-        ortho_penalty_count = 0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
             if live_tracker and getattr(live_tracker, 'is_cancelled', False):
@@ -894,13 +892,6 @@ def training_loop(phase,
             log_dict[f'Phase{str(phase).upper()}/Train/DANN_Subject_Acc'] = train_dann_acc
             log_dict[f'Phase{str(phase).upper()}/Train/DANN_Loss'] = avg_dann_loss
 
-        # --- Ortho Projection Logging ---
-        if use_ortho and ortho_penalty_count > 0:
-            avg_ortho = ortho_penalty_total / ortho_penalty_count
-            print(f"  OrthoLOP — Avg Penalty: {avg_ortho:.4f}")
-            log_dict[f'Phase{str(phase).upper()}/Train/Ortho_Penalty'] = avg_ortho
-
-
 
         # --- Checkpoint: checkpoint_last.pt (every epoch, atomic write) ---
         save_checkpoint(model, optimizer, scheduler, epoch, best_acc, best_dice,
@@ -1120,14 +1111,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         subj_remapper=subj_remapper,
         use_mmd=config.loss.get('use_mmd', False),
         lambda_mmd=config.loss.get('lambda_mmd', 0.0),
-        live_tracker=live_tracker,
-        use_ortho=config.loss.get('use_ortho', False),
-        lambda_ortho=config.loss.get('lambda_ortho', 0.1),
-        ortho_ema_momentum=config.loss.get('ortho_ema_momentum', 0.1),
-        num_subjects_ortho=num_dynamic_subjects,
-        feature_dim_ortho=config.model.get('feature_dim', 256),
-        lambda_min=config.loss.get('lambda_min', 0.0),
-        lambda_max=config.loss.get('lambda_max', 0.1)
+        live_tracker=live_tracker
     )
    
 
