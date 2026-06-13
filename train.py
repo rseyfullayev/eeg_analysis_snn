@@ -788,12 +788,12 @@ def training_loop(phase,
             epoch_metrics["dann_loss"] = dann_loss_total / max(train_dann_total, 1)
 
         # --- Offline Probes (Phase 1A only) ---
+        log_loto_metrics = {}
         val_linear_acc = 0.0
         train_linear_acc = 0.0
-        subj_cv_acc = 0.0
         subj_cross_acc = 0.0
         if phase == '1a' and (epoch % probe_interval == 0 or epoch == epochs - 1):
-            from test import _linear_probe_cv, _linear_probe_accuracy, _svm_probe_cv, _svm_probe_accuracy
+            from test import _linear_probe_loto, _linear_probe_accuracy, _svm_probe_accuracy
             
             # Temporary inline extractor
             def _extract_feats(loader):
@@ -857,22 +857,36 @@ def training_loop(phase,
             subj_t = np.array([tr_b2s.get(str(g), -1) for g in grps_t])
             subj_v = np.array([vl_b2s.get(str(g), -1) for g in grps_v])
             
-            train_linear_acc = _linear_probe_cv(emb_t, lbl_t, grps_t, n_folds=5)
-            val_linear_acc = _linear_probe_accuracy(emb_t, lbl_t, emb_v, lbl_v)
+            suffix = os.path.basename(checkpoint_dir)
+            num_classes = config.model.get('num_classes', 5)
+            
+            loto_train_results = _linear_probe_loto(
+                emb_t, lbl_t, grps_t, tag="Train", suffix=suffix, num_classes=num_classes
+            )
+            loto_val_results = _linear_probe_loto(
+                emb_v, lbl_v, grps_v, tag="Val", suffix=suffix, num_classes=num_classes
+            )
+            
+            train_linear_acc = loto_train_results.get("Eval/LOTO_Train_MeanAcc", 0.0)
+            val_linear_acc = loto_val_results.get("Eval/LOTO_Val_MeanAcc", 0.0)
+            lp_train_val = _linear_probe_accuracy(emb_t, lbl_t, emb_v, lbl_v)
+            
+            log_loto_metrics = {**loto_train_results, **loto_val_results}
             
             # Proxy-A
+            subj_cross_acc = 0.0
             if not np.all(subj_t == -1):
-                subj_cv_acc = _svm_probe_cv(emb_t, subj_t, grps_t, n_folds=5)
                 subj_cross_acc = _svm_probe_accuracy(emb_t, subj_t, emb_v, subj_v)
             
-            print(f"  Offline Probes — Emotion Train CV: {train_linear_acc:.4f} | Val Bal Acc: {val_linear_acc:.4f}")
-            print(f"  Proxy-A Probes — Subject Train CV (SVM): {subj_cv_acc:.4f} | Val Cross Acc (SVM): {subj_cross_acc:.4f}")
+            print(f"  Offline Probes — Emotion Train LOTO Mean Acc: {train_linear_acc:.4f} | Val LOTO Mean Acc: {val_linear_acc:.4f} | Train->Val Acc: {lp_train_val:.4f}")
+            if not np.all(subj_t == -1):
+                print(f"  Proxy-A Probes — Subject Val Cross Acc (SVM): {subj_cross_acc:.4f}")
 
             # Live Tracker: probe results
             live_tracker.probe_results(phase, epoch, {
-                "emotion_train_cv": train_linear_acc,
-                "emotion_val": val_linear_acc,
-                "subject_train_cv": subj_cv_acc,
+                "emotion_train_loto_mean": train_linear_acc,
+                "emotion_val_loto_mean": val_linear_acc,
+                "emotion_train_val_cross": lp_train_val,
                 "subject_val_cross": subj_cross_acc,
             })
 
@@ -916,9 +930,9 @@ def training_loop(phase,
                 f"Phase{phase}/Train/QueueFillRatio": queue_len / float(max(1, supmoco_state.queue_size)),
             })
         if phase == '1a' and (epoch % probe_interval == 0 or epoch == epochs - 1):
-            log_dict[f"Phase{phase}/Train/Emotion_Probe_CV_Acc"] = train_linear_acc
-            log_dict[f"Phase{phase}/Val/Emotion_Probe_Val_Acc"] = val_linear_acc
-            log_dict[f"Phase{phase}/Train/Subject_Probe_CV_Acc"] = subj_cv_acc
+            log_dict[f"Phase{phase}/Train/Emotion_LOTO_Mean_Acc"] = train_linear_acc
+            log_dict[f"Phase{phase}/Val/Emotion_LOTO_Mean_Acc"] = val_linear_acc
+            log_dict[f"Phase{phase}/Val/Emotion_Probe_Val_Acc"] = lp_train_val
             log_dict[f"Phase{phase}/Val/Subject_Probe_Val_Acc"] = subj_cross_acc
         if phase not in [1, '1a', '1b']:
             log_dict.update({
@@ -928,7 +942,11 @@ def training_loop(phase,
                 f"Phase{phase}/Val/Recall": val_rec,
             })
 
-        for k, v in log_dict.items(): writer.add_scalar(k, v, epoch)
+        log_dict.update(log_loto_metrics)
+
+        for k, v in log_dict.items():
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                writer.add_scalar(k, v, epoch)
 
         # --- Phase 1A: Three-tier checkpointing ---
         if phase == '1a':
