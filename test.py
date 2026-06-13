@@ -523,6 +523,7 @@ def test(config, loso, subj, device, model):
     # =================================================================
     # Leave-One-Trial-Out (LOTO) Probes
     # =================================================================
+    suffix = f"loso{loso}" if loso else f"subj{subj}"
     print(f"\n{'='*60}")
     print(f"  LOTO (Leave-One-Trial-Out) Linear Probe  ({id_label})")
     print(f"{'='*60}")
