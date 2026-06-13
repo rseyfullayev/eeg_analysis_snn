@@ -858,7 +858,7 @@ def training_loop(phase,
             subj_v = np.array([vl_b2s.get(str(g), -1) for g in grps_v])
             
             suffix = os.path.basename(checkpoint_dir)
-            num_classes = config.model.get('num_classes', 5)
+            num_classes = clean_train_set.config.model.get('num_classes', 5)
             
             loto_train_results = _linear_probe_loto(
                 emb_t, lbl_t, grps_t, tag="Train", suffix=suffix, num_classes=num_classes
