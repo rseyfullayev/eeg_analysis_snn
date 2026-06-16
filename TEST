@@ -1,0 +1,3 @@
+config/ea_supcon_fda_adamw_lotomasking.yaml
+phase1a/MobileNet_0613_224241_loso1/checkpoint_best.pt
+--loso 1
