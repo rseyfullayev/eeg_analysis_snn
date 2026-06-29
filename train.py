@@ -56,9 +56,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, acc, dice, path="best_sw
 
 
 def validate(model, val_loader, criterion, device, threshold=0.5, only_classification=False):
-    if only_classification:
-        return 0, 0, 0, 0, 0, 0, 0
-   
     model.eval()
     val_loss = 0
     correct = 0
@@ -72,8 +69,37 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loop):
+            # Support phase 1b precomputed unpacking
+            if len(batch) == 9: # Precomputed Phase 1b validation batch
+                inputs, targets, labels, subject_idx, bag_id, video_id, timestamp_data, masks, lengths = batch
+                inputs, targets, labels, masks = inputs.to(device), targets.to(device), labels.to(device), masks.to(device)
+                
+                K_bag = inputs.size(1)
+                outputs = model(inputs, K=K_bag, mask=masks)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                    # Compute SubjectEraserLoss if criterion supports it, else fake it
+                    try:
+                        loss, _ = criterion(logits, labels.squeeze(), outputs[2], outputs[3], outputs[4], outputs[5])
+                    except:
+                        loss = torch.tensor(0.0) # Fallback if criterion doesn't match
+                else:
+                    logits = outputs
+                    loss = criterion(logits, labels.squeeze())
+                
+                preds = logits.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(labels.cpu().numpy())
+                val_loss += loss.item()
+                val_loop.set_postfix(loss=loss.item())
+                continue
+                
+            # Standard unpacking
             inputs, targets, labels = batch[0], batch[1], batch[2]
-            inputs, targets, labels = inputs.to(device),  targets.to(device), labels.to(device)
+            inputs, targets, labels = inputs.to(device), targets.to(device), labels.to(device)
             
             K_bag = None
             if inputs.dim() == 6:
@@ -89,9 +115,23 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             if K_bag is not None and outputs.shape[0] == B * K_bag:
                 outputs = outputs.view(B, K_bag, *outputs.shape[1:]).mean(dim=1)
 
+            if only_classification:
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                loss = criterion(logits, labels) if not isinstance(criterion, torch.nn.CrossEntropyLoss) else criterion(logits, labels.squeeze())
+                preds = logits.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(labels.cpu().numpy())
+                val_loss += loss.item()
+                val_loop.set_postfix(loss=loss.item())
+                continue
+
             loss = criterion(outputs, targets, labels)
-            B, C, H, W = outputs.shape
-            
             probs = torch.softmax(outputs, dim=1)
             energy_logits = probs[:, 1:, :, :].sum(dim=(2, 3))
             preds_map = torch.argmax(probs, dim=1)
@@ -112,24 +152,21 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.cpu().numpy())
 
-
             val_loss += loss.item()
             val_loop.set_postfix(loss=loss.item())
-            
-            
-            
-            # Cleanup tensors to free memory
-            del inputs, labels, outputs, loss, preds
-            del preds_map, targets, tp, fp, fn, tn
                 
-    # Clear CUDA cache after validation
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
                 
-            
-    avg_loss = val_loss / len(val_loader)
-    accuracy = correct / total
-    balanced_acc = balanced_accuracy_score(all_targets, all_preds)
+    avg_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
+    accuracy = correct / total if total > 0 else 0
+    try:
+        balanced_acc = balanced_accuracy_score(all_targets, all_preds)
+    except:
+        balanced_acc = 0
+
+    if only_classification:
+        return avg_loss, accuracy, balanced_acc, 0, 0, 0, 0
     
     eps = 1e-7
     dice_score = (2 * tp_tot) / (2 * tp_tot + fp_tot + fn_tot + eps)
@@ -515,7 +552,33 @@ def training_loop(phase,
             # Unpack batch dynamically based on length to handle is_baseline or baseline_windows if provided
             is_baseline = None
             baseline_windows = None
-            if len(batch) == 9:
+            
+            # --- Shared Schedulers for Adversarial / KL penalties ---
+            target_lr_momentum = 0.75
+            plateau_ratio = math.acos(2.0 * target_lr_momentum - 1.0) / math.pi
+            plateau_epoch = int(epochs * plateau_ratio)
+
+            current_step = epoch * len(train_loader) + batch_idx
+            plateau_steps = plateau_epoch * len(train_loader)
+
+            p = min(1.0, current_step / plateau_steps)
+            schedule_weight = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0)
+
+            # Update DANN GRL Alpha
+            if hasattr(model, 'dann_head') and hasattr(model.dann_head[0], 'alpha'):
+                model.dann_head[0].alpha = schedule_weight * dann_alpha
+
+            # Update VIB Beta
+            if hasattr(loss_fn, 'max_beta'):
+                loss_fn.beta = schedule_weight * loss_fn.max_beta
+            
+            if phase == '1b':
+                inputs, targets, targets_c, subject_labels, bag_ids, video_ids, timestamps, masks, lengths = batch
+                inputs = inputs.to(device)
+                targets_c = targets_c.to(device)
+                subject_labels = subject_labels.to(device)
+                masks = masks.to(device)
+            elif len(batch) == 9:
                 inp1, inp2, targets, targets_c, subject_labels, _, video_ids, timestamps, baseline_info = batch
                 video_ids = video_ids.to(device)
                 timestamps = timestamps.to(device)
@@ -606,26 +669,10 @@ def training_loop(phase,
                 if getattr(model, 'use_dann', False):
                     # Safety: skip DANN if backbone features contain NaN/Inf
                     if torch.isfinite(backbone_feats).all():
-                        # Ganin et al. (2015) Alpha Annealing Schedule
-                        # Progress p smoothly moves from 0 to 1 over the course of training phases
-
-                        plateau_ratio = math.acos(2.0 * target_lr_momentum - 1.0) / math.pi
-                        plateau_epoch = int(epochs * plateau_ratio)
-
-                        current_step = epoch * len(train_loader) + batch_idx
-                        plateau_steps = plateau_epoch * len(train_loader)
-
-                        p = min(1.0, current_step / plateau_steps)
-                        annealed_alpha = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0) * dann_alpha
-
-                        # Update GRL alpha if dynamically given
-                        if hasattr(model, 'dann_head') and hasattr(model.dann_head[0], 'alpha'):
-                            model.dann_head[0].alpha = annealed_alpha
-
                         subj_preds = model.dann_head(backbone_feats)
 
                         # Monitor: check DANN head for GRL instability
-                        nan_monitor.check_dann(backbone_feats, subj_preds, annealed_alpha,
+                        nan_monitor.check_dann(backbone_feats, subj_preds, schedule_weight * dann_alpha,
                                                epoch=epoch, batch_idx=batch_idx)
                         
                         if subj_remapper is not None:
@@ -677,29 +724,53 @@ def training_loop(phase,
 
 
             else:
-                # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
-                K_bag = None
-                if inputs.dim() == 6:
-                    B, K_bag, T, C, H, W = inputs.shape
-                    # Flatten Bags into Batch dimension for the SNN Encoder
-                    inputs = inputs.view(B * K_bag, T, C, H, W)
-                else:
-                    B, T, C, H, W = inputs.shape
-                
-                # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
-                inputs = inputs.permute(1,0,2,3,4) 
                 if phase == '1b':
-                    half_idx = (B // 2) * K_bag if K_bag is not None else B // 2
-                    inp1b = inputs[:, :half_idx]
+                    # Precomputed branch
+                    # inputs: (B, max_len, C_dim), masks: (B, max_len)
+                    K_bag = inputs.size(1)
                     
-                    logits = model(inp1b, K=K_bag)
-                    ce_loss = loss_fn(logits, targets_c.squeeze())
-                    
-                    probs = torch.softmax(logits, dim=1)
-                    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).mean()
-                    
-                    loss = ce_loss + 0.1 * entropy
+                    if getattr(model, 'use_dann', False):
+                        logits, dann_logits, mu, logvar, h_emo, h_dmn = model(inputs, K=K_bag, mask=masks)
+                        
+                        loss, loss_dict = loss_fn(
+                            logits=logits, 
+                            targets_class=targets_c.squeeze(), 
+                            mu=mu, 
+                            logvar=logvar, 
+                            h_emo=h_emo, 
+                            h_dmn=h_dmn, 
+                            dann_logits=dann_logits, 
+                            targets_domain=subject_labels.squeeze()
+                        )
+                        
+                        valid_mask = subject_labels.squeeze() != -1
+                        if valid_mask.any():
+                            train_dann_correct += (dann_logits[valid_mask].argmax(dim=1) == subject_labels.squeeze()[valid_mask]).sum().item()
+                            train_dann_total += valid_mask.sum().item()
+                            dann_loss_total += loss_dict.get('loss_dann', 0) * valid_mask.sum().item()
+                    else:
+                        logits, mu, logvar, h_emo, h_dmn = model(inputs, K=K_bag, mask=masks)
+                        loss, loss_dict = loss_fn(
+                            logits=logits, 
+                            targets_class=targets_c.squeeze(), 
+                            mu=mu, 
+                            logvar=logvar, 
+                            h_emo=h_emo, 
+                            h_dmn=h_dmn
+                        )
                 else:
+                    # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
+                    K_bag = None
+                    if inputs.dim() == 6:
+                        B, K_bag, T, C, H, W = inputs.shape
+                        # Flatten Bags into Batch dimension for the SNN Encoder
+                        inputs = inputs.view(B * K_bag, T, C, H, W)
+                    else:
+                        B, T, C, H, W = inputs.shape
+                    
+                    # SNN requires Time to be dimension 0: [T, Batch, C, H, W]
+                    inputs = inputs.permute(1,0,2,3,4) 
+                if phase != '1b':
                     outputs = model(inputs, K=K_bag)
 
                     # If the model didn't internally reduce K (e.g. Phase 2 UNet)
@@ -1160,7 +1231,13 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
         enc_class.use_dann = False
 
     use_supmoco = False
-    loss_fn = nn.CrossEntropyLoss()
+    
+    from src.snn_modeling.utils.loss import SubjectEraserLoss
+    loss_fn = SubjectEraserLoss(
+        beta=config.loss.get('beta_vib', 1e-3),
+        gamma=config.loss.get('gamma_ortho', 0.1),
+        dann_weight=config.loss.get('dann_weight', 1.0)
+    )
 
     loss_fn.to(device)
 
@@ -1393,6 +1470,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
 
     # Create dataset first (without augmentations) so FourierMixup can scan it
+    is_precomputed = phase == '1b'
+    
     train_set = SWEEPDataset(
         config,
         split='train',
@@ -1400,7 +1479,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         loso=loso,
         subj=subj,
         prototypes=masks,
-        augmentations=None  # assigned below after FourierMixup scan
+        augmentations=None,  # assigned below after FourierMixup scan
+        precomputed=is_precomputed
     )
 
     # --- Fourier Mixup: data-level identity erasure (replaces DANN/MMD) ---
@@ -1450,7 +1530,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
         #experiment=True,
         loso=loso,
         subj=subj,
-        prototypes=masks
+        prototypes=masks,
+        precomputed=is_precomputed
     )
 
     num_workers = config.data.get('num_workers', 0)
@@ -1458,6 +1539,10 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     persist = num_workers > 0  # Only use persistent_workers if num_workers > 0
     
     use_pk_sampler = config.training.get('use_pk_sampler', True)
+    
+    from src.snn_modeling.dataloader.dataset import collate_precomputed
+    collate_fn = collate_precomputed if is_precomputed else None
+    
     if use_pk_sampler:
         train_loader = DataLoader(train_set, 
                                   batch_sampler=PKSampler(train_set, 
@@ -1467,7 +1552,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
                                   num_workers=num_workers,
                                   prefetch_factor=prefetch,
                                   persistent_workers=persist,
-                                  pin_memory=True)
+                                  pin_memory=True,
+                                  collate_fn=collate_fn)
     else:
         train_loader = DataLoader(train_set, 
                                   batch_size=config.training.batch_size,
@@ -1475,7 +1561,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
                                   num_workers=num_workers,
                                   prefetch_factor=prefetch,
                                   persistent_workers=persist,
-                                  pin_memory=True)
+                                  pin_memory=True,
+                                  collate_fn=collate_fn)
     
     val_loader = DataLoader(val_set, 
                             batch_size=config.training.batch_size, 
@@ -1483,7 +1570,8 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
                             num_workers=num_workers,
                             prefetch_factor=prefetch,
                             persistent_workers=persist,
-                            pin_memory=True)
+                            pin_memory=True,
+                            collate_fn=collate_fn)
 
     print(f"Data Loaded: {len(train_set)} Train | {len(val_set)} Val")
     

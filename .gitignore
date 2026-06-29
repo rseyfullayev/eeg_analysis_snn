@@ -3,6 +3,7 @@ data_process/eeg_raw
 data_process/venv
 .vscode
 venv
+vault/
 __pycache__/
 *.py[cod]
 *$py.class

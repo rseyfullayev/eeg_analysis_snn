@@ -196,11 +196,11 @@ class SwiGLU(nn.Module):
     * "SwiGLU: A New Activation Function for Language Models" 
       by Shazeer et al., 2020. https://arxiv.org/abs/2002.05202
     """
-    def __init__(self, in_features, p_drop=0.1):
+    def __init__(self, in_features, hid_features, out_features, p_drop=0.1):
         super(SwiGLU, self).__init__()
-        self.gate = nn.Linear(in_features, in_features*4, bias=False)
-        self.value = nn.Linear(in_features, in_features*4, bias=False)
-        self.out = nn.Linear(in_features*4, in_features, bias=False)
+        self.gate = nn.Linear(in_features, hid_features, bias=False)
+        self.value = nn.Linear(in_features, hid_features, bias=False)
+        self.out = nn.Linear(hid_features, out_features, bias=False)
         self.silu = nn.SiLU()
         self.drop = nn.Dropout(p_drop)
 
@@ -209,7 +209,7 @@ class SwiGLU(nn.Module):
         x_gate = self.gate(x)
         x_val = self.value(x)
         x = self.silu(x_gate) * x_val
-        return self.drop(self.out(x))
+        return self.out(self.drop(x))
 
 class LearnableAtan(nn.Module):
     """

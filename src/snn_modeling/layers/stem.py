@@ -44,6 +44,58 @@ class ProjectionHead(nn.Module):
         proj = self.supcon_head(features)
         embedding = F.normalize(proj.view(B, -1), dim=1, eps=1e-6)
         return embedding
+
+class VIBLayer(nn.Module):
+    def __init__(self, in_channels):
+        super(VIBLayer, self).__init__()
+        self.fc_mu = nn.Linear(in_channels, in_channels//8)
+        self.fc_logvar = nn.Linear(in_channels, in_channels//8)
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+    
+    def forward(self, x):
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        z = self.reparameterize(mu, logvar)
+        return z, mu, logvar
+
+class PositionalEncoding(nn.Module):
+    """
+    Fixed sinusoidal positional encoding for spatial dimensions.
+    Input shape: Batch, Trial, Windows, Feature Dim
+    Applying encoding across windows per trial (for each trial, encoding should be reset)
+    """
+    def __init__(self, in_channels, d_model, max_windows):
+        super(PositionalEncoding, self).__init__()
+        base = math.ceil(max_windows/(2*math.pi))
+        pe = torch.zeros(1, max_windows, d_model)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(base) / d_model))
+        pe[:, :, 0::2] = torch.sin(torch.arange(max_windows) * div_term)
+        pe[:, :, 1::2] = torch.cos(torch.arange(max_windows) * div_term)
+        self.register_buffer('pe', pe)
+        
+    
+    def forward(self, x):
+        num_windows = x.size(2)
+        return x + self.pe[:, :num_windows, :] 
+
+
+class WindowReRanker(nn.Module):
+    def __init__(self, in_channels, feature_dim=256, max_windows=400):
+        super(WindowReRanker, self).__init__()
+        self.pos_enc = PositionalEncoding(in_channels, feature_dim, max_windows)
+        self.scorer = SwiGLU(feature_dim, feature_dim//8, 1, p_drop=0.1)
+    
+    def forward(self, x, mask=None):
+        x = self.pos_enc(x)
+        scores = self.scorer(x)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+        return F.softmax(scores, dim=2)
+        
     
 class TemporalViTBlock(nn.Module):
     def __init__(self, in_channels,

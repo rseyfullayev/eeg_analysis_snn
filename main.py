@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--checkpoint', type=str, help='Path to checkpoint')
 
     parser.add_argument('--setup_data', action='store_true', help='Setup data before training')
+    parser.add_argument('--precompute', action='store_true', help='Precompute Phase 1B features using the checkpoint')
 
     parser.add_argument('--raw_path', type=str, help='Path to folder containing raw .txt files')
     parser.add_argument('--coords_path', type=str, help='Path to electrodes coordinates .csv')
@@ -135,6 +136,13 @@ def main():
         print("\n--- [2] Generating Prototypes / Masks ---")
         generate_masks(config, subject_id=args.subj, loso_subject_id=args.loso)
         print("Masks generated.\n")
+        
+    if args.precompute:
+        print("\n--- [3] Precomputing Phase 1B Features ---")
+        if not args.checkpoint:
+            parser.error("You MUST specify --checkpoint when using --precompute.")
+        from precompute_features import run_precompute
+        run_precompute(config, args.checkpoint)
         
     if args.no_train:
         print("Exiting because --no_train was specified.")

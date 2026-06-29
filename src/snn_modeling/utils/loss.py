@@ -588,3 +588,41 @@ class MultiKernelMMDLoss(nn.Module):
             mmd_loss = torch.tensor(0.0, device=features.device, requires_grad=True)
         
         return mmd_loss
+
+class SubjectEraserLoss(nn.Module):
+    def __init__(self, beta=1e-3, gamma=0.1, dann_weight=1.0):
+        super(SubjectEraserLoss, self).__init__()
+        self.ce = nn.CrossEntropyLoss()
+        self.beta = beta
+        self.max_beta = beta
+        self.gamma = gamma
+        self.dann_weight = dann_weight
+
+    def forward(self, logits, targets_class, mu, logvar, h_emo, h_dmn, dann_logits=None, targets_domain=None):
+        # 1. Classification Loss
+        cls_loss = self.ce(logits, targets_class)
+        
+        # 2. VIB KL Divergence Loss
+        # KL(N(mu, sigma^2) || N(0, 1)) = -0.5 * sum(1 + logvar - mu^2 - sigma^2)
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+        
+        # 3. Orthogonality Loss
+        # Cosine similarity penalty
+        cos_sim = F.cosine_similarity(h_emo, h_dmn, dim=1)
+        ortho_loss = torch.mean(cos_sim.abs())
+        
+        # 4. DANN Loss
+        dann_loss = 0.0
+        if dann_logits is not None and targets_domain is not None:
+            valid_mask = targets_domain != -1
+            if valid_mask.any():
+                dann_loss = self.ce(dann_logits[valid_mask], targets_domain[valid_mask])
+                
+        total_loss = cls_loss + self.beta * kl_loss + self.gamma * ortho_loss + self.dann_weight * dann_loss
+        
+        return total_loss, {
+            'loss_cls': cls_loss.item(),
+            'loss_kl': kl_loss.item(),
+            'loss_ortho': ortho_loss.item(),
+            'loss_dann': dann_loss.item() if isinstance(dann_loss, torch.Tensor) else dann_loss
+        }

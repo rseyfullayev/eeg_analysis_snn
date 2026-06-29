@@ -143,7 +143,8 @@ class TopoMapper(nn.Module):
         return self.transform(tensor)
 
 class SWEEPDataset(Dataset):
-    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None):
+    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None, precomputed=False):
+        self.precomputed = precomputed
         self.config = config
         self.split = split
         self.num_classes = config.data.get('n_emotions', 5)
@@ -253,6 +254,11 @@ class SWEEPDataset(Dataset):
             self.prototypes = prototypes
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
+            
+        # Create contiguous mapping for subject IDs (important for DANN with LOSO)
+        unique_subjects = sorted(list(set([s[3] for s in self.samples if s[3] != -1])))
+        self.subject_map = {old: new for new, old in enumerate(unique_subjects)}
+        self.subject_map[-1] = -1  # Fallback
     
     @staticmethod
     def _parse_timestamp(filename):
@@ -287,6 +293,23 @@ class SWEEPDataset(Dataset):
 
     def __getitem__(self, idx):
         bag_id, files, label_idx, subject_idx, video_id, timestamp_data = self.samples[idx]
+        
+        # Map subject_idx to contiguous range
+        subject_idx = self.subject_map.get(subject_idx, -1)
+
+        # We keep the single prototype map for the whole bag
+        target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
+        target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
+
+        if self.precomputed:
+            file_path = os.path.join(self.samples_dir, "precomputed_features", f"bag_{bag_id}.pt")
+            try:
+                bag_video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+            except Exception as e:
+                print(f"Error loading {file_path}: {e}")
+                bag_video = torch.zeros(1, 256) # Fallback shape
+            
+            return bag_video, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data
 
         # 1. Stratified Strided Sampling (Binning).
         # We divide the trial into 'bag_size_limit' equal temporal bins,
@@ -332,10 +355,6 @@ class SWEEPDataset(Dataset):
         elif not self.bagging:
             # If bagging is turned off, drop the K dimension
             bag_video = bag_video.squeeze(0)
-
-        # We keep the single prototype map for the whole bag
-        target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
-        target_map[self.prototypes[label_idx] > 0.1] = label_idx + 1  # Background is 0
         
         # When augmentations happen, they need to handle the batched/bag 5D size 
         # or we iteratively apply it. Assuming it's applied correctly later.
@@ -346,6 +365,42 @@ class SWEEPDataset(Dataset):
             return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data
 
         return bag_video, target_map, label_idx, bag_id, video_id, timestamp_data
+
+def collate_precomputed(batch):
+    """
+    Custom collate_fn for precomputed features.
+    batch is a list of tuples: (bag_video, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data)
+    bag_video shape: (W, C_dim)
+    """
+    bag_videos = [item[0] for item in batch]
+    target_maps = torch.stack([item[1] for item in batch])
+    label_idxs = torch.tensor([item[2] for item in batch], dtype=torch.long)
+    subject_idxs = torch.tensor([item[3] for item in batch], dtype=torch.long)
+    bag_ids = [item[4] for item in batch]
+    video_ids = torch.tensor([int(item[5]) for item in batch], dtype=torch.long)
+    
+    # Not combining timestamps properly here if they are lists, but we'll just leave it as list
+    timestamp_data = [item[6] for item in batch]
+
+    lengths = torch.tensor([bv.size(0) for bv in bag_videos], dtype=torch.long)
+    max_len = lengths.max().item()
+    
+    padded_videos = []
+    masks = []
+    
+    for bv, length in zip(bag_videos, lengths):
+        pad_len = max_len - length
+        if pad_len > 0:
+            padded_videos.append(torch.cat([bv, torch.zeros(pad_len, bv.size(1))], dim=0))
+            masks.append(torch.cat([torch.ones(length, dtype=torch.bool), torch.zeros(pad_len, dtype=torch.bool)], dim=0))
+        else:
+            padded_videos.append(bv)
+            masks.append(torch.ones(length, dtype=torch.bool))
+            
+    padded_videos = torch.stack(padded_videos, dim=0) # (B, max_len, C_dim)
+    masks = torch.stack(masks, dim=0) # (B, max_len)
+    
+    return padded_videos, target_maps, label_idxs, subject_idxs, bag_ids, video_ids, timestamp_data, masks, lengths
 
 class PKSampler(Sampler):
     def __init__(self, dataset, batch_size, n_classes=5, n_samples_per_class=None, subject_diverse_k=True):

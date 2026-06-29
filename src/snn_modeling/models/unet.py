@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import snntorch as snn
 from .decoders import ResNetDecoder, SpikingResNetDecoder
-from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead, TemporalGCBlock
+from ..layers.stem import BottleneckBlock, ClassifierHead, ProjectionHead, TemporalGCBlock, WindowReRanker, VIBLayer
 from ..layers.neurons import ALIF, TimeDistributed, SwiGLU
 import snntorch.spikegen as spikegen
 import torch.nn.functional as F
@@ -67,7 +67,11 @@ class UNet(nn.Module):
         raise NotImplementedError("This is a placeholder for the ANN UNet.")
 
 class SpikingMobileNetProjector(nn.Module):
-    def __init__(self, encoder_backbone, num_classes=5, feature_dim=256, use_swiglu=False, use_batchnorm=False, use_dann=False, num_subjects=15):
+    def __init__(self, encoder_backbone, 
+                 num_classes=5, feature_dim=256, 
+                 use_swiglu=False, use_batchnorm=False, 
+                 use_dann=False, num_subjects=15,
+                 max_windows=400):
         super().__init__()
 
         self.encoder = encoder_backbone 
@@ -79,10 +83,9 @@ class SpikingMobileNetProjector(nn.Module):
         
         # --- SwiGLU MIL Attention Heads (Optional) ---
         if self.use_swiglu:
-            self.mil_attention = nn.Sequential(
-                SwiGLU(feature_dim, p_drop=0.2),
-                nn.Linear(feature_dim, 1, bias=False)
-            )
+            self.vib = VIBLayer(feature_dim)
+            self.reranker = WindowReRanker(feature_dim, max_windows=max_windows)
+        
             self.cls_head = nn.Linear(128, num_classes)
 
         if self.use_dann:
@@ -101,45 +104,46 @@ class SpikingMobileNetProjector(nn.Module):
         self.classifier = ProjectionHead(feature_dim, 128, use_batchnorm=use_batchnorm)
         
         
-    def extract_features(self, x, K=None):
+        
+    def extract_features(self, x, K=None, mask=None):
         """Extract backbone features (before projection head).
         
         Returns (B, feature_dim) tensor suitable for linear evaluation.
         """
-        features, _ = self.encoder(x)
-        # Spatiotemporal GAP: (T, B, C, H, W) -> (B, C)
-        if features.dim() == 5:
-            out = features.mean(dim=[0, 3, 4])  # mean over T, H, W
+        if x.dim() == 3:
+            # Precomputed features: (B, W, C_dim)
+            out = x
+            B, K, C_dim = out.shape
         else:
-            out = features.mean(dim=[-2, -1])   # mean over H, W if already collapsed
+            features, _ = self.encoder(x)
+            # Spatiotemporal GAP: (T, B, C, H, W) -> (B, C)
+            if features.dim() == 5:
+                out = features.mean(dim=[0, 3, 4])  # mean over T, H, W
+            else:
+                out = features.mean(dim=[-2, -1])   # mean over H, W if already collapsed
 
         # === HYBRID MIL: Pre-Normalized RTFM Gating (or SwiGLU) ===
         if K is not None and K > 1:
-            B_total, C_dim = out.shape
-            B = B_total // K
-            
-            # Reshape to [Bags, Windows, Channels]
-            out = out.view(B, K, C_dim)
+            if x.dim() != 3:
+                B_total, C_dim = out.shape
+                B = B_total // K
+                # Reshape to [Bags, Windows, Channels]
+                out = out.view(B, K, C_dim)
             
             if self.use_swiglu:
-                # 1. Compute Attention Scores using SwiGLU
-                attn_scores = self.mil_attention(out)
-                # 2. Normalize via Softmax across the K windows
-                attn_weights = torch.softmax(attn_scores, dim=1)
-                # 3. Aggregate windows via weighted sum
-                h_agg = torch.sum(out * attn_weights, dim=1)
-                
-                # Variational Info Bottleneck (VIB)
-                z = h_agg # look into this (sampling may be requried)
-
-                # Inverse attention baseline
+                attn_weights = self.reranker(out, mask=mask)
+                h_emo = torch.sum(out * attn_weights, dim=1)
+   
                 inv_weights = (1.0 - attn_weights)
+                if mask is not None:
+                    inv_weights = inv_weights.masked_fill(~mask.unsqueeze(-1), 0.0)
                 inv_weights = inv_weights / (inv_weights.sum(dim=1, keepdim=True) + 1e-8)
-                h_base = torch.sum(out * inv_weights, dim=1)
+                h_dmn = torch.sum(out * inv_weights, dim=1)
 
                 # Gram-Schmidt Orthogonalization
-                proj = (torch.sum(z * h_base, dim=1, keepdim=True) / (torch.sum(h_base * h_base, dim=1, keepdim=True) + 1e-8)) * h_base
-                out = z - proj
+                proj = (torch.sum(h_emo * h_dmn, dim=1, keepdim=True) / (torch.sum(h_dmn * h_dmn, dim=1, keepdim=True) + 1e-8)) * h_dmn
+                h_emo -= proj
+                return h_dmn, h_emo
             else:
                 # --- Pre-Normalized RTFM Sieve ---
                 # 1. Calculate unnormalized L2 magnitude of embeddings
@@ -157,12 +161,16 @@ class SpikingMobileNetProjector(nn.Module):
 
         return out
 
-    def forward(self, x, K=None):
+    def forward(self, x, K=None, mask=None):
         if K is not None and K > 1:
-            out = self.extract_features(x, K=K)
-            logits = self.cls_head(out)
-            return logits
+            h_dmn, h_emo = self.extract_features(x, K=K, mask=mask)
+            z_emo, mu, logvar = self.vib(h_emo)
+            logits = self.cls_head(z_emo)
+            if self.use_dann:
+                dann_logits = self.dann_head(h_dmn)
+                return logits, dann_logits, mu, logvar, h_emo, h_dmn
+            return logits, mu, logvar, h_emo, h_dmn
             
-        out = self.extract_features(x, K=K)
+        out = self.extract_features(x, K=K, mask=mask)
         out = self.classifier(out)
         return out
