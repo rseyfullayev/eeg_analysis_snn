@@ -4,6 +4,7 @@ import snntorch as snn
 from .residual_blocks import ConvSpiking
 from .neurons import TimeDistributed, SwiGLU
 import torch.nn.functional as F
+import math
     
 class ClassifierHead(nn.Module):
     def __init__(self, in_features, num_classes, kernel_size=1):
