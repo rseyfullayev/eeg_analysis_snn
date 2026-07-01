@@ -1,0 +1,2 @@
+config/ea_supcon_fda_adamw_lotomasking.yaml
+--checkpoint /home/tempuser2/Documents/saved_models/phase1a/MobileNet_0613_224241_loso1/checkpoint_best.pt --precompute --no_train
