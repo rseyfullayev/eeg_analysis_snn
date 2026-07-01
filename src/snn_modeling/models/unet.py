@@ -86,11 +86,22 @@ class SpikingMobileNetProjector(nn.Module):
             self.vib = VIBLayer(feature_dim)
             self.reranker = WindowReRanker(feature_dim, max_windows=max_windows)
         
-            self.cls_head = nn.Linear(128, num_classes)
+            self.cls_head = nn.Sequential(
+                nn.Linear(feature_dim // 8, feature_dim // 8),
+                nn.SiLU(),
+                nn.Linear(feature_dim // 8, num_classes)
+            )
 
         if self.use_dann:
+            # GRL Adversarial Head on z_emo: Forces emotion latent to contain NO subject information
             self.dann_head = nn.Sequential(
                 GRL(alpha=1.0),
+                nn.Linear(feature_dim // 8, feature_dim // 8),
+                nn.SiLU(),
+                nn.Linear(feature_dim // 8, num_subjects)
+            )
+            # Explicit Subject Classification Head on h_dmn: Explicitly pulls subject variance into h_dmn
+            self.subj_head = nn.Sequential(
                 nn.LayerNorm(feature_dim),
                 nn.Linear(feature_dim, feature_dim // 2),
                 nn.SiLU(),
@@ -167,8 +178,9 @@ class SpikingMobileNetProjector(nn.Module):
             z_emo, mu, logvar = self.vib(h_emo)
             logits = self.cls_head(z_emo)
             if self.use_dann:
-                dann_logits = self.dann_head(h_dmn)
-                return logits, dann_logits, mu, logvar, h_emo, h_dmn
+                dann_logits = self.dann_head(z_emo)  # GRL applied to z_emo
+                subj_logits = self.subj_head(h_dmn)  # No GRL, explicit routing for h_dmn
+                return logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn
             return logits, mu, logvar, h_emo, h_dmn
             
         out = self.extract_features(x, K=K, mask=mask)

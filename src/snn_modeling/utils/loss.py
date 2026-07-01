@@ -598,7 +598,7 @@ class SubjectEraserLoss(nn.Module):
         self.gamma = gamma
         self.dann_weight = dann_weight
 
-    def forward(self, logits, targets_class, mu, logvar, h_emo, h_dmn, dann_logits=None, targets_domain=None):
+    def forward(self, logits, targets_class, mu, logvar, h_emo, h_dmn, dann_logits=None, subj_logits=None, targets_domain=None):
         # 1. Classification Loss
         cls_loss = self.ce(logits, targets_class)
         
@@ -607,22 +607,27 @@ class SubjectEraserLoss(nn.Module):
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
         
         # 3. Orthogonality Loss
-        # Cosine similarity penalty
+        # Soft Frobenius orthogonalization penalty (squared cosine similarity)
         cos_sim = F.cosine_similarity(h_emo, h_dmn, dim=1)
-        ortho_loss = torch.mean(cos_sim.abs())
+        ortho_loss = torch.mean(cos_sim.pow(2))
         
-        # 4. DANN Loss
+        # 4. DANN (Subject Erasure) and Explicit Subject Routing Loss
         dann_loss = 0.0
-        if dann_logits is not None and targets_domain is not None:
+        subj_loss = 0.0
+        if targets_domain is not None:
             valid_mask = targets_domain != -1
             if valid_mask.any():
-                dann_loss = self.ce(dann_logits[valid_mask], targets_domain[valid_mask])
+                if dann_logits is not None:
+                    dann_loss = self.ce(dann_logits[valid_mask], targets_domain[valid_mask])
+                if subj_logits is not None:
+                    subj_loss = self.ce(subj_logits[valid_mask], targets_domain[valid_mask])
                 
-        total_loss = cls_loss + self.beta * kl_loss + self.gamma * ortho_loss + self.dann_weight * dann_loss
+        total_loss = cls_loss + self.beta * kl_loss + self.gamma * ortho_loss + self.dann_weight * dann_loss + subj_loss
         
         return total_loss, {
             'loss_cls': cls_loss.item(),
             'loss_kl': kl_loss.item(),
             'loss_ortho': ortho_loss.item(),
-            'loss_dann': dann_loss.item() if isinstance(dann_loss, torch.Tensor) else dann_loss
+            'loss_dann': dann_loss.item() if isinstance(dann_loss, torch.Tensor) else dann_loss,
+            'loss_subj': subj_loss.item() if isinstance(subj_loss, torch.Tensor) else subj_loss
         }

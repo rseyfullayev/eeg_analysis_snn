@@ -541,6 +541,9 @@ def training_loop(phase,
         train_dann_correct = 0
         train_dann_total = 0
         dann_loss_total = 0.0
+        train_subj_correct = 0
+        train_subj_total = 0
+        subj_loss_total = 0.0
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
             if live_tracker and getattr(live_tracker, 'is_cancelled', False):
@@ -730,7 +733,7 @@ def training_loop(phase,
                     K_bag = inputs.size(1)
                     
                     if getattr(model, 'use_dann', False):
-                        logits, dann_logits, mu, logvar, h_emo, h_dmn = model(inputs, K=K_bag, mask=masks)
+                        logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn = model(inputs, K=K_bag, mask=masks)
                         
                         loss, loss_dict = loss_fn(
                             logits=logits, 
@@ -739,15 +742,22 @@ def training_loop(phase,
                             logvar=logvar, 
                             h_emo=h_emo, 
                             h_dmn=h_dmn, 
-                            dann_logits=dann_logits, 
+                            dann_logits=dann_logits,
+                            subj_logits=subj_logits,
                             targets_domain=subject_labels.squeeze()
                         )
                         
                         valid_mask = subject_labels.squeeze() != -1
                         if valid_mask.any():
+                            # Track DANN head (adversarial) accuracy
                             train_dann_correct += (dann_logits[valid_mask].argmax(dim=1) == subject_labels.squeeze()[valid_mask]).sum().item()
                             train_dann_total += valid_mask.sum().item()
                             dann_loss_total += loss_dict.get('loss_dann', 0) * valid_mask.sum().item()
+                            
+                            # Track Subj head (explicit) accuracy
+                            train_subj_correct += (subj_logits[valid_mask].argmax(dim=1) == subject_labels.squeeze()[valid_mask]).sum().item()
+                            train_subj_total += valid_mask.sum().item()
+                            subj_loss_total += loss_dict.get('loss_subj', 0) * valid_mask.sum().item()
                     else:
                         logits, mu, logvar, h_emo, h_dmn = model(inputs, K=K_bag, mask=masks)
                         loss, loss_dict = loss_fn(
@@ -857,6 +867,44 @@ def training_loop(phase,
         if getattr(model, 'use_dann', False) and train_dann_total > 0:
             epoch_metrics["dann_acc"] = train_dann_correct / max(train_dann_total, 1)
             epoch_metrics["dann_loss"] = dann_loss_total / max(train_dann_total, 1)
+            
+            if train_subj_total > 0:
+                epoch_metrics["subj_acc"] = train_subj_correct / max(train_subj_total, 1)
+                epoch_metrics["subj_loss"] = subj_loss_total / max(train_subj_total, 1)
+
+        # --- WeightWatcher (Empirical Generalization Analysis) ---
+        if epoch % probe_interval == 0 or epoch == epochs - 1:
+            try:
+                import weightwatcher as ww
+                import logging
+                ww_logger = logging.getLogger("weightwatcher")
+                ww_logger.setLevel(logging.CRITICAL)  # Suppress massive spam
+                
+                # 1. Analyze frozen backbone
+                watcher_enc = ww.WeightWatcher(model=model.encoder)
+                details_enc = watcher_enc.analyze(progress=False)
+                if details_enc is not None and not details_enc.empty and 'alpha' in details_enc.columns:
+                    enc_alpha = details_enc['alpha'].mean()
+                    epoch_metrics["ww_alpha_encoder"] = enc_alpha
+                else:
+                    enc_alpha = 0.0
+                
+                # 2. Analyze active (newly trained) heads and layers
+                active_modules = {k: v for k, v in model.named_children() if k != 'encoder'}
+                dummy_active_model = torch.nn.ModuleDict(active_modules)
+                watcher_act = ww.WeightWatcher(model=dummy_active_model)
+                details_act = watcher_act.analyze(progress=False)
+                if details_act is not None and not details_act.empty and 'alpha' in details_act.columns:
+                    act_alpha = details_act['alpha'].mean()
+                    epoch_metrics["ww_alpha_active"] = act_alpha
+                else:
+                    act_alpha = 0.0
+                    
+                print(f"  [WeightWatcher] Encoder Alpha: {enc_alpha:.3f} | Active Heads Alpha: {act_alpha:.3f}")
+            except ImportError:
+                print("  [WeightWatcher] Not installed. Run `pip install weightwatcher` to see layer health metrics.")
+            except Exception as e:
+                print(f"  [WeightWatcher] Analysis skipped: {e}")
 
         # --- Offline Probes (Phase 1A only) ---
         log_loto_metrics = {}
