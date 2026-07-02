@@ -2,8 +2,8 @@ defaults:
   - data: seed_v_ea
   - encoder: analog
   - decoder: spiking        
-  - architecture: phase1a
-  - training: phase1a
+  - architecture: phase1b_swiglu
+  - training: phase1b
   - logger: default
   - _self_
 
