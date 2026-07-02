@@ -51,8 +51,11 @@ class VIBLayer(nn.Module):
         super(VIBLayer, self).__init__()
         self.fc_mu = nn.Linear(in_channels, in_channels//8)
         self.fc_logvar = nn.Linear(in_channels, in_channels//8)
+        nn.init.zeros_(self.fc_logvar.weight)
+        nn.init.constant_(self.fc_logvar.bias, -2.0)
     
     def reparameterize(self, mu, logvar):
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         std = torch.exp(0.5*logvar)
         eps = torch.randn_like(std)
         return mu + eps*std
@@ -91,13 +94,17 @@ class WindowReRanker(nn.Module):
         super(WindowReRanker, self).__init__()
         self.pos_enc = PositionalEncoding(in_channels, feature_dim, max_windows)
         self.scorer = SwiGLU(feature_dim, feature_dim//8, 1, p_drop=0.1)
+        self.temperature = 1.0
+        nn.init.normal_(self.scorer.out.weight, mean=0.0, std=0.02) 
     
     def forward(self, x, mask=None):
         x = self.pos_enc(x)
-        scores = self.scorer(x)
+        scores = self.scorer(x).squeeze(-1)
         if mask is not None:
-            scores = scores.masked_fill(~mask.unsqueeze(-1), float('-inf'))
-        return F.softmax(scores, dim=2)
+            scores = scores.masked_fill(~mask, float('-inf'))
+        attn = F.softmax(scores / self.temperature, dim=1)
+        
+        return attn.unsqueeze(-1)
         
     
 class TemporalViTBlock(nn.Module):

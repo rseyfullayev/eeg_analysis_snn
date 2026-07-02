@@ -750,6 +750,22 @@ def training_loop(phase,
                     # inputs: (B, max_len, C_dim), masks: (B, max_len)
                     K_bag = inputs.size(1)
                     
+                    # 1. Ganin Alpha Schedule (DANN)
+                    current_step = epoch * len(train_loader) + batch_idx
+                    total_steps = epochs * len(train_loader)
+                    p = current_step / total_steps
+                    ganin_alpha = (2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0)
+                    
+                    if getattr(model, 'use_dann', False) and hasattr(model, 'dann_head'):
+                        model.dann_head[0].alpha = ganin_alpha
+                    
+                    # 2. Linear KL Annealing (VIB)
+                    # Anneal beta from 0 to max_beta over the first 30% of training
+                    kl_anneal_steps = int(total_steps * 0.3)
+                    beta_scale = min(1.0, current_step / max(1, kl_anneal_steps))
+                    if hasattr(loss_fn, 'beta') and hasattr(loss_fn, 'max_beta'):
+                        loss_fn.beta = loss_fn.max_beta * beta_scale
+                    
                     if getattr(model, 'use_dann', False):
                         logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn, attn_entropy = model(inputs, K=K_bag, mask=masks)
                         
@@ -791,6 +807,10 @@ def training_loop(phase,
                         )
                         train_emo_correct += (logits.argmax(dim=1) == targets_c.squeeze()).sum().item()
                         train_emo_total += targets_c.size(0)
+                        
+                    # Maximize entropy to prevent MIL collapse (0.1 weighting)
+                    if isinstance(attn_entropy, torch.Tensor):
+                        loss = loss - 0.1 * attn_entropy
                         
                     kl_loss_total += loss_dict.get('loss_kl', 0)
                     ortho_loss_total += loss_dict.get('loss_ortho', 0)
@@ -1170,6 +1190,10 @@ def training_loop(phase,
                 log_dict[f"Phase{phase}/Metrics/WeightWatcher_Active_Alpha"] = epoch_metrics["ww_alpha_active"]
                 
         if getattr(model, 'use_dann', False):
+            if "dann_acc" in epoch_metrics:
+                log_dict[f"Phase{str(phase).upper()}/Train/DANN_Subject_Acc"] = epoch_metrics["dann_acc"]
+            if "dann_loss" in epoch_metrics:
+                log_dict[f"Phase{str(phase).upper()}/Train/DANN_Subject_Loss"] = epoch_metrics["dann_loss"]
             if "subj_acc" in epoch_metrics:
                 log_dict[f"Phase{str(phase).upper()}/Train/Subj_Classification_Acc"] = epoch_metrics["subj_acc"]
             if "subj_loss" in epoch_metrics:

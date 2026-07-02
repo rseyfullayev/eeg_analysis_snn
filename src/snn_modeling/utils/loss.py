@@ -622,7 +622,8 @@ class SubjectEraserLoss(nn.Module):
                 if subj_logits is not None:
                     subj_loss = self.ce(subj_logits[valid_mask], targets_domain[valid_mask])
                 
-        total_loss = cls_loss + self.beta * kl_loss + self.gamma * ortho_loss + self.dann_weight * dann_loss + subj_loss
+        # Gram-Schmidt enforces absolute orthogonality, so gamma penalty is removed to save computation
+        total_loss = cls_loss + self.beta * kl_loss + self.dann_weight * dann_loss + subj_loss
         
         return total_loss, {
             'loss_cls': cls_loss.item(),
