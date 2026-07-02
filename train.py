@@ -67,6 +67,12 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     tp_tot, fp_tot, fn_tot, tn_tot = 0, 0, 0, 0
 
     val_loop = tqdm(val_loader, desc=f"Validation", unit="batch")
+    
+    val_dann_correct = 0
+    val_dann_total = 0
+    val_subj_correct = 0
+    val_subj_total = 0
+    
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loop):
             # Support phase 1b precomputed unpacking
@@ -85,6 +91,13 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
                             dann_logits=dann_logits, subj_logits=subj_logits, targets_domain=subject_idx.squeeze()
                         )
                         loss = loss_tuple[0] if isinstance(loss_tuple, tuple) else loss_tuple
+                        
+                        valid_mask = subject_idx.squeeze() != -1
+                        if valid_mask.any():
+                            val_dann_correct += (dann_logits[valid_mask].argmax(dim=1) == subject_idx.squeeze()[valid_mask]).sum().item()
+                            val_dann_total += valid_mask.sum().item()
+                            val_subj_correct += (subj_logits[valid_mask].argmax(dim=1) == subject_idx.squeeze()[valid_mask]).sum().item()
+                            val_subj_total += valid_mask.sum().item()
                     else:
                         logits, mu, logvar, h_emo, h_dmn, attn_entropy = outputs
                         loss_tuple = criterion(
@@ -175,6 +188,10 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
         balanced_acc = 0
 
     if only_classification:
+        if val_dann_total > 0:
+            val_dann_acc = val_dann_correct / max(val_dann_total, 1)
+            val_subj_acc = val_subj_correct / max(val_subj_total, 1)
+            return avg_loss, accuracy, balanced_acc, 0, 0, 0, 0, val_dann_acc, val_subj_acc
         return avg_loss, accuracy, balanced_acc, 0, 0, 0, 0
     
     eps = 1e-7
@@ -182,7 +199,11 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
     iou_score = tp_tot / (tp_tot + fp_tot + fn_tot + eps)
     precision = tp_tot / (tp_tot + fp_tot + eps)
     recall = tp_tot / (tp_tot + fn_tot + eps)
-
+    if val_dann_total > 0:
+        val_dann_acc = val_dann_correct / max(val_dann_total, 1)
+        val_subj_acc = val_subj_correct / max(val_subj_total, 1)
+        return avg_loss, accuracy, balanced_acc, dice_score, iou_score, precision, recall, val_dann_acc, val_subj_acc
+    
     return avg_loss, accuracy, balanced_acc, dice_score, iou_score, precision, recall
 
 def log_visuals(model, val_loader, device, writer, epoch, threshold=0.5):
@@ -907,7 +928,13 @@ def training_loop(phase,
 
         avg_train_loss = train_loss / len(train_loader)
 
-        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=phase in [1, '1a', '1b'])
+        val_metrics = validate(model, val_loader, loss_fn, device, only_classification=phase in [1, '1a', '1b'])
+        if len(val_metrics) == 9:
+            val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec, val_dann_acc, val_subj_acc = val_metrics
+        else:
+            val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = val_metrics
+            val_dann_acc, val_subj_acc = None, None
+            
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
@@ -931,9 +958,15 @@ def training_loop(phase,
             epoch_metrics["dann_acc"] = train_dann_correct / max(train_dann_total, 1)
             epoch_metrics["dann_loss"] = dann_loss_total / max(train_dann_total, 1)
             
+            if val_dann_acc is not None:
+                epoch_metrics["val_dann_acc"] = val_dann_acc
+            
             if train_subj_total > 0:
                 epoch_metrics["subj_acc"] = train_subj_correct / max(train_subj_total, 1)
                 epoch_metrics["subj_loss"] = subj_loss_total / max(train_subj_total, 1)
+                
+                if val_subj_acc is not None:
+                    epoch_metrics["val_subj_acc"] = val_subj_acc
 
         # --- WeightWatcher (Empirical Generalization Analysis) ---
         if epoch % probe_interval == 0 or epoch == epochs - 1:
@@ -1198,6 +1231,11 @@ def training_loop(phase,
                 log_dict[f"Phase{str(phase).upper()}/Train/Subj_Classification_Acc"] = epoch_metrics["subj_acc"]
             if "subj_loss" in epoch_metrics:
                 log_dict[f"Phase{str(phase).upper()}/Train/Subj_Classification_Loss"] = epoch_metrics["subj_loss"]
+                
+            if "val_dann_acc" in epoch_metrics:
+                log_dict[f"Phase{str(phase).upper()}/Val/DANN_Subject_Acc"] = epoch_metrics["val_dann_acc"]
+            if "val_subj_acc" in epoch_metrics:
+                log_dict[f"Phase{str(phase).upper()}/Val/Subj_Classification_Acc"] = epoch_metrics["val_subj_acc"]
 
         wandb.log(log_dict, step=epoch)
 
