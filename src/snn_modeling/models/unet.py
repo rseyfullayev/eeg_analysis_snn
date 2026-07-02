@@ -153,7 +153,7 @@ class SpikingMobileNetProjector(nn.Module):
 
                 # Gram-Schmidt Orthogonalization
                 proj = (torch.sum(h_emo * h_dmn, dim=1, keepdim=True) / (torch.sum(h_dmn * h_dmn, dim=1, keepdim=True) + 1e-8)) * h_dmn
-                h_emo -= proj
+                h_emo = h_emo - proj
                 return h_dmn, h_emo
             else:
                 # --- Pre-Normalized RTFM Sieve ---

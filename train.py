@@ -882,7 +882,7 @@ def training_loop(phase,
                 
                 # 1. Analyze frozen backbone
                 watcher_enc = ww.WeightWatcher(model=model.encoder)
-                details_enc = watcher_enc.analyze(progress=False)
+                details_enc = watcher_enc.analyze()
                 if details_enc is not None and not details_enc.empty and 'alpha' in details_enc.columns:
                     enc_alpha = details_enc['alpha'].mean()
                     epoch_metrics["ww_alpha_encoder"] = enc_alpha
