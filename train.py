@@ -78,7 +78,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
                 outputs = model(inputs, K=K_bag, mask=masks)
                 if isinstance(outputs, tuple):
                     if getattr(model, 'use_dann', False):
-                        logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn = outputs
+                        logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn, attn_entropy = outputs
                         loss_tuple = criterion(
                             logits=logits, targets_class=labels.squeeze(), 
                             mu=mu, logvar=logvar, h_emo=h_emo, h_dmn=h_dmn,
@@ -86,7 +86,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
                         )
                         loss = loss_tuple[0] if isinstance(loss_tuple, tuple) else loss_tuple
                     else:
-                        logits, mu, logvar, h_emo, h_dmn = outputs
+                        logits, mu, logvar, h_emo, h_dmn, attn_entropy = outputs
                         loss_tuple = criterion(
                             logits=logits, targets_class=labels.squeeze(), 
                             mu=mu, logvar=logvar, h_emo=h_emo, h_dmn=h_dmn
