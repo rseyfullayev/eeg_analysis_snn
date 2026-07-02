@@ -1390,6 +1390,29 @@ def phase_one_b(config, model, device, train_loader, val_loader, writer, checkpo
 
     if isinstance(model, SpikingMobileNetProjector):
         enc_class = model
+        
+        # Inject DANN heads if Hydra config omitted them but loss config requires them
+        if config.loss.get('use_dann', False) and not getattr(enc_class, 'use_dann', False):
+            import torch.nn as nn
+            from src.snn_modeling.models.unet import GRL
+            
+            print(f"Force-enabling DANN heads for {num_dynamic_subjects} subjects based on config!")
+            enc_class.use_dann = True
+            enc_class.num_subjects = num_dynamic_subjects
+            
+            enc_class.dann_head = nn.Sequential(
+                GRL(alpha=1.0),
+                nn.Linear(enc_class.feature_dim // 8, enc_class.feature_dim // 8),
+                nn.SiLU(),
+                nn.Linear(enc_class.feature_dim // 8, enc_class.num_subjects)
+            ).to(device)
+            
+            enc_class.subj_head = nn.Sequential(
+                nn.LayerNorm(enc_class.feature_dim),
+                nn.Linear(enc_class.feature_dim, enc_class.feature_dim // 2),
+                nn.SiLU(),
+                nn.Linear(enc_class.feature_dim // 2, enc_class.num_subjects)
+            ).to(device)
     else:
         enc_class = SpikingMobileNetProjector(
             encoder_backbone = model.encoder,
