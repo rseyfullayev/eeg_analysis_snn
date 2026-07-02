@@ -1155,6 +1155,26 @@ def training_loop(phase,
             else:
                 print(f"Best Result yet: {best_acc:.4f}")
 
+        # Inject all dynamic custom metrics from epoch_metrics into log_dict for W&B
+        log_dict[f"Phase{phase}/Train/Emotion_Accuracy"] = epoch_metrics.get("train_acc", 0.0)
+        
+        if phase == '1b':
+            log_dict[f"Phase{phase}/Train/Loss_KL"] = epoch_metrics.get("kl_loss", 0.0)
+            log_dict[f"Phase{phase}/Train/Loss_Ortho"] = epoch_metrics.get("ortho_loss", 0.0)
+            log_dict[f"Phase{phase}/Train/Loss_Classification"] = epoch_metrics.get("cls_loss", 0.0)
+            log_dict[f"Phase{phase}/Train/Attention_Entropy"] = epoch_metrics.get("attn_entropy", 0.0)
+            
+            if "ww_alpha_encoder" in epoch_metrics:
+                log_dict[f"Phase{phase}/Metrics/WeightWatcher_Encoder_Alpha"] = epoch_metrics["ww_alpha_encoder"]
+            if "ww_alpha_active" in epoch_metrics:
+                log_dict[f"Phase{phase}/Metrics/WeightWatcher_Active_Alpha"] = epoch_metrics["ww_alpha_active"]
+                
+        if getattr(model, 'use_dann', False):
+            if "subj_acc" in epoch_metrics:
+                log_dict[f"Phase{str(phase).upper()}/Train/Subj_Classification_Acc"] = epoch_metrics["subj_acc"]
+            if "subj_loss" in epoch_metrics:
+                log_dict[f"Phase{str(phase).upper()}/Train/Subj_Classification_Loss"] = epoch_metrics["subj_loss"]
+
         wandb.log(log_dict, step=epoch)
 
         # Live Tracker: epoch summary (after all metrics computed)
