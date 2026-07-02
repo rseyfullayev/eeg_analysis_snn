@@ -79,6 +79,7 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
             if len(batch) == 9: # Precomputed Phase 1b validation batch
                 inputs, targets, labels, subject_idx, bag_id, video_id, timestamp_data, masks, lengths = batch
                 inputs, targets, labels, masks = inputs.to(device), targets.to(device), labels.to(device), masks.to(device)
+                subject_idx = subject_idx.to(device)
                 
                 K_bag = inputs.size(1)
                 outputs = model(inputs, K=K_bag, mask=masks)
