@@ -841,7 +841,13 @@ def training_loop(phase,
                 del q_inputs, k_inputs, key_features, queue_features, queue_labels, queue_ages, q_video_ids, q_timestamps
             else:
                 del inputs
-            del targets_c, outputs, loss
+            del targets_c, loss
+            if 'outputs' in locals():
+                del outputs
+            if 'logits' in locals():
+                del logits
+            if 'h_emo' in locals():
+                del h_emo, h_dmn, mu, logvar
 
         # Periodic memory cleanup after each epoch
         if torch.cuda.is_available():
