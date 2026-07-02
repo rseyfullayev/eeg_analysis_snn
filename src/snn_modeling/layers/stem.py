@@ -74,14 +74,16 @@ class PositionalEncoding(nn.Module):
         base = math.ceil(max_windows/(2*math.pi))
         pe = torch.zeros(1, max_windows, d_model)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(base) / d_model))
-        pe[:, :, 0::2] = torch.sin(torch.arange(max_windows) * div_term)
-        pe[:, :, 1::2] = torch.cos(torch.arange(max_windows) * div_term)
+        position = torch.arange(max_windows).unsqueeze(1)
+        pe[:, :, 0::2] = torch.sin(position * div_term)
+        pe[:, :, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
         
     
     def forward(self, x):
-        num_windows = x.size(2)
-        return x + self.pe[:, :num_windows, :] 
+        # x shape: [Batch, Windows, Channels]
+        num_windows = x.size(1)
+        return x + self.pe[:, :num_windows, :]
 
 
 class WindowReRanker(nn.Module):

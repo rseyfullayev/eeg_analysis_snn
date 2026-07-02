@@ -71,7 +71,7 @@ class SpikingMobileNetProjector(nn.Module):
                  num_classes=5, feature_dim=256, 
                  use_swiglu=False, use_batchnorm=False, 
                  use_dann=False, num_subjects=15,
-                 max_windows=400):
+                 max_windows=1000):
         super().__init__()
 
         self.encoder = encoder_backbone 
