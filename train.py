@@ -77,12 +77,21 @@ def validate(model, val_loader, criterion, device, threshold=0.5, only_classific
                 K_bag = inputs.size(1)
                 outputs = model(inputs, K=K_bag, mask=masks)
                 if isinstance(outputs, tuple):
-                    logits = outputs[0]
-                    # Compute SubjectEraserLoss if criterion supports it, else fake it
-                    try:
-                        loss, _ = criterion(logits, labels.squeeze(), outputs[2], outputs[3], outputs[4], outputs[5])
-                    except:
-                        loss = torch.tensor(0.0) # Fallback if criterion doesn't match
+                    if getattr(model, 'use_dann', False):
+                        logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn = outputs
+                        loss_tuple = criterion(
+                            logits=logits, targets_class=labels.squeeze(), 
+                            mu=mu, logvar=logvar, h_emo=h_emo, h_dmn=h_dmn,
+                            dann_logits=dann_logits, subj_logits=subj_logits, targets_domain=subject_idx.squeeze()
+                        )
+                        loss = loss_tuple[0] if isinstance(loss_tuple, tuple) else loss_tuple
+                    else:
+                        logits, mu, logvar, h_emo, h_dmn = outputs
+                        loss_tuple = criterion(
+                            logits=logits, targets_class=labels.squeeze(), 
+                            mu=mu, logvar=logvar, h_emo=h_emo, h_dmn=h_dmn
+                        )
+                        loss = loss_tuple[0] if isinstance(loss_tuple, tuple) else loss_tuple
                 else:
                     logits = outputs
                     loss = criterion(logits, labels.squeeze())
@@ -540,10 +549,19 @@ def training_loop(phase,
         train_linear_total = 0
         train_dann_correct = 0
         train_dann_total = 0
-        dann_loss_total = 0.0
         train_subj_correct = 0
         train_subj_total = 0
+        dann_loss_total = 0.0
         subj_loss_total = 0.0
+        
+        train_emo_correct = 0
+        train_emo_total = 0
+        
+        kl_loss_total = 0.0
+        ortho_loss_total = 0.0
+        cls_loss_total = 0.0
+        attn_entropy_total = 0.0
+
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
             if live_tracker and getattr(live_tracker, 'is_cancelled', False):
@@ -733,7 +751,7 @@ def training_loop(phase,
                     K_bag = inputs.size(1)
                     
                     if getattr(model, 'use_dann', False):
-                        logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn = model(inputs, K=K_bag, mask=masks)
+                        logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn, attn_entropy = model(inputs, K=K_bag, mask=masks)
                         
                         loss, loss_dict = loss_fn(
                             logits=logits, 
@@ -747,6 +765,9 @@ def training_loop(phase,
                             targets_domain=subject_labels.squeeze()
                         )
                         
+                        train_emo_correct += (logits.argmax(dim=1) == targets_c.squeeze()).sum().item()
+                        train_emo_total += targets_c.size(0)
+                        
                         valid_mask = subject_labels.squeeze() != -1
                         if valid_mask.any():
                             # Track DANN head (adversarial) accuracy
@@ -759,7 +780,7 @@ def training_loop(phase,
                             train_subj_total += valid_mask.sum().item()
                             subj_loss_total += loss_dict.get('loss_subj', 0) * valid_mask.sum().item()
                     else:
-                        logits, mu, logvar, h_emo, h_dmn = model(inputs, K=K_bag, mask=masks)
+                        logits, mu, logvar, h_emo, h_dmn, attn_entropy = model(inputs, K=K_bag, mask=masks)
                         loss, loss_dict = loss_fn(
                             logits=logits, 
                             targets_class=targets_c.squeeze(), 
@@ -768,6 +789,13 @@ def training_loop(phase,
                             h_emo=h_emo, 
                             h_dmn=h_dmn
                         )
+                        train_emo_correct += (logits.argmax(dim=1) == targets_c.squeeze()).sum().item()
+                        train_emo_total += targets_c.size(0)
+                        
+                    kl_loss_total += loss_dict.get('loss_kl', 0)
+                    ortho_loss_total += loss_dict.get('loss_ortho', 0)
+                    cls_loss_total += loss_dict.get('loss_cls', 0)
+                    attn_entropy_total += attn_entropy.item() if isinstance(attn_entropy, torch.Tensor) else 0
                 else:
                     # Check if using bag-level 6D inputs: [B, K, T, C, H, W]
                     K_bag = None
@@ -847,7 +875,7 @@ def training_loop(phase,
             if 'logits' in locals():
                 del logits
             if 'h_emo' in locals():
-                del h_emo, h_dmn, mu, logvar
+                del h_emo, h_dmn, mu, logvar, attn_entropy
 
         # Periodic memory cleanup after each epoch
         if torch.cuda.is_available():
@@ -866,10 +894,19 @@ def training_loop(phase,
         # --- Live Tracker: epoch summary ---
         epoch_metrics = {
             "train_loss": avg_train_loss,
+            "train_acc": train_emo_correct / max(train_emo_total, 1),
             "val_loss": val_loss,
+            "val_acc": val_acc,
             "val_bal_acc": val_bal_acc,
+            "val_dice": val_dice,
             "lr": current_lr,
         }
+        if phase == '1b':
+            epoch_metrics["kl_loss"] = kl_loss_total / len(train_loader)
+            epoch_metrics["ortho_loss"] = ortho_loss_total / len(train_loader)
+            epoch_metrics["cls_loss"] = cls_loss_total / len(train_loader)
+            epoch_metrics["attn_entropy"] = attn_entropy_total / len(train_loader)
+
         if getattr(model, 'use_dann', False) and train_dann_total > 0:
             epoch_metrics["dann_acc"] = train_dann_correct / max(train_dann_total, 1)
             epoch_metrics["dann_loss"] = dann_loss_total / max(train_dann_total, 1)
@@ -899,7 +936,7 @@ def training_loop(phase,
                 active_modules = {k: v for k, v in model.named_children() if k != 'encoder'}
                 dummy_active_model = torch.nn.ModuleDict(active_modules)
                 watcher_act = ww.WeightWatcher(model=dummy_active_model)
-                details_act = watcher_act.analyze(progress=False)
+                details_act = watcher_act.analyze()
                 if details_act is not None and not details_act.empty and 'alpha' in details_act.columns:
                     act_alpha = details_act['alpha'].mean()
                     epoch_metrics["ww_alpha_active"] = act_alpha

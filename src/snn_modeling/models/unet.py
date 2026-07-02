@@ -154,7 +154,10 @@ class SpikingMobileNetProjector(nn.Module):
                 # Gram-Schmidt Orthogonalization
                 proj = (torch.sum(h_emo * h_dmn, dim=1, keepdim=True) / (torch.sum(h_dmn * h_dmn, dim=1, keepdim=True) + 1e-8)) * h_dmn
                 h_emo = h_emo - proj
-                return h_dmn, h_emo
+                
+                # Attention Entropy: -sum(p * log(p))
+                attn_entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
+                return h_dmn, h_emo, attn_entropy
             else:
                 # --- Pre-Normalized RTFM Sieve ---
                 # 1. Calculate unnormalized L2 magnitude of embeddings
@@ -174,14 +177,15 @@ class SpikingMobileNetProjector(nn.Module):
 
     def forward(self, x, K=None, mask=None):
         if K is not None and K > 1:
-            h_dmn, h_emo = self.extract_features(x, K=K, mask=mask)
+            h_dmn, h_emo, attn_entropy = self.extract_features(x, K=K, mask=mask)
+            
             z_emo, mu, logvar = self.vib(h_emo)
             logits = self.cls_head(z_emo)
             if self.use_dann:
                 dann_logits = self.dann_head(z_emo)  # GRL applied to z_emo
                 subj_logits = self.subj_head(h_dmn)  # No GRL, explicit routing for h_dmn
-                return logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn
-            return logits, mu, logvar, h_emo, h_dmn
+                return logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn, attn_entropy
+            return logits, mu, logvar, h_emo, h_dmn, attn_entropy
             
         out = self.extract_features(x, K=K, mask=mask)
         out = self.classifier(out)
