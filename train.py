@@ -1174,7 +1174,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         loss_fn = ContrastiveLoss(
             train_loader.dataset.prototypes,
             temperature=con_temp,
-            iic_enabled=iic_enabled,
+            iic_enabled=use_scda,
             iic_intra_weight=iic_intra_weight,
             iic_inter_weight=iic_inter_weight,
             decoupled=decoupled,
