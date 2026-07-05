@@ -87,18 +87,18 @@ class SpikingMobileNetProjector(nn.Module):
             self.reranker = WindowReRanker(feature_dim, max_windows=max_windows)
         
             self.cls_head = nn.Sequential(
-                nn.Linear(feature_dim // 8, feature_dim // 8),
+                nn.Linear(feature_dim // 4, feature_dim // 4),
                 nn.SiLU(),
-                nn.Linear(feature_dim // 8, num_classes)
+                nn.Linear(feature_dim // 4, num_classes)
             )
 
         if self.use_dann:
             # GRL Adversarial Head on z_emo: Forces emotion latent to contain NO subject information
             self.dann_head = nn.Sequential(
                 GRL(alpha=1.0),
-                nn.Linear(feature_dim // 8, feature_dim // 8),
+                nn.Linear(feature_dim // 4, feature_dim // 4),
                 nn.SiLU(),
-                nn.Linear(feature_dim // 8, num_subjects)
+                nn.Linear(feature_dim // 4, num_subjects)
             )
             # Explicit Subject Classification Head on h_dmn: Explicitly pulls subject variance into h_dmn
             self.subj_head = nn.Sequential(
