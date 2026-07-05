@@ -181,8 +181,9 @@ class SpikingMobileNetProjector(nn.Module):
             
             z_emo, mu, logvar = self.vib(h_emo)
             logits = self.cls_head(z_emo)
+            print(z_emo.shape)
             if self.use_dann:
-                print(z_emo.shape)
+                
                 dann_logits = self.dann_head(z_emo)  # GRL applied to z_emo
                 subj_logits = self.subj_head(h_dmn)  # No GRL, explicit routing for h_dmn
                 return logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn, attn_entropy
