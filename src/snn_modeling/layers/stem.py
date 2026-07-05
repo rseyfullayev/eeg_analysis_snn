@@ -49,9 +49,9 @@ class ProjectionHead(nn.Module):
 class VIBLayer(nn.Module):
     def __init__(self, in_channels):
         super(VIBLayer, self).__init__()
-        self.fc_mu = nn.Linear(in_channels, in_channels//8)
-        self.fc_logvar = nn.Linear(in_channels, in_channels//8)
-        nn.init.zeros_(self.fc_logvar.weight)
+        self.fc_mu = nn.Linear(in_channels, in_channels//4)
+        self.fc_logvar = nn.Linear(in_channels, in_channels//4)
+        nn.init.normal_(self.fc_logvar.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.fc_logvar.bias, -2.0)
     
     def reparameterize(self, mu, logvar):
@@ -93,7 +93,7 @@ class WindowReRanker(nn.Module):
     def __init__(self, in_channels, feature_dim=256, max_windows=400):
         super(WindowReRanker, self).__init__()
         self.pos_enc = PositionalEncoding(in_channels, feature_dim, max_windows)
-        self.scorer = SwiGLU(feature_dim, feature_dim//8, 1, p_drop=0.1)
+        self.scorer = SwiGLU(feature_dim, feature_dim//2, 1, p_drop=0.1)
         self.temperature = 1.0
         nn.init.normal_(self.scorer.out.weight, mean=0.0, std=0.02) 
     
