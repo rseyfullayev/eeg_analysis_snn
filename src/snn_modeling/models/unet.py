@@ -84,6 +84,9 @@ class SpikingMobileNetProjector(nn.Module):
         
         # --- SwiGLU MIL Attention Heads (Optional) ---
         if self.use_swiglu:
+            self.ln_emo = nn.LayerNorm(feature_dim)
+            self.ln_dmn = nn.LayerNorm(feature_dim)
+            
             if self.use_vib:
                 self.vib = VIBLayer(feature_dim)
                 cls_in_dim = feature_dim // 4
@@ -93,7 +96,6 @@ class SpikingMobileNetProjector(nn.Module):
             self.reranker = WindowReRanker(feature_dim, max_windows=max_windows)
         
             self.cls_head = nn.Sequential(
-                nn.LayerNorm(cls_in_dim),
                 nn.Linear(cls_in_dim, cls_in_dim),
                 nn.SiLU(),
                 nn.Linear(cls_in_dim, num_classes)
@@ -189,8 +191,14 @@ class SpikingMobileNetProjector(nn.Module):
         if K is not None and K > 1:
             h_dmn, h_emo, attn_entropy = self.extract_features(x, K=K, mask=mask)
             
-            if self.use_swiglu and getattr(self, 'use_vib', True):
-                z_emo, mu, logvar = self.vib(h_emo)
+            if self.use_swiglu:
+                h_emo = self.ln_emo(h_emo)
+                h_dmn = self.ln_dmn(h_dmn)
+                
+                if getattr(self, 'use_vib', True):
+                    z_emo, mu, logvar = self.vib(h_emo)
+                else:
+                    z_emo, mu, logvar = h_emo, None, None
             else:
                 z_emo, mu, logvar = h_emo, None, None
                 
