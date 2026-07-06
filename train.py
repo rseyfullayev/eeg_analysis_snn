@@ -830,9 +830,9 @@ def training_loop(phase,
                         train_emo_correct += (logits.argmax(dim=1) == targets_c.squeeze()).sum().item()
                         train_emo_total += targets_c.size(0)
                         
-                    # Maximize entropy to prevent MIL collapse (0.1 weighting)
+                    # Minimize entropy to encourage sharp, discriminative attention bursts (0.1 weighting)
                     if isinstance(attn_entropy, torch.Tensor):
-                        loss = loss - 0.1 * attn_entropy
+                        loss = loss + 0.1 * attn_entropy
                         
                     kl_loss_total += loss_dict.get('loss_kl', 0)
                     ortho_loss_total += loss_dict.get('loss_ortho', 0)
