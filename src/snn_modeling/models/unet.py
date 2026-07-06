@@ -70,43 +70,51 @@ class SpikingMobileNetProjector(nn.Module):
     def __init__(self, encoder_backbone, 
                  num_classes=5, feature_dim=256, 
                  use_swiglu=False, use_batchnorm=False, 
-                 use_dann=False, num_subjects=15,
+                 use_dann=False, use_vib=True, use_subj=True, num_subjects=15,
                  max_windows=1000):
         super().__init__()
-
-        self.encoder = encoder_backbone 
-        self.num_classes = num_classes
+        self.encoder = encoder_backbone
         self.feature_dim = feature_dim
+        self.num_classes = num_classes
         self.use_swiglu = use_swiglu
         self.use_dann = use_dann
+        self.use_vib = use_vib
+        self.use_subj = use_subj
         self.num_subjects = num_subjects
         
         # --- SwiGLU MIL Attention Heads (Optional) ---
         if self.use_swiglu:
-            self.vib = VIBLayer(feature_dim)
+            if self.use_vib:
+                self.vib = VIBLayer(feature_dim)
+                cls_in_dim = feature_dim // 4
+            else:
+                cls_in_dim = feature_dim
+            
             self.reranker = WindowReRanker(feature_dim, max_windows=max_windows)
         
             self.cls_head = nn.Sequential(
-                nn.Linear(feature_dim // 4, feature_dim // 4),
+                nn.Linear(cls_in_dim, cls_in_dim),
                 nn.SiLU(),
-                nn.Linear(feature_dim // 4, num_classes)
+                nn.Linear(cls_in_dim, num_classes)
             )
 
         if self.use_dann:
             # GRL Adversarial Head on z_emo: Forces emotion latent to contain NO subject information
             self.dann_head = nn.Sequential(
                 GRL(alpha=1.0),
-                nn.Linear(feature_dim // 4, feature_dim // 4),
+                nn.Linear(cls_in_dim if self.use_swiglu else feature_dim, cls_in_dim if self.use_swiglu else feature_dim),
                 nn.SiLU(),
-                nn.Linear(feature_dim // 4, num_subjects)
+                nn.Linear(cls_in_dim if self.use_swiglu else feature_dim, num_subjects)
             )
-            # Explicit Subject Classification Head on h_dmn: Explicitly pulls subject variance into h_dmn
-            self.subj_head = nn.Sequential(
-                nn.LayerNorm(feature_dim),
-                nn.Linear(feature_dim, feature_dim // 2),
-                nn.SiLU(),
-                nn.Linear(feature_dim // 2, num_subjects)
-            )
+            
+            if self.use_subj:
+                # Explicit Subject Classification Head on h_dmn: Explicitly pulls subject variance into h_dmn
+                self.subj_head = nn.Sequential(
+                    nn.LayerNorm(feature_dim),
+                    nn.Linear(feature_dim, feature_dim // 2),
+                    nn.SiLU(),
+                    nn.Linear(feature_dim // 2, num_subjects)
+                )
         
         # Auto-detect if encoder uses batchnorm to sync the ProjectionHead
         has_bn = any(isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) for m in self.encoder.modules())
@@ -153,7 +161,8 @@ class SpikingMobileNetProjector(nn.Module):
 
                 # Gram-Schmidt Orthogonalization
                 proj = (torch.sum(h_emo * h_dmn, dim=1, keepdim=True) / (torch.sum(h_dmn * h_dmn, dim=1, keepdim=True) + 1e-8)) * h_dmn
-                h_emo = h_emo - proj
+                if self.use_subj:
+                    h_emo = h_emo - proj
                 
                 # Attention Entropy: -sum(p * log(p))
                 attn_entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()
@@ -179,13 +188,21 @@ class SpikingMobileNetProjector(nn.Module):
         if K is not None and K > 1:
             h_dmn, h_emo, attn_entropy = self.extract_features(x, K=K, mask=mask)
             
-            z_emo, mu, logvar = self.vib(h_emo)
-            logits = self.cls_head(z_emo)
-            print(z_emo.shape)
-            if self.use_dann:
+            if self.use_swiglu and getattr(self, 'use_vib', True):
+                z_emo, mu, logvar = self.vib(h_emo)
+            else:
+                z_emo, mu, logvar = h_emo, None, None
                 
+            logits = self.cls_head(z_emo)
+            
+            if self.use_dann:
                 dann_logits = self.dann_head(z_emo)  # GRL applied to z_emo
-                subj_logits = self.subj_head(h_dmn)  # No GRL, explicit routing for h_dmn
+                
+                if getattr(self, 'use_subj', True):
+                    subj_logits = self.subj_head(h_dmn)  # No GRL, explicit routing for h_dmn
+                else:
+                    subj_logits = None
+                    
                 return logits, dann_logits, subj_logits, mu, logvar, h_emo, h_dmn, attn_entropy
             return logits, mu, logvar, h_emo, h_dmn, attn_entropy
             

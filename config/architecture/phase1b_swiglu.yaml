@@ -3,3 +3,5 @@ num_classes: ${data.n_emotions}
 use_swiglu: true # Uses SwiGLU Attention Heads
 encoder_backbone: ${encoder}
 use_dann: ${loss.use_dann}
+use_vib: ${loss.use_vib}
+use_subj: ${loss.use_subj}

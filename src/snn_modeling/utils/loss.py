@@ -604,12 +604,18 @@ class SubjectEraserLoss(nn.Module):
         
         # 2. VIB KL Divergence Loss
         # KL(N(mu, sigma^2) || N(0, 1)) = -0.5 * sum(1 + logvar - mu^2 - sigma^2)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+        if mu is not None and logvar is not None:
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+        else:
+            kl_loss = torch.tensor(0.0, device=logits.device)
         
         # 3. Orthogonality Loss
         # Soft Frobenius orthogonalization penalty (squared cosine similarity)
-        cos_sim = F.cosine_similarity(h_emo, h_dmn, dim=1)
-        ortho_loss = torch.mean(cos_sim.pow(2))
+        if self.gamma > 0.0:
+            cos_sim = F.cosine_similarity(h_emo, h_dmn, dim=1)
+            ortho_loss = torch.mean(cos_sim.pow(2))
+        else:
+            ortho_loss = torch.tensor(0.0, device=logits.device)
         
         # 4. DANN (Subject Erasure) and Explicit Subject Routing Loss
         dann_loss = 0.0
@@ -622,13 +628,12 @@ class SubjectEraserLoss(nn.Module):
                 if subj_logits is not None:
                     subj_loss = self.ce(subj_logits[valid_mask], targets_domain[valid_mask])
                 
-        # Gram-Schmidt enforces absolute orthogonality, so gamma penalty is removed to save computation
-        total_loss = cls_loss + self.beta * kl_loss + self.dann_weight * dann_loss + subj_loss
+        total_loss = cls_loss + self.beta * kl_loss + self.gamma * ortho_loss + self.dann_weight * dann_loss + subj_loss
         
         return total_loss, {
             'loss_cls': cls_loss.item(),
-            'loss_kl': kl_loss.item(),
-            'loss_ortho': ortho_loss.item(),
+            'loss_kl': kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+            'loss_ortho': ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else ortho_loss,
             'loss_dann': dann_loss.item() if isinstance(dann_loss, torch.Tensor) else dann_loss,
             'loss_subj': subj_loss.item() if isinstance(subj_loss, torch.Tensor) else subj_loss
         }
