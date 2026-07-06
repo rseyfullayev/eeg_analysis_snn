@@ -86,7 +86,10 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         # x shape: [Batch, Windows, Channels]
         num_windows = x.size(1)
-        return x + self.pe[:, :num_windows, :]
+        # Scale x by sqrt(d_model) so normalized features aren't overwhelmed by PE
+        d_model = x.size(-1)
+        x_scaled = x * math.sqrt(d_model)
+        return x_scaled + self.pe[:, :num_windows, :].to(x.device)
 
 
 class WindowReRanker(nn.Module):

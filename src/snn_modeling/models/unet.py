@@ -93,6 +93,7 @@ class SpikingMobileNetProjector(nn.Module):
             self.reranker = WindowReRanker(feature_dim, max_windows=max_windows)
         
             self.cls_head = nn.Sequential(
+                nn.LayerNorm(cls_in_dim),
                 nn.Linear(cls_in_dim, cls_in_dim),
                 nn.SiLU(),
                 nn.Linear(cls_in_dim, num_classes)
