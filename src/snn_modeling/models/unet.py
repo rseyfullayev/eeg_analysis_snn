@@ -162,10 +162,8 @@ class SpikingMobileNetProjector(nn.Module):
                 inv_weights = inv_weights / (inv_weights.sum(dim=1, keepdim=True) + 1e-8)
                 h_dmn = torch.sum(out * inv_weights, dim=1)
 
-                # Gram-Schmidt Orthogonalization
-                proj = (torch.sum(h_emo * h_dmn, dim=1, keepdim=True) / (torch.sum(h_dmn * h_dmn, dim=1, keepdim=True) + 1e-8)) * h_dmn
-                if self.use_subj:
-                    h_emo = h_emo - proj
+                # Soft orthogonalization is handled by gamma_ortho in loss.py
+                # Removing hard Gram-Schmidt because it causes annihilation when attention is uniform
                 
                 # Attention Entropy: -sum(p * log(p))
                 attn_entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=1).mean()

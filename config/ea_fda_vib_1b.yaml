@@ -55,7 +55,7 @@ loss:
   use_dann: true
   dann_weight: 1.0
   dann_alpha: 1.0
-  beta_vib: 0.05
+  beta_vib: 0.001
   gamma_ortho: 0.1
   use_mmd: false
   lambda_mmd: 0.1
