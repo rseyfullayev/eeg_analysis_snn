@@ -34,7 +34,14 @@ echo "Starting auto-runner. Monitoring branch: $BRANCH..."
 
 while true; do
     git fetch origin > /dev/null 2>&1
-    git reset --hard origin/$BRANCH > /dev/null 2>&1
+
+    # CI policy (audit §6): fast-forward is the only silent update path. If local
+    # history diverged, fall back to hard-reset WITH a loud warning — the poller
+    # must keep running, but divergence must never pass unnoticed.
+    if ! git merge --ff-only origin/$BRANCH > /dev/null 2>&1; then
+        echo "$(date): WARNING: local history diverged from origin/$BRANCH — CI fallback: hard reset (uncommitted/diverged lab work will be lost). Investigate."
+        git reset --hard origin/$BRANCH > /dev/null 2>&1
+    fi
 
     CURRENT_COMMIT=$(git rev-parse HEAD)
 
@@ -90,7 +97,7 @@ while true; do
 
             echo "  Executing python commands from VENV file..."
 
-            PYTHON_ARGS = $(sed -n '1p' VENV)
+            PYTHON_ARGS=$(sed -n '1p' VENV)
             echo "  Args:     $PYTHON_ARGS"
             # Launch in background
             (

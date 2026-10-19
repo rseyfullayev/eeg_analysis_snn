@@ -11,9 +11,8 @@ from test import test
 
 from src.snn_modeling.models.unet import SpikingMobileNetProjector
 from src.snn_modeling.utils.model_builder import build_model
-from src.snn_modeling.utils.utils import run_bio_audit, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject, generate_masks, calibrate_params
+from src.snn_modeling.utils.utils import run_bio_audit, calculate_optimal_firing_rate, analyze_distribution, seed_everything, generate_topology_proof, find_representative_subject, generate_masks
 from src.snn_modeling.dataloader.dataset import SWEEPDataset
-from src.snn_modeling.utils.loss import FullHybridLoss
 
 from torch.utils.data import DataLoader
 
@@ -26,7 +25,7 @@ def main():
     parser.add_argument('--loso', type=int, help='The integer ID of the subject to hold out for testing (1-16).')
     parser.add_argument('--subj', type=int, help='The integer ID of the subject (1-16).')
 
-    parser.add_argument('--phase', type=str, help='Specify training phase (1a, 1b, 2, 3, or 4)')
+    parser.add_argument('--phase', type=str, help="Specify training phase ('1a'; legacy 1b/2/3 were retired in Stage 0 tranche 2)")
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
     parser.add_argument('--val', action='store_true', help='Validation mode')
     parser.add_argument('--test', action='store_true', help='Test mode: extract embeddings and generate UMAP')
@@ -55,8 +54,12 @@ def main():
     if args.resume and args.checkpoint is None:
         parser.error("When using --resume, you MUST specify --checkpoint.")
     
-    if args.loso and args.subj:
+    if args.loso is not None and args.subj is not None:
         parser.error("You CANNOT specify both --loso and --subj at the same time.")
+
+    for _name, _val in (('loso', args.loso), ('subj', args.subj)):
+        if _val is not None and not (1 <= _val <= 16):
+            parser.error(f"--{_name} must be a SEED-V subject id in 1..16, got {_val}.")
     
     # We now use true Hydra resolution so we can combine folders (dataset/, model/) dynamically!
     import sys
@@ -192,38 +195,9 @@ def main():
         run_bio_audit(config, device=torch.device('cuda'), samples=300)
 
     elif args.calibrate:
-        if args.phase != '2':
-            parser.error("You MUST specify phase 2 for calibration (either config or CLI).")
-        if args.checkpoint is None:
-            parser.error("You MUST specify --checkpoint for calibration.")
-
-        
-        model = build_model(config).to(device)
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        print(f"Loaded checkpoint from {args.checkpoint}.")
-        chk = {k[8:]:v for k,v in checkpoint['model_state_dict'].items() if 'encoder' in k}
-        model.encoder.load_state_dict(chk)
-
-        masks = torch.load(os.path.join(config.data.dataset_path,'masks.pt')).to(device)
-        val_set = SWEEPDataset(
-                                config, 
-                                split='val',
-                                experiment=False,
-                                loso=args.loso,
-                                subj=args.subj,
-                                prototypes=masks
-                                )
-        
-        val_loader = DataLoader(val_set, 
-                            batch_size=config.training.batch_size, 
-                            shuffle=False, 
-                            num_workers=config.data.get('num_workers', 0),
-                            prefetch_factor=4,
-                            persistent_workers=True,
-                            pin_memory=True)
-        
-        
-        calibrate_params(model.encoder, val_loader, device)
+        parser.error("--calibrate was retired in Stage 0 tranche 2: calibrate_params() computed "
+                     "thresholds but never wrote them into the encoder (audit B25). SNN "
+                     "calibration returns with the ST-KD stage.")
     
     elif args.calculate_stat:
         dataset = SWEEPDataset(
@@ -283,21 +257,12 @@ def main():
                             pin_memory=True)
         print(f"Validation set size: {len(val_set)} samples.")
 
-        loss_fn = FullHybridLoss(
-        smooth = 0.0,
-        lambda_seg = config.loss.get('lambda_seg', 1.0),
-        lambda_con = 0.0,
-        lambda_class = config.loss.get('lambda_class', 1.0),
-        alpha = config.loss.get('alpha', 0.5),
-        beta = config.loss.get('beta', 0.5),
-        time_steps=config.data.get('num_timesteps', 16),
-        )
+        if args.phase not in ('1', '1a'):
+            parser.error("--val supports phase 1/1a only (1b/2/3 retired in Stage 0 tranche 2; "
+                         "see REVIEW_SMC_AUDIT.md §5/§8).")
+        loss_fn = nn.CrossEntropyLoss()
 
-        loss_fn.class_loss.masks = val_loader.dataset.prototypes
-
-        if args.phase in ['1', '1a', '1b']: loss_fn = nn.CrossEntropyLoss()
-
-        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=args.phase in ['1', '1a', '1b'])
+        val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(model, val_loader, loss_fn, device, only_classification=True)
         if args.phase in ['1', '1a', '1b']:
             print(f"Phase {args.phase} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         else:

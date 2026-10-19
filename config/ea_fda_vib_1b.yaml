@@ -53,7 +53,7 @@ loss:
   beta: 0.7
   exclude_same_trial: true  # Make contrastive formulation adhere strictly to Leave-One-Trial-Out by filtering exact same video negatives
   use_dann: true
-  dann_weight: 1.0
+  dann_weight: 0.1
   dann_alpha: 1.0
   beta_vib: 0.001
   gamma_ortho: 0.1

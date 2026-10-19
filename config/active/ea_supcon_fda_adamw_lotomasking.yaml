@@ -60,3 +60,40 @@ loss:
   lambda_mmd: 0.1
   cosface_margin: 0.0 # Not using cosface loss
 
+  # ---- Stage 6: assembled SMC objective (Eq. 23). loss.sm present + enabled=true
+  #      switches Phase 1A from the legacy SupMoCoLoss path to SMCLossEngine
+  #      (train.py); every approved standard default is config-exposed here. ----
+  sm:
+    enabled: true
+    feature_dim: 256            # backbone embedding dim (128 projection head is ablation-only, §11.4i)
+    num_subjects: 15            # S for NullspaceState (SEED-V LOSO fold = 15 train subjects)
+    n_q: 4096                   # §9.6; validated against sizing_* + run budget at init (loud)
+    queue_momentum: 0.9         # §9.4 staleness input (ring write-through is exact, no decay)
+    anchor_on: projected        # §11.4i ablation: projected | raw
+    tau_dcl: 0.1
+    tau_norm: 0.25              # §11.4i ball floor
+    rank_energy_band: 0.85      # §11.4ii dynamic spectral rank (0.85–0.90)
+    warmup_epochs: 2            # §11.4ii: U=0 while the queue populates
+    space_momentum: 0.9         # NullspaceState EMA tables
+    sigma_sq: 1.0               # baseline Gaussian scale (Rm 4.2)
+    rho_min: 0.02
+    seed: {s: 2.0}              # §9.5 burst spread; seed.log_coeff defaults to feature_dim
+    seed_batches: 96            # Option-B pre-pass cap over train_loader (raw window norms)
+    seed_min_windows: 256       # per class before seeding (starved seed = hard error)
+    anneal: {t_start: 20.0, t_end: 1.0, frac: 0.3}   # deterministic annealing, Eq. 6
+    sinkhorn: {tol: 1.0e-3, T_sc: 30, n_iters: 5000, solver_tol: 1.0e-10}
+    eps_max: 1.0                # Thm 12.2 upper end; eps resolves to interval midpoint at seeding (set `eps` to pin)
+    c: 0.5                      # B5(iii): 0.05 <= c <= c_max < 1 enforced at build
+    g_floor: 0.1
+    lambda_anc: 1.0             # Eq. 23 anchor weight (0.0 = §13 row-1 evidence run only)
+    lambda_sub: 1.0             # Eq. 23 subject-residual weight
+    lambda_rho: 0.1             # Eq. 23 sparsity weight
+    force_balanced: false       # §13 row-2 switch: pinned tau_y -> balanced-OT pathology (evidence only)
+    gate_ema_momentum: 0.9      # OTCoefficient carry weight (§8.3 ratio smoothing)
+    # §9.6 floor / §9.4 staleness init-gate constants (must stay consistent with n_q/B/budget):
+    sizing_C_const: 1.0
+    sizing_d_eff: 64.0
+    sizing_tol: 0.5
+    sizing_eps_tol: 20000.0
+    sizing_L: 1.0
+

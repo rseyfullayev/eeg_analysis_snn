@@ -4,11 +4,13 @@ import json
 import numpy as np
 from torch.utils.data import Dataset
 import torch.nn as nn
-import pandas as pd     
+import pandas as pd
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from torch.utils.data.sampler import Sampler
 import random
 import collections
+
+from ..utils.features import load_bag_payload
 
 class TopoMapper(nn.Module):
     def __init__(self, sensor_coords_df, grid_size=64, perplexity=5.0, device='cuda'):  # t-SNE binary search with perplexity
@@ -143,7 +145,9 @@ class TopoMapper(nn.Module):
         return self.transform(tensor)
 
 class SWEEPDataset(Dataset):
-    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None, precomputed=False):
+    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None, precomputed=False, subject_map=None):
+        # subject_map arg is retained for call-site compatibility only; the mapping
+        # is now always built index-wide (audit B7). See self.subject_map below.
         self.precomputed = precomputed
         self.config = config
         self.split = split
@@ -180,7 +184,10 @@ class SWEEPDataset(Dataset):
             df_val = df[df['filename'].str.split('_').str[0] == str(loso)]
     
 
-        if split == 'train':
+        if split == 'all':
+            print(f"Selecting ALL windows ({len(df)}) — every subject (feature generation / diagnostics)")
+            df_slice = df
+        elif split == 'train':
             print(f"Selecting TRAINING set ({len(df_train)} windows)")
             df_slice = df_train 
         elif split == 'val':
@@ -202,14 +209,11 @@ class SWEEPDataset(Dataset):
                 # Maintain chronological order of files (s0, s1, s2, ...)
                 # Ensure proper string/int casting for consistent sorting if needed, but for now we expect the filenames to be chronological or we can just list them
                 files = group_df['filename'].tolist()
-                try:
-                    subject_idx = int(str(files[0]).split('_')[0])
-                except Exception:
-                    subject_idx = -1
-                # Parse video_id (= bag_id) and timestamps from filenames
+                subject_idx = int(str(files[0]).split('_')[0])
+                # Parse video_id (= bag_id). Window IDs are computed per SELECTED window
+                # in __getitem__ (strided subsampling makes an init-time full list wrong).
                 video_id = int(bag_id)
-                timestamps = [self._parse_timestamp(f) for f in files]
-                self.samples.append((bag_id, files, emotion_idx, subject_idx, video_id, timestamps))
+                self.samples.append((bag_id, files, emotion_idx, subject_idx, video_id, None))
 
             print(f"[{split.upper()}] Initialized with {len(self.samples)} Bags (Total Windows: {len(df_slice)})")
         else:
@@ -217,10 +221,7 @@ class SWEEPDataset(Dataset):
                 emotion_idx = row['emotion_id']
                 files = [row['filename']]
                 bag_id = row.get('bag_id', f"no_bag_{idx}")
-                try:
-                    subject_idx = int(str(files[0]).split('_')[0])
-                except Exception:
-                    subject_idx = -1
+                subject_idx = int(str(files[0]).split('_')[0])
                 # Parse video_id (= bag_id) and timestamp from filename
                 video_id = int(bag_id) if str(bag_id).isdigit() else -1
                 timestamp = self._parse_timestamp(files[0])
@@ -236,15 +237,12 @@ class SWEEPDataset(Dataset):
                     # Skip if already cached
                     if fname in self.cache: continue
                     file_path = os.path.join(self.samples_dir, fname)
-                    try:
-                        # Use weights_only=True for security, map_location='cpu' to avoid GPU memory
-                        # Use half precision to reduce RAM by 50% if acceptable
-                        video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-                        # Share memory for multiprocessing efficiency
-                        video.share_memory_()
-                        self.cache[fname] = video
-                    except Exception as e:
-                        print(f"Error loading {fname}: {e}")
+                    # Fail loud on unreadable windows — a missing window is a data
+                    # desync, not a condition to paper over with zeros (audit §3.5).
+                    video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+                    # Share memory for multiprocessing efficiency
+                    video.share_memory_()
+                    self.cache[fname] = video
             print("Cache complete!")
 
 
@@ -255,10 +253,12 @@ class SWEEPDataset(Dataset):
         else:
             self.prototypes = self.compute_prototypes(self.num_classes, self.grid_size, radius, sigma, device='cpu')
             
-        # Create contiguous mapping for subject IDs (important for DANN with LOSO)
-        unique_subjects = sorted(list(set([s[3] for s in self.samples if s[3] != -1])))
-        self.subject_map = {old: new for new, old in enumerate(unique_subjects)}
-        self.subject_map[-1] = -1  # Fallback
+        # Contiguous subject-ID map over EVERY subject in the index (both splits), so
+        # train and val always share one label space and the held-out subject maps to a
+        # real slot instead of the old -1 sentinel that silently killed val subject
+        # metrics (audit B7). sorted() => deterministic across runs.
+        all_subjects = sorted({int(str(f).split('_')[0]) for f in df['filename'].tolist()})
+        self.subject_map = {old: new for new, old in enumerate(all_subjects)}
     
     @staticmethod
     def _parse_timestamp(filename):
@@ -294,8 +294,9 @@ class SWEEPDataset(Dataset):
     def __getitem__(self, idx):
         bag_id, files, label_idx, subject_idx, video_id, timestamp_data = self.samples[idx]
         
-        # Map subject_idx to contiguous range
-        subject_idx = self.subject_map.get(subject_idx, -1)
+        # Map subject_idx to the index-wide contiguous slot (KeyError = unparsable
+        # filename prefix: loud, never a silent -1)
+        subject_idx = self.subject_map[subject_idx]
 
         # We keep the single prototype map for the whole bag
         target_map = torch.zeros((self.grid_size, self.grid_size), dtype=torch.long)
@@ -303,13 +304,13 @@ class SWEEPDataset(Dataset):
 
         if self.precomputed:
             file_path = os.path.join(self.samples_dir, "precomputed_features", f"bag_{bag_id}.pt")
-            try:
-                bag_video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-            except Exception as e:
-                print(f"Error loading {file_path}: {e}")
-                bag_video = torch.zeros(1, 256) # Fallback shape
-            
-            return bag_video, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(
+                    f"Missing precomputed bag artifact for bag_id={bag_id}: {file_path}. "
+                    "Regenerate: python precompute_features.py --config <cfg> --checkpoint <phase1A ckpt>")
+            payload = load_bag_payload(file_path)  # v2 schema-validated; legacy files raise
+            return (payload['z'], target_map, label_idx, subject_idx, bag_id, video_id,
+                    payload['window_ids'].tolist())
 
         # 1. Stratified Strided Sampling (Binning).
         # We divide the trial into 'bag_size_limit' equal temporal bins,
@@ -328,17 +329,20 @@ class SWEEPDataset(Dataset):
             selected_files = files
         
         loaded_tensors = []
+        window_ids = [self._parse_timestamp(f) for f in selected_files]
         for fname in selected_files:
             file_path = os.path.join(self.samples_dir, fname)
             if self.preload:
-                video = self.cache[fname] 
+                video = self.cache[fname]
             else:
-                try:
-                    video = torch.load(file_path, weights_only=True, map_location='cpu').float()
-                except Exception as e:
-                    print(f"Error loading {fname}: {e}")
-                    # Zero tensor fallback for missing window
-                    video = torch.zeros(5, 32, 32, 32)
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(
+                        f"Missing window file {file_path} (bag {bag_id}) — dataset/index desynced")
+                video = torch.load(file_path, weights_only=True, map_location='cpu').float()
+                if video.dim() != 4:
+                    raise ValueError(
+                        f"Unexpected window layout in {file_path}: shape {tuple(video.shape)} "
+                        "(expected 4D (T, C, H, Wg))")
             loaded_tensors.append(video)
 
         # Stack into [K, C, H, W, T] (or your specific shape)
@@ -351,6 +355,7 @@ class SWEEPDataset(Dataset):
             pad_shape[0] = pad_size
             padding = torch.zeros(pad_shape, dtype=bag_video.dtype, device=bag_video.device)
             bag_video = torch.cat([bag_video, padding], dim=0)
+            window_ids = window_ids + [-1] * pad_size  # -1 = pad slot, never a real window id
             
         elif not self.bagging:
             # If bagging is turned off, drop the K dimension
@@ -362,9 +367,9 @@ class SWEEPDataset(Dataset):
             # Note: you may need to apply augmentations over the batch dimension K safely
             video1 = self.augmentations(bag_video)
             video2 = self.augmentations(bag_video)
-            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, timestamp_data
+            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, window_ids
 
-        return bag_video, target_map, label_idx, bag_id, video_id, timestamp_data
+        return bag_video, target_map, label_idx, bag_id, video_id, window_ids
 
 def collate_precomputed(batch):
     """
@@ -411,7 +416,10 @@ class PKSampler(Sampler):
         
         self.labels = torch.tensor(self.labels).long()
         self.subjects = torch.tensor(self.subjects).long()
-        self.label_set = list(set(self.labels.numpy()))
+        # sorted() => deterministic class iteration order across processes/runs
+        # (raw set() iteration order is the exact nondeterminism class that produced
+        # the PROJECT_STATE 85%/49% probe artifact).
+        self.label_set = sorted({int(x) for x in self.labels.numpy()})
         self.subject_diverse_k = subject_diverse_k
         
         self.label_to_indices = {label: np.where(self.labels.numpy() == label)[0]
@@ -453,11 +461,15 @@ class PKSampler(Sampler):
                 )
             
         self.batch_size = self.n_samples_per_class * self.n_classes
+        if self.batch_size != batch_size:
+            print(f"PKSampler: requested batch_size={batch_size} -> effective batch_size={self.batch_size} "
+                  f"({self.n_samples_per_class}/class x {self.n_classes} classes)")
         self.dataset_len = len(dataset)
 
     def __iter__(self):
         self.count = 0
-        while self.count + self.batch_size < self.dataset_len:
+        # <= : consume a final batch when it fits exactly (strict < silently dropped one)
+        while self.count + self.batch_size <= self.dataset_len:
             classes = np.random.choice(self.label_set, self.n_classes, replace=False)
             indices = []
             

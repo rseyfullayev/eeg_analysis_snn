@@ -239,9 +239,10 @@ def compute_subject_variance_map(dataset, max_samples_per_subject=200, device='c
         donor_ffts.append((subj_id, centroid))
     
     if len(centroids) < 2:
-        print("[FourierMixup] Warning: fewer than 2 subjects found, returning uniform variance map.")
-        shape = centroids[0].shape if centroids else (16, 32, 32)
-        return torch.ones(shape), shape, donor_ffts
+        raise RuntimeError(
+            f"[FourierMixup] Only {len(centroids)} subject centroid(s) found in the scanned split — "
+            "a donor pool of >= 2 subjects is required; refusing to fabricate a uniform variance "
+            "map and continue (audit B19).")
         
     centroids = torch.stack(centroids)
     # Variance of the magnitudes for optimal sigma search
@@ -315,6 +316,10 @@ class FourierMixup(nn.Module):
         donor_fft_val = self.donor_pool[donor_idx]
         
         lam = torch.distributions.Beta(self.beta_alpha, self.beta_alpha).sample().item()
+        if x.dim() != 4:
+            raise ValueError(
+                f"FourierMixup expects a 4D (T,C,H,W) window, got {x.dim()}D {tuple(x.shape)}. "
+                "Bagged 5D/6D inputs are unsupported by this augmentation (1A runs bagging=False).")
         orig_shape = x.shape
         frames = x.permute(1, 0, 2, 3)
         
@@ -335,13 +340,29 @@ def build_fourier_mixup(dataset, retention_ratio=0.95, p=0.5, beta_alpha=1.0,
                         max_samples_per_subject=200, device='cuda',
                         cache_dir=None, loso_id=None):
     import os
-    if cache_dir is None: cache_dir = getattr(dataset, 'samples_dir', None) or '.'
-    cache_key = f"loso{loso_id}_ret{retention_ratio:.2f}" if loso_id is not None else f"ret{retention_ratio:.2f}"
+    import hashlib
+    if cache_dir is None:
+        cache_dir = getattr(dataset, 'samples_dir', None)
+        if cache_dir is None:
+            raise RuntimeError(
+                "build_fourier_mixup: no cache_dir given and dataset has no samples_dir — "
+                "refusing the silent '.' CWD fallback (audit B19).")
+    # Cache key is content-hashed over the dataset index so a rebuilt dataset can
+    # never reuse a stale variance map (audit B19).
+    index_file = os.path.join(dataset.samples_dir, 'index.csv')
+    if not os.path.exists(index_file):
+        raise FileNotFoundError(
+            f"build_fourier_mixup: index not found at {index_file}; cache keys must be tied "
+            "to dataset contents to avoid stale-cache reuse.")
+    with open(index_file, 'rb') as f:
+        digest = hashlib.md5(f.read()).hexdigest()[:12]
+    loso_tag = f"loso{loso_id}" if loso_id is not None else "losoAll"
+    cache_key = f"{digest}_{loso_tag}_ret{retention_ratio:.2f}"
     cache_path = os.path.join(cache_dir, f"fourier_mixup_cache_complex_3d_{cache_key}.pt")
     
     if os.path.exists(cache_path):
         print(f"[FourierMixup] Loading cached σ from {cache_path}")
-        cached = torch.load(cache_path, weights_only=False)
+        cached = torch.load(cache_path, weights_only=True)
         sigma = cached['sigma'].item()
         shape = tuple(cached['shape'].tolist())
         donor_ids = cached.get('donor_subject_ids', [])

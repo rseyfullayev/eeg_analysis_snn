@@ -1,102 +1,9 @@
 import torch
 import torch.nn as nn
-from segmentation_models_pytorch.losses import TverskyLoss, FocalLoss
 import segmentation_models_pytorch as smp
 import torch.nn.functional as F
 
 
-
-class FiringRateRegularizer:
-    def __init__(self, model, target_rate=0.05, lambda_reg=0.1):
-        self.target_rate = target_rate
-        self.lambda_reg = lambda_reg
-        self.layer_outputs = {}
-        self.hooks = []
-        self._register_hooks(model)
-
-    def _register_hooks(self, model):
-        def get_activation(name):
-            def hook(model, input, output):
-                # DO NOT DETACH. We need the gradient history.
-                if isinstance(output, torch.Tensor):
-                    self.layer_outputs[name] = output
- 
-            return hook
-
-        for name, layer in model.named_modules():
-            if "ALIF" in str(type(layer)): 
-                if hasattr(layer, 'return_mem') and layer.return_mem:
-                    continue
-                self.hooks.append(layer.register_forward_hook(get_activation(name)))
-
-    def compute_tax(self):
-        reg_loss = 0
-        count = 0
-        for _, spikes in self.layer_outputs.items():
-            firing_rate = torch.mean(spikes) 
-            reg_loss += (firing_rate - self.target_rate) ** 2
-            count += 1
-
-        self.layer_outputs = {} 
-        
-        if count == 0: return torch.tensor(0.0, device=spikes.device)
-        return self.lambda_reg * (reg_loss / count)
-
-    def remove_hooks(self):
-        for h in self.hooks:
-            h.remove()
-
-
-class TopKClassificationLoss(nn.Module):
-    def __init__(self, k_percent=0.05):
-        super(TopKClassificationLoss, self).__init__()
-        self.cross_entropy = nn.CrossEntropyLoss()
-        self.k_percent = k_percent
-        self.scale = nn.Parameter(torch.tensor(5.0))
-
-    def forward(self, inputs, targets_class):
-        B, C, H, W = inputs.shape
-        flat_inputs = inputs.view(B, C, -1)
-        
-        k = max(1, int(H * W * self.k_percent))
-
-        top_k_values, _ = torch.topk(flat_inputs, k, dim=2)
-        peak_logits = torch.mean(top_k_values, dim=2)
-        safe_scale = F.softplus(self.scale)
-        peak_logits_scaled = peak_logits * safe_scale
-
-        loss = self.cross_entropy(peak_logits_scaled, targets_class)
-
-        return loss
-    
-class GSPLoss(nn.Module):
-    def __init__(self, num_classes=5, device='cuda'):
-        super(GSPLoss, self).__init__()
-        self.num_classes = num_classes
-        self._masks = None
-        self.ce = nn.CrossEntropyLoss()
-        self.device = device
-        self.scale = nn.Parameter(torch.tensor(0.1)) 
-
-    
-    @property
-    def masks(self):
-        return self._masks
-    
-    @masks.setter
-    def masks(self, value):
-        self._masks = value.unsqueeze(0).to(self.device)
-    
-    def forward(self, inputs, targets_class):
-        B, _, H, W = inputs.shape
-        msk_act = inputs * self.masks
-        gsp = msk_act.sum(dim=(2, 3))
-        safe_scale = F.softplus(self.scale)
-        logits = gsp * safe_scale
-        loss = self.ce(logits, targets_class)
-        return loss
-    
-     
 
 class ContrastiveLoss(nn.Module):
 
@@ -139,7 +46,6 @@ class ContrastiveLoss(nn.Module):
         Returns:
             dice_matrix: (C, C) tensor of pairwise Dice scores.
         """
-        print(prototypes.shape)
         C = prototypes.shape[0]
         binary = (prototypes > threshold).long()  # (C, H, W)
 
@@ -208,14 +114,17 @@ class ContrastiveLoss(nn.Module):
         exp_logits = torch.exp(logits) * denom_weights
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
         
-        # Mean log-likelihood over positives
+        # Mean log-likelihood over positives. A fully ghosted batch is a masking/data
+        # bug, not a training step — raise instead of emitting a silent zero loss
+        # (audit §3.5 row 8; interiority guarantees this cannot fire on healthy data).
         valid_anchors = pos_weights.sum(1) > 0
         if not valid_anchors.any():
-            loss = torch.tensor(0.0, device=device, requires_grad=True)
-        else:
-            pos_weight_sum = pos_weights[valid_anchors].sum(1)
-            mean_log_prob_pos = (pos_weights[valid_anchors] * log_prob[valid_anchors]).sum(1) / pos_weight_sum
-            loss = -mean_log_prob_pos.mean()
+            raise RuntimeError(
+                f"ContrastiveLoss: no anchor retains a positive (raw pos pairs={mask.sum().item()}, "
+                f"batch={batch_size}). Check LOTO masking / labels; refusing zero-loss step.")
+        pos_weight_sum = pos_weights[valid_anchors].sum(1)
+        mean_log_prob_pos = (pos_weights[valid_anchors] * log_prob[valid_anchors]).sum(1) / pos_weight_sum
+        loss = -mean_log_prob_pos.mean()
         
         current_epoch = getattr(self, 'current_epoch', 0)
         step_count = getattr(self, 'step_count', 0)
@@ -420,11 +329,14 @@ class SupMoCoLoss(ContrastiveLoss):
 
         valid_anchors = pos_weights.sum(dim=1) > 0
         if not valid_anchors.any():
-            loss_val = torch.tensor(0.0, device=device, requires_grad=True)
-        else:
-            pos_weight_sum = pos_weights[valid_anchors].sum(dim=1)
-            mean_log_prob_pos = (pos_weights[valid_anchors] * pos_log_prob[valid_anchors]).sum(dim=1) / pos_weight_sum
-            loss_val = -mean_log_prob_pos.mean()
+            raise RuntimeError(
+                f"SupMoCoLoss: every anchor lost all cross-trial positives "
+                f"(pos pairs={pos_mask.sum().item()}, batch={q.shape[0]}, "
+                f"candidates={all_features.shape[0]}). Check LOTO masking / queue video ids; "
+                "refusing zero-loss step.")
+        pos_weight_sum = pos_weights[valid_anchors].sum(dim=1)
+        mean_log_prob_pos = (pos_weights[valid_anchors] * pos_log_prob[valid_anchors]).sum(dim=1) / pos_weight_sum
+        loss_val = -mean_log_prob_pos.mean()
         
         current_epoch = getattr(self, 'current_epoch', 0)
         step_count = getattr(self, 'step_count', 0)
@@ -462,178 +374,3 @@ class SupMoCoLoss(ContrastiveLoss):
                 
         self.step_count = step_count + 1
         return loss_val
-
-
-class FullHybridLoss(nn.Module):
-    def __init__(self,
-                 time_steps=16,
-                 smooth=0., 
-                 lambda_seg=1., 
-                 lambda_con=1., 
-                 lambda_class=0.1, 
-                 alpha=0.5, 
-                 beta=0.5):
-        super().__init__()
-
-        self.con_loss =  nn.BCEWithLogitsLoss() #ContrastiveLoss()
-        self.dice_loss = TverskyLoss(mode="multiclass", 
-                                     smooth=smooth, 
-                                     from_logits=True, 
-                                     alpha=alpha, 
-                                     beta=beta,
-                                     ignore_index=0)
-        self.class_loss = FocalLoss(mode="multiclass", 
-                                    alpha=0.25, 
-                                    gamma=2.) #GSPLoss() #TopKClassificationLoss()
-        self.lambda_class = lambda_class
-        self.lambda_seg = lambda_seg
-        self.lambda_con = lambda_con
-        self.time_steps = time_steps
-    
-    def add_fire_rate_loss(self, model, lambda_fire=0.1, target_rate=0.05):
-        self.fire_loss = FiringRateRegularizer(model, target_rate=target_rate, lambda_reg=lambda_fire)
-
-    def forward(self, inputs, targets_mask, targets_class):
-        segmentation_loss, classification_loss, con_loss = 0, 0, 0
-        if type(inputs) is tuple:
-            inputs, embedding = inputs
-
-        if self.lambda_seg > 0:
-            segmentation_loss = self.dice_loss(inputs, targets_mask)
-        if self.lambda_class > 0:
-            classification_loss = self.class_loss(inputs, targets_mask) #targets_class)
-        if self.lambda_con > 0:
-            #con_loss = self.con_loss(embedding, targets_class.repeat_interleave(self.time_steps))
-            con_loss = self.con_loss(inputs, targets_mask)
-        
-
-        total_loss = self.lambda_seg * segmentation_loss + self.lambda_class * classification_loss + self.lambda_con * con_loss
-        
-        if hasattr(self, 'fire_loss'):
-            tax_loss = self.fire_loss.compute_tax()
-            total_loss += tax_loss
-        
-        return total_loss
-
-class MultiKernelMMDLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def compute_median_distance(self, features):
-        """Compute median pairwise distance across all features for dynamic bandwidth."""
-        with torch.no_grad():
-            distances = torch.cdist(features, features, p=2.0)
-            upper_tri_indices = torch.triu_indices(distances.size(0), distances.size(1), offset=1)
-            pairwise_dists = distances[upper_tri_indices[0], upper_tri_indices[1]]
-            if pairwise_dists.numel() == 0:
-                return 1.0 # fallback
-            median_dist = torch.median(pairwise_dists).item()
-            return median_dist if median_dist > 1e-5 else 1.0
-
-    def forward(self, features, domain_labels, class_labels=None):
-        """Calculates Multi-Kernel MMD across all pairs of domains natively present in the batch."""
-
-        features = F.normalize(features, dim=1) # L2 Normalization ensuring that Dual Loss lives in same hypersphere
-
-        # Safety: bail out if features are degenerate (NaN/Inf from collapse or overflow)
-        if not torch.isfinite(features).all():
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-
-        unique_domains = torch.unique(domain_labels)
-        if len(unique_domains) < 2:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-
-        sigma_median = self.compute_median_distance(features)
-        bandwidths = [sigma_median / 4.0, sigma_median / 2.0, sigma_median, sigma_median * 2.0, sigma_median * 4.0]
-
-        # Precompute kernel matrix across ALL features once for efficiency
-        dist_sq = torch.cdist(features, features, p=2.0).pow(2)
-        kernel_matrix = torch.zeros_like(dist_sq)
-        for sigma in bandwidths:
-            gamma = 1.0 / (2 * (sigma ** 2))
-            kernel_matrix += torch.exp(-gamma * dist_sq)
-            
-        B = features.size(0)
-        max_class = class_labels.max()+1
-        group_ids = domain_labels * max_class + class_labels
-        
-        unique_groups, inverse_indices = torch.unique(group_ids, return_inverse=True)
-        G = unique_groups.size(0)
-
-        if G<2:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-        
-        H = F.one_hot(inverse_indices, num_classes=G).to(features.dtype)
-
-        group_counts = H.sum(dim=0)
-        H_norm = H / torch.clamp(group_counts, min=1.0).unsqueeze(0)
-
-        K_groups = torch.mm(torch.mm(H_norm.t(), kernel_matrix), H_norm)
-
-        group_domains = unique_groups // max_class
-        group_classes = unique_groups % max_class
-
-        same_class = (group_classes.unsqueeze(1) == group_classes.unsqueeze(0)).float()
-        diff_domain = (group_domains.unsqueeze(1) != group_domains.unsqueeze(0)).float()
-
-        valid_pairs = torch.triu(same_class * diff_domain, diagonal=1)
-        
-        K_self = torch.diag(K_groups)
-        MMD_matrix = K_self.unsqueeze(1) + K_self.unsqueeze(0) - 2.0*K_groups
-        num_pairs = valid_pairs.sum()
-
-        if num_pairs>0:
-            mmd_loss = (MMD_matrix * valid_pairs).sum() / num_pairs
-        else:
-            mmd_loss = torch.tensor(0.0, device=features.device, requires_grad=True)
-        
-        return mmd_loss
-
-class SubjectEraserLoss(nn.Module):
-    def __init__(self, beta=1e-3, gamma=0.1, dann_weight=1.0):
-        super(SubjectEraserLoss, self).__init__()
-        self.ce = nn.CrossEntropyLoss()
-        self.beta = beta
-        self.max_beta = beta
-        self.gamma = gamma
-        self.dann_weight = dann_weight
-
-    def forward(self, logits, targets_class, mu, logvar, h_emo, h_dmn, dann_logits=None, subj_logits=None, targets_domain=None):
-        # 1. Classification Loss
-        cls_loss = self.ce(logits, targets_class)
-        
-        # 2. VIB KL Divergence Loss
-        # KL(N(mu, sigma^2) || N(0, 1)) = -0.5 * sum(1 + logvar - mu^2 - sigma^2)
-        if mu is not None and logvar is not None:
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
-        else:
-            kl_loss = torch.tensor(0.0, device=logits.device)
-        
-        # 3. Orthogonality Loss
-        # Soft Frobenius orthogonalization penalty (squared cosine similarity)
-        if self.gamma > 0.0:
-            cos_sim = F.cosine_similarity(h_emo, h_dmn, dim=1)
-            ortho_loss = torch.mean(cos_sim.pow(2))
-        else:
-            ortho_loss = torch.tensor(0.0, device=logits.device)
-        
-        # 4. DANN (Subject Erasure) and Explicit Subject Routing Loss
-        dann_loss = 0.0
-        subj_loss = 0.0
-        if targets_domain is not None:
-            valid_mask = targets_domain != -1
-            if valid_mask.any():
-                if dann_logits is not None:
-                    dann_loss = self.ce(dann_logits[valid_mask], targets_domain[valid_mask])
-                if subj_logits is not None:
-                    subj_loss = self.ce(subj_logits[valid_mask], targets_domain[valid_mask])
-                
-        total_loss = cls_loss + self.beta * kl_loss + self.gamma * ortho_loss + self.dann_weight * dann_loss + subj_loss
-        
-        return total_loss, {
-            'loss_cls': cls_loss.item(),
-            'loss_kl': kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
-            'loss_ortho': ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else ortho_loss,
-            'loss_dann': dann_loss.item() if isinstance(dann_loss, torch.Tensor) else dann_loss,
-            'loss_subj': subj_loss.item() if isinstance(subj_loss, torch.Tensor) else subj_loss
-        }
