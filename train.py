@@ -319,10 +319,23 @@ def training_loop(phase,
                   accumulation_steps=1,
                   best_train_loss=float('inf'),
                   probe_interval=5,
+                  use_bf16=True,
+                  moco_momentum_end=None,
+                  moco_warmup_steps=0,
                   live_tracker=None):
 
     # Phase 1A trackers (best_train_loss injectable for honest resume — B15)
     best_linear_acc = 0.0
+
+    # MoCo EMA-momentum ramp: 0.9 -> 0.99 linearly over the SMC warmup window,
+    # then hold moco_momentum_end (matches the §11.4ii U=0 warmup gate so the key
+    # encoder moves slowest exactly when U starts earning rank). No end -> constant.
+    def _ema_momentum(global_step):
+        if moco_momentum_end is None or moco_warmup_steps <= 0:
+            return moco_momentum
+        frac = min(1.0, global_step / float(moco_warmup_steps))
+        return moco_momentum + (moco_momentum_end - moco_momentum) * frac
+
 
     # NaN/Inf monitor with diagnostic reasoning
     if live_tracker is None:
@@ -335,6 +348,11 @@ def training_loop(phase,
     # B3(iii) early-stop series (§11.5 / certification.alpha_identity_escape):
     # per-epoch intra-trial Stdt(alpha) + anneal-floor flags (SMC runs only).
     smc_std_series, smc_anneal_series = [], []
+
+    # Optimizer-step counter for the EMA-momentum ramp; seeded from start_epoch so a
+    # resumed run continues the 0.9->0.99 schedule instead of restarting it.
+    opt_steps = int(start_epoch) * max(1, len(train_loader))
+
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -355,6 +373,8 @@ def training_loop(phase,
         train_emo_correct = 0
         train_emo_total = 0
         last_smc_diag = None
+        epoch_ema_m = moco_momentum  # last EMA-momentum used this epoch (for logging)
+
 
         train_loop = tqdm(train_loader, desc=f"Phase {phase} Epoch {epoch+1}/{epochs}", unit="batch")
         for batch_idx, batch in enumerate(train_loop):
@@ -400,32 +420,44 @@ def training_loop(phase,
                 q_inputs, B, K_bag = _prepare_view(q_inputs)
                 k_inputs, _, _ = _prepare_view(k_inputs)
 
-                # Extract backbone features, then project for contrastive loss
-                backbone_feats = model.extract_features(q_inputs, K=K_bag)
-                if K_bag is not None and backbone_feats.shape[0] == B * K_bag:
-                    backbone_feats = backbone_feats.view(B, K_bag, *backbone_feats.shape[1:]).mean(dim=1)
-                outputs = model.classifier(backbone_feats)
+                # bf16 autocast wraps ONLY the encoder + head forward. The SMC
+                # objective (L2-normalize, queue, SVD, DCL logsumexp, Sinkhorn
+                # exp(-C/eps), bkl logs, lockpass) runs in fp32 once this `with`
+                # block exits. No GradScaler — bf16 has fp32's exponent range,
+                # so the fp32 master weights update directly.
+                amp_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                         enabled=(use_bf16 and device.type == 'cuda'))
+                with amp_ctx:
+                    # Extract backbone features, then project for contrastive loss
+                    backbone_feats = model.extract_features(q_inputs, K=K_bag)
+                    if K_bag is not None and backbone_feats.shape[0] == B * K_bag:
+                        backbone_feats = backbone_feats.view(B, K_bag, *backbone_feats.shape[1:]).mean(dim=1)
+                    outputs = model.classifier(backbone_feats)
+
+                    with torch.no_grad():
+                        if smc_engine is not None:
+                            # §11.4i: the 128-D ProjectionHead leaves the SMC queue/anchor path —
+                            # keys must come from the momentum BACKBONE (256-D), matching z_q.
+                            key_features = momentum_model.extract_features(k_inputs, K=K_bag)
+                        else:
+                            key_features = momentum_model(k_inputs, K=K_bag)
+                        if K_bag is not None and key_features.shape[0] == B * K_bag:
+                            key_features = key_features.view(B, K_bag, *key_features.shape[1:]).mean(dim=1)
+
+                # ---- EXIT autocast: everything below is fp32 (no precision loss) ----
+                backbone_feats = backbone_feats.float()
+                outputs = outputs.float()
+                key_features = F.normalize(key_features.float(), dim=1, eps=1e-6)
 
                 # Monitor: check activations after forward
                 nan_monitor.check_activations(epoch=epoch, batch_idx=batch_idx,
                                               backbone_feats=backbone_feats, outputs=outputs)
 
-                with torch.no_grad():
-                    if smc_engine is not None:
-                        # §11.4i: the 128-D ProjectionHead leaves the SMC queue/anchor path —
-                        # keys must come from the momentum BACKBONE (256-D), matching z_q.
-                        key_features = momentum_model.extract_features(k_inputs, K=K_bag)
-                    else:
-                        key_features = momentum_model(k_inputs, K=K_bag)
-                    if K_bag is not None and key_features.shape[0] == B * K_bag:
-                        key_features = key_features.view(B, K_bag, *key_features.shape[1:]).mean(dim=1)
-                    key_features = F.normalize(key_features, dim=1, eps=1e-6)
-
                 if smc_engine is not None:
                     # Eq. 23 engine branch (plan §5 Stage 6): online z_q vs momentum key_z;
                     # queue reads, E-step, anchor/OT/gate/lambda and all M-step side
                     # effects (rho, geometry, enqueue) live inside SMCLossEngine.forward().
-                    z_q = F.normalize(backbone_feats, dim=1, eps=1e-6)
+                    z_q = F.normalize(backbone_feats.float(), p=2, dim=1, eps=1e-6)
                     wins = timestamps.reshape(-1) if timestamps.dim() == 1 else timestamps[:, 0]
                     smc_out = smc_engine(z_q, key_features, targets_c, subject_labels,
                                          wins, video_ids)
@@ -497,7 +529,9 @@ def training_loop(phase,
                 nan_monitor.check_weights(epoch=epoch, batch_idx=batch_idx)
 
                 if use_supmoco:
-                    momentum_update(model, momentum_model, moco_momentum)
+                    momentum_update(model, momentum_model, _ema_momentum(opt_steps))
+                    epoch_ema_m = _ema_momentum(opt_steps)
+                opt_steps += 1
                 optimizer.zero_grad(set_to_none=True)
 
             if use_supmoco and smc_engine is None:
@@ -545,6 +579,10 @@ def training_loop(phase,
             "val_dice": val_dice,
             "lr": current_lr,
         }
+        if use_supmoco:
+            epoch_metrics["ema_momentum"] = float(epoch_ema_m)
+            epoch_metrics["amp_bf16"] = 1.0 if (use_bf16 and device.type == 'cuda') else 0.0
+
         # --- WeightWatcher (Empirical Generalization Analysis) ---
         if epoch % probe_interval == 0 or epoch == epochs - 1:
             try:
@@ -609,16 +647,10 @@ def training_loop(phase,
                             B, T, C, H, W = vid.shape
 
                         vid = vid.permute(1, 0, 2, 3, 4)
-                        features, _ = model.encoder(vid)
-
-                        if features.dim() == 5:
-                            emb = features.mean(dim=[0, 3, 4])
-                        else:
-                            emb = features.mean(dim=[-2, -1])
-
-                        if K_bag is not None:
-                            emb = emb.view(B, K_bag, -1).mean(dim=1)
-
+                        # Shared pooling path (encoder + MeanMaxPoolHead) — must match
+                        # training exactly; a local GAP here graded stale geometry
+                        # after the 2026-11-20 head redesign.
+                        emb = model.extract_features(vid, K=K_bag)
                         emb = F.normalize(emb, dim=1, eps=1e-6)
                         embs.append(emb.cpu())
                         lbls.append(lbl.cpu())
@@ -633,6 +665,9 @@ def training_loop(phase,
             import copy
             clean_train_set = copy.copy(train_loader.dataset)
             clean_train_set.augmentations = None
+            # Both views must be clean or the probe grades donor-mixed embeddings while
+            # claiming to report the test-like baseline.
+            clean_train_set.key_augmentations = None
             
             bs = getattr(train_loader, 'batch_size', None)
             if bs is None:
@@ -672,15 +707,79 @@ def training_loop(phase,
             
             print(f"  Offline Probes — Emotion Train LOTO Mean Acc: {train_linear_acc:.4f} | Val LOTO Mean Acc: {val_linear_acc:.4f} | Train->Val Acc: {lp_train_val:.4f}")
             if not np.all(subj_t == -1):
-                print(f"  Proxy-A Probes — Subject Val Cross Acc (SVM): {subj_cross_acc:.4f}")
+                print(f"  Proxy-A Probes — Subject Val Cross Acc (SVM, z-space): {subj_cross_acc:.4f}")
+
+            # --- SMC live diagnostics (Table 1 #1/#2). Under the nullspace design a
+            # HIGH z-space probe is by construction (L_sub parks identity in span(U));
+            # it is the h'-space accuracy that must collapse toward 1/S.
+            subj_hp_acc = None
+            zs_acc = zs_unw = None
+            if smc_engine is not None and not np.all(subj_t == -1):
+                with torch.no_grad():
+                    def _hprime(emb):
+                        t = torch.from_numpy(np.ascontiguousarray(emb, dtype=np.float32))
+                        rows = []
+                        for i in range(0, t.shape[0], 4096):
+                            h, _zt, _hn = smc_engine.space.project(t[i:i + 4096])
+                            rows.append(h)
+                        return torch.cat(rows, dim=0).numpy()
+                    subj_hp_acc = float(_svm_probe_accuracy(_hprime(emb_t), subj_t,
+                                                            _hprime(emb_v), subj_v))
+                print(f"  Subject probes — z-space: {subj_cross_acc:.4f} | h'-space: {subj_hp_acc:.4f} "
+                      "(Table 1: h' must drop < 0.20; z staying high is BY DESIGN)")
+
+            if smc_engine is not None:
+                try:
+                    from src.snn_modeling.adapters.mil_readout import Phase1BReadout
+                    rd = Phase1BReadout(smc_engine.lock_fullpass(),
+                                        sigma_sq=smc_engine.sigma_sq)
+
+                    def _group_bags(emb, grps, lbl):
+                        zs_list, ys = [], []
+                        for b in np.unique(grps):
+                            sel = np.where(grps == b)[0]
+                            if not (lbl[sel] == lbl[sel[0]]).all():
+                                raise ValueError(f"bag {b} mixes emotion labels — window/label desync")
+                            zs_list.append(torch.from_numpy(
+                                np.ascontiguousarray(emb[sel], dtype=np.float32)))
+                            ys.append(int(lbl[sel][0]))
+                        return zs_list, torch.tensor(ys, dtype=torch.long)
+
+                    ztr, ytr = _group_bags(emb_t, grps_t, lbl_t)
+                    zte, yte = _group_bags(emb_v, grps_v, lbl_v)
+                    zs_fit_cap = 256
+                    if len(ztr) > zs_fit_cap:
+                        print(f"  [ZeroStep preview] centroid fit capped to first "
+                              f"{zs_fit_cap}/{len(ztr)} train bags")
+                        ztr, ytr = ztr[:zs_fit_cap], ytr[:zs_fit_cap]
+                    Rtr, _ = rd.encode_bags(ztr, ytr)
+                    rd.fit_nearest_centroid(Rtr, ytr)
+                    Rte, _ = rd.encode_bags(zte, yte)
+                    zs_acc = rd.evaluate(Rte, yte, use="centroid")
+                    with torch.no_grad():  # unweighted control: plain mean h' (alpha == 1)
+                        Ru_tr = torch.stack([rd._bag_geometry(z)[0].mean(dim=0) for z in ztr])
+                        Ru_te = torch.stack([rd._bag_geometry(z)[0].mean(dim=0) for z in zte])
+                        cen_u = torch.stack([Ru_tr[ytr == y].mean(dim=0)
+                                             for y in range(rd.num_classes)])
+                        zs_unw = float((torch.cdist(Ru_te, cen_u).argmin(dim=1) == yte).float().mean())
+                    print(f"  ZeroStep preview — bag acc (R_b): {zs_acc:.4f} | "
+                          f"unweighted mean-h' baseline: {zs_unw:.4f} (gap = alpha-weighting payoff)")
+                except (ValueError, RuntimeError) as e:
+                    print(f"  [ZeroStep preview] skipped this probe: {e}")
 
             # Live Tracker: probe results
-            live_tracker.probe_results(phase, epoch, {
+            _probe_payload = {
                 "emotion_train_loto_mean": train_linear_acc,
                 "emotion_val_loto_mean": val_linear_acc,
                 "emotion_train_val_cross": lp_train_val,
                 "subject_val_cross": subj_cross_acc,
-            })
+            }
+            if subj_hp_acc is not None:
+                _probe_payload["subject_val_cross_hprime"] = subj_hp_acc
+            if zs_acc is not None:
+                _probe_payload["zerostep_bag_acc"] = zs_acc
+                _probe_payload["zerostep_bag_acc_unweighted"] = zs_unw
+            live_tracker.probe_results(phase, epoch, _probe_payload)
 
         log_dict = {
             f"Phase{phase}/Train/Loss": avg_train_loss,
@@ -722,9 +821,17 @@ def training_loop(phase,
                 f"Phase{phase}/SMC/QueueFill": last_smc_diag["queue"]["fill_ratio"],
                 f"Phase{phase}/SMC/NullspaceRank": last_smc_diag["space"].get("rank", 0),
                 f"Phase{phase}/SMC/ColdAlphaRows": last_smc_diag["cold_alpha_rows"],
+                # Cloud LOTO support mask: DNorm_y can only be read as burst-drop if the
+                # structural share is known alongside it (SMC/LotoColdRows counts windows
+                # whose whole class cloud was same-trial and therefore fell back to rho).
+                f"Phase{phase}/SMC/LotoMaskOn": 1.0 if last_smc_diag.get("loto_mask") else 0.0,
+                f"Phase{phase}/SMC/LotoForbiddenFrac": last_smc_diag.get("loto_forbidden_frac", 0.0),
+                f"Phase{phase}/SMC/LotoColdRows": last_smc_diag.get("loto_cold_rows", 0),
             })
             for _y, _dv in last_smc_diag["D_norm"].items():
                 log_dict[f"Phase{phase}/SMC/DNorm_y{_y}"] = float(_dv)
+            for _y in range(int(smc_engine.rho.numel())):
+                log_dict[f"Phase{phase}/SMC/Rho_y{_y}"] = float(smc_engine.rho[_y].detach())
             # B3(iii) early stop: Stdt(alpha) < 0.02 for 3 consecutive epochs AFTER the
             # anneal floor means alpha has degenerated to the constant rho prior — the
             # gate carries no within-trial information. Stop loudly; ladder next.
@@ -743,6 +850,11 @@ def training_loop(phase,
             log_dict[f"Phase{phase}/Val/Emotion_LOTO_Mean_Acc"] = val_linear_acc
             log_dict[f"Phase{phase}/Val/Emotion_Probe_Val_Acc"] = lp_train_val
             log_dict[f"Phase{phase}/Val/Subject_Probe_Val_Acc"] = subj_cross_acc
+            if subj_hp_acc is not None:
+                log_dict[f"Phase{phase}/Val/Subject_Probe_hprime_Acc"] = float(subj_hp_acc)
+            if zs_acc is not None:
+                log_dict[f"Phase{phase}/Val/ZeroStep_Bag_Acc"] = float(zs_acc)
+                log_dict[f"Phase{phase}/Val/ZeroStep_Bag_Acc_Unweighted"] = float(zs_unw)
         log_dict.update(log_loto_metrics)
 
         for k, v in log_dict.items():
@@ -779,6 +891,11 @@ def training_loop(phase,
 
         # Inject all dynamic custom metrics from epoch_metrics into log_dict for W&B
         log_dict[f"Phase{phase}/Train/Emotion_Accuracy"] = epoch_metrics.get("train_acc", 0.0)
+        if "ema_momentum" in epoch_metrics:
+            log_dict[f"Phase{phase}/Train/EMA_Momentum"] = epoch_metrics["ema_momentum"]
+        if "amp_bf16" in epoch_metrics:
+            log_dict[f"Phase{phase}/Train/Amp_BF16"] = epoch_metrics["amp_bf16"]
+
         
         if "ww_alpha_encoder" in epoch_metrics:
             log_dict[f"Phase{phase}/Metrics/WeightWatcher_Encoder_Alpha"] = epoch_metrics["ww_alpha_encoder"]
@@ -942,10 +1059,22 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
             d_eff=float(_sm_cfg.get('sizing_d_eff', _sm_cfg.get('feature_dim', 256))),
             tol_eff=float(_sm_cfg.get('sizing_tol', 0.1)),
             C_const=float(_sm_cfg.get('sizing_C_const', 4.0)),
-            eps_tol=float(_sm_cfg.get('sizing_eps_tol', 1e-2)))
+            eps_tol=float(_sm_cfg.get('sizing_eps_tol', 1e-2)),
+            allow_smoke_sizing=bool(_sm_cfg.get('allow_smoke_sizing', False)))
         print("  [SMC] §9.6 sizing + §9.4 staleness init gates passed")
 
 
+
+    # MoCo EMA ramp: start at training.supmoco_momentum, climb to
+    # loss.sm.supmoco_momentum_end linearly over loss.sm.warmup_epochs epochs
+    # (= U=0 §11.4ii window), then hold. Only active for SMC runs with end>start;
+    # otherwise None => training_loop keeps the constant momentum.
+    moco_start = float(config.training.get('supmoco_momentum', 0.999))
+    moco_end = float(_sm_cfg.get('supmoco_momentum_end', 0.99)) if use_sm else None
+    if moco_end is not None and moco_end <= moco_start:
+        moco_end = None
+    moco_warmup_steps = (int(_sm_cfg.get('warmup_epochs', 0)) * max(1, len(train_loader))
+                         if (use_sm and moco_end is not None) else 0)
 
     training_loop(
         '1a',
@@ -963,7 +1092,11 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         writer,
         checkpoint_dir,
         use_supmoco=use_supmoco,
-        moco_momentum=config.training.get('supmoco_momentum', 0.999),
+        moco_momentum=moco_start,
+        moco_momentum_end=moco_end,
+        moco_warmup_steps=moco_warmup_steps,
+        use_bf16=bool(config.training.get('bf16', True)),
+        probe_interval=int(config.training.get('probe_interval', 5)),
         momentum_model=momentum_model,
         supmoco_state=supmoco_state,
         smc_engine=smc_engine,
@@ -1093,16 +1226,34 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
             fourier_mixup_module.gaussian_mask = torch.exp(-dist_sq / (2.0 * fmix_sigma ** 2))
         fourier_mixup_modules = [fourier_mixup_module]
     
-    # Compose: FourierMixup (if enabled) → standard augmentations
-    all_aug_modules = fourier_mixup_modules + [
-        GaussianNoise(std=0.05),
-        FrequencyDropout(p=0.1),
-        VideoRandomErasing(p=0.1, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
-        VideoTemporalMasking(p=0.1, max_mask_len=8),
-        SignalJitter(lower=0.5, upper=2.0)
-    ]
-    train_aug = nn.Sequential(*all_aug_modules)
+    # Asymmetric dual-view augmentation (owner 2026-11-23). QUERY view = FourierMixup
+    # (donor blend, p from config) followed by the light chain. KEY view = light chain
+    # WITHOUT FourierMixup (or the clean window), so the momentum keys that populate the
+    # queue clouds nu_y and the subject means mu_s never carry a donor spectrum: the
+    # reference measures the E-step and OT score against stay test-like, and the only
+    # view that sees erasure-processed input is the one the gradient updates.
+    def _light_chain():
+        return [
+            GaussianNoise(std=0.05),
+            FrequencyDropout(p=0.1),
+            VideoRandomErasing(p=0.1, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
+            VideoTemporalMasking(p=0.1, max_mask_len=8),
+            SignalJitter(lower=0.5, upper=2.0),
+        ]
+
+    query_modules = fourier_mixup_modules + _light_chain()
+    query_aug = nn.Sequential(*query_modules)
+    key_view = str(config.training.get('key_view', 'light')).lower()
+    if key_view not in ('light', 'clean'):
+        raise ValueError(f"training.key_view must be 'light' or 'clean', got {key_view!r}")
+    # 'clean' => key_augmentations None => video2 is the un-augmented window.
+    key_aug = nn.Sequential(*_light_chain()) if key_view == 'light' else None
+    train_aug = query_aug
     train_set.augmentations = train_aug  # Now assign augmentations
+    train_set.key_augmentations = key_aug
+    print(f"[Augmentation] query view: FourierMixup={len(fourier_mixup_modules)} + "
+          f"{len(_light_chain())} light modules | key view: {key_view} "
+          f"({'light chain, no FourierMixup' if key_aug is not None else 'clean window'})")
     
     val_set = SWEEPDataset(
         config,

@@ -14,14 +14,19 @@ encoder:
 
 training:
   use_pk_sampler: true
+  probe_interval: 5             # offline-probe + h'/ZeroStep preview cadence in epochs (1 = every epoch)
   subject_diverse_k: true
   temporal_decay_enabled: false
   temporal_decay_factor: 0.99
   use_supmoco: true
-  supmoco_momentum: 0.9
+  supmoco_momentum: 0.9         # EMA start (MoCo key encoder); ramps to supmoco_momentum_end over SMC warmup
+  bf16: true                    # bf16 autocast on encoder fwd/bwd (no GradScaler); SMC math stays fp32
   supmoco_queue_size: 512
   use_muon: false
   use_fourier_mixup: true
+  key_view: light               # momentum-key view: 'light' = standard augs WITHOUT
+                                # FourierMixup (donor-free keys); 'clean' = untouched window.
+                                # The query view always carries FM3D (p below).
   filter_baseline_windows: false
   fourier_mixup:
     retention_ratio: 0.95       # % variance to retain (try 0.90–0.98)
@@ -78,7 +83,9 @@ loss:
     sigma_sq: 1.0               # baseline Gaussian scale (Rm 4.2)
     rho_min: 0.02
     seed: {s: 2.0}              # §9.5 burst spread; seed.log_coeff defaults to feature_dim
-    seed_batches: 96            # Option-B pre-pass cap over train_loader (raw window norms)
+    seed_max_batches: 96        # Option-B pre-pass cap over train_loader (key must match
+                                # train.py's _sm_cfg.get('seed_max_batches') — the old
+                                # 'seed_batches' spelling was read by nobody)
     seed_min_windows: 256       # per class before seeding (starved seed = hard error)
     anneal: {t_start: 20.0, t_end: 1.0, frac: 0.3}   # deterministic annealing, Eq. 6
     sinkhorn: {tol: 1.0e-3, T_sc: 30, n_iters: 5000, solver_tol: 1.0e-10}
@@ -89,10 +96,21 @@ loss:
     lambda_sub: 1.0             # Eq. 23 subject-residual weight
     lambda_rho: 0.1             # Eq. 23 sparsity weight
     force_balanced: false       # §13 row-2 switch: pinned tau_y -> balanced-OT pathology (evidence only)
+    ot_loto_mask: true          # per-pair LOTO support mask (structural zero, NEVER a cost
+                                # sentinel) on nu_y in the E-step log p_y AND the OT cross
+                                # term; forbids same-TRIAL keys only. Same-SUBJECT masking
+                                # is intentionally not offered: it routes the freed mass to
+                                # the dustbin and inflates D_norm_y (Table 1 #5), and nu_y is
+                                # already projected through (I - U U^T) on both sides.
     gate_ema_momentum: 0.9      # OTCoefficient carry weight (§8.3 ratio smoothing)
+    supmoco_momentum_end: 0.99  # MoCo EMA target; ramped from training.supmoco_momentum over warmup_epochs
     # §9.6 floor / §9.4 staleness init-gate constants (must stay consistent with n_q/B/budget):
+    # floor = sizing_C_const * sizing_d_eff / (sizing_tol^2 * min_y(pi_y*rho_y)), the
+    # pi_y/rho_y seeded by Option-B at startup (not rho_min). 5-subject smoke runs set
+    # allow_smoke_sizing=true so a sub-floor n_q WARNS (ceiling + staleness still raise).
+    allow_smoke_sizing: false
     sizing_C_const: 1.0
-    sizing_d_eff: 64.0
+    sizing_d_eff: 20.0
     sizing_tol: 0.5
     sizing_eps_tol: 20000.0
     sizing_L: 1.0

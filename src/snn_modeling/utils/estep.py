@@ -51,16 +51,23 @@ def _check_ball(t, name):
 
 # ------------------------------------------------------------------ densities
 
-def cloud_log_p_matrix(z_tilde, clouds, eps):
+def cloud_log_p_matrix(z_tilde, clouds, eps, support=None):
     """log p_y(z~) for every class in `clouds` — Eq. 6/Rm 4.2 cloud score.
 
     z_tilde: (n, D) current-window ball features (grad allowed — this is the
     differentiable side that Stage 4's coupling gradient later mirrors).
     clouds:  {y: {'keys': (m_y, D), 'weights': (m_y,)}} from
              SupMoCoQueue.read_class_clouds() (stop-grad material).
+    support: optional {y: (n, m_y) bool} — False = pair forbidden. Applied as a
+             STRUCTURAL ZERO inside the logsumexp (never a cost sentinel), so the
+             E-step density and Stage 4's coupling see the SAME transportable graph
+             (Rm 4.2). A window whose whole class-y cloud is forbidden gets
+             log p_y = -inf; the caller must treat those rows as cold (alpha = rho),
+             never as a density.
     Returns (lp, costs): lp (n, C_max) with column y = log p_y, costs = {y:
     C matrix (n, m_y)} — THE shared kernel matrices (Rm 4.2; Stage 4 must not
-    recompute them).
+    recompute them). Costs stay in [0, 2] under a mask: the mask restricts the
+    support, so the B2a eps bound (which scales with the cost DIAMETER) is unchanged.
     """
     _check_ball(z_tilde, "z_tilde")
     if not (eps > 0) or not math.isfinite(eps):
@@ -96,9 +103,25 @@ def cloud_log_p_matrix(z_tilde, clouds, eps):
         if not bool(pos.any()):
             raise ValueError(f"class {y}: all-zero cloud mass — Rm 4.2 interiority violated upstream")
         lw[pos] = torch.log(w[pos])
-        lp[:, col] = torch.logsumexp(lw - cost / eps, dim=1)
+        logits = lw - cost / eps
+        if support is not None:
+            sp = support.get(int(y)) if hasattr(support, "get") else support[y]
+            if sp.dtype != torch.bool:
+                raise ValueError(f"class {y}: support mask must be bool, got {sp.dtype}")
+            if sp.shape != cost.shape:
+                raise ValueError(f"class {y}: support mask {tuple(sp.shape)} != cost "
+                                 f"{tuple(cost.shape)}")
+            if bool(sp.all()):
+                pass                      # fully open column: nothing to zero out
+            else:
+                logits = logits.masked_fill(~sp, float("-inf"))
+        lp[:, col] = torch.logsumexp(logits, dim=1)
         costs[y] = cost
-    if not torch.isfinite(lp).all():
+    # -inf is legal ONLY as a support-mask verdict ("no transportable key of this class
+    # for this window"); NaN/+inf remain impossible on B^d. Written as isinf & (lp > 0)
+    # rather than torch.isposinf — the RunPod image ships torch 2.8.0, so the guard must
+    # not depend on an API whose availability differs between 2.8 and the 2.9 dev box.
+    if bool((torch.isnan(lp) | (torch.isinf(lp) & (lp > 0))).any()):
         raise RuntimeError("non-finite class log-density — impossible on B^d; check eps")
     return lp, costs
 

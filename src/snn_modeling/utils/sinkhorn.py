@@ -160,11 +160,34 @@ def burst_marginal(alpha):
 
 # ------------------------------------------------------------------ solver (stop-grad, Prop 8.3)
 
-def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10):
+def _augment_support(support, n, m, device, name="support"):
+    """(n, m) bool (True = pair transportable) -> (n+1, m+1) for the augmented kernel.
+
+    The dustbin row/column are ALWAYS open: an over-masked real row then dumps into the
+    baseline node (d_i = a_i, legitimate drop mass) instead of making the balanced
+    problem infeasible and tripping the solver's residual raise. Support restriction is
+    a STRUCTURAL ZERO in log-space (logK = -inf), never a large cost — a cost sentinel
+    is rejected by _validate_cost and, worse, would rescale the B2a bound
+    eps >= max(2, tau)/(2*artanh(tol^(1/T_sc))), which is derived from the cost
+    DIAMETER (2 on B^d). Masking must leave that bound and Thm 12.2 untouched."""
+    if support.dtype != torch.bool:
+        raise ValueError(f"{name}: must be a bool tensor (True = transportable), got {support.dtype}")
+    if support.shape != (n, m):
+        raise ValueError(f"{name}: expected ({n}, {m}) for cost shape, got {tuple(support.shape)}")
+    if support.device != device:
+        support = support.to(device)
+    aug = torch.ones(n + 1, m + 1, dtype=torch.bool, device=device)
+    aug[1:, 1:] = support
+    return aug
+
+
+def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10, support=None):
     """Balanced log-domain scaling on the augmented marginals (1,a) x (1,b).
     Fully no_grad: the plan is an M-step object; gradients reach the loss only
     through W_with_grad below (Prop 8.3/Danskin). Non-convergence RAISES
-    (never a silently under-solved coupling)."""
+    (never a silently under-solved coupling).
+
+    `support` (optional): (n, m) bool, False = forbidden pair (structural zero)."""
     _validate_cost(cost, "sinkhorn_plan cost")
     _validate_marginal(a, "sinkhorn_plan a")
     _validate_marginal(b, "sinkhorn_plan b")
@@ -176,6 +199,10 @@ def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10):
         cd = cost.detach()
         C_aug = augment_cost(cd, tau)
         logK = -C_aug / eps
+        aug_mask = None
+        if support is not None:
+            aug_mask = _augment_support(support, cd.shape[0], cd.shape[1], cd.device)
+            logK = logK.masked_fill(~aug_mask, float("-inf"))
         # §5.3: the dummy baseline node carries marginal capacity a0 = b0 = 1 on
         # BOTH sides (NOT 0 — that would zero the dustbin column and silently
         # degrade the problem to exact balanced OT, ignoring tau entirely).
@@ -192,6 +219,11 @@ def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10):
             if float((f - f_prev).abs().max().item()) < tol * min(1.0, eps):
                 break
         plan = torch.exp(f.unsqueeze(1) + logK + g.unsqueeze(0))
+        if not torch.isfinite(plan).all():
+            raise RuntimeError(
+                "sinkhorn_plan: non-finite plan under the support mask — a real row/column "
+                "has no transportable cell and no dustbin fallback (impossible if the dustbin "
+                "row/col stay open); check the mask construction")
         row_res = float((plan.sum(dim=1) - r).abs().max().item())
         col_res = float((plan.sum(dim=0) - cvec).abs().max().item())
         residual = max(row_res, col_res)
@@ -203,13 +235,23 @@ def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10):
                 "never ship an under-solved coupling")
         e_const = eps * float((plan * (plan.clamp(min=_finfo_tiny(plan.dtype)).log() - 1.0)).sum())
         W = float((plan * C_aug).sum()) + e_const
-    return {"plan": plan, "W": W, "di": plan[1:, 0], "uj": plan[0, 1:],
-            "residual": residual, "iters": it}
+    out = {"plan": plan, "W": W, "di": plan[1:, 0], "uj": plan[0, 1:],
+           "residual": residual, "iters": it}
+    if aug_mask is not None:
+        real = plan[1:, 1:]
+        out["rows_fully_masked"] = int((~support).all(dim=1).sum())
+        out["cols_fully_masked"] = int((~support).all(dim=0).sum())
+        out["forbidden_mass"] = float(real[~support].sum())   # must be exactly 0
+    return out
 
 
 def W_with_grad(cost, plan, tau, eps):
     """Prop 8.3: dW/dC_ij = Pi*_ij — value re-evaluated at the FIXED plan so the
-    gradient flows only through the cost (exact to first order; no unrolling)."""
+    gradient flows only through the cost (exact to first order; no unrolling).
+
+    Under a support mask no change is needed: the solved plan carries EXACT zeros on
+    forbidden cells, so dW/dC_ij = 0 there automatically — the Danskin derivative is
+    restricted to the transportable support without touching the cost tensor."""
     _validate_cost(cost, "W_with_grad cost")
     if plan.shape != (cost.shape[0] + 1, cost.shape[1] + 1):
         raise ValueError(f"W_with_grad: plan must be the augmented ({cost.shape[0]+1},"
@@ -226,7 +268,8 @@ def solve_w(cost, a, b, eps, tau, **kw):
 
 # ------------------------------------------------------------------ per-class emotion term
 
-def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=5000, tol=1e-10):
+def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=5000, tol=1e-10,
+                  support=None):
     """S^y_eps(mu_y, nu_y) — Def. 5.4 debiased matching value for one class (Prop 5.5).
 
     z_tilde: (n, D) current-window ball features for class y, grad-carrying.
@@ -234,6 +277,13 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
     keys: (m, D) queue cloud r_j (stop-grad material), b: (m,) its measure.
     self_nu_cache: SELF_NU_SCHEMA dict from a previous call — the nu-self solve is
       detached, so it is cacheable per queue refresh (Stage 4 §5 line 3).
+    support: optional (n, m) bool restricting the CROSS term only (False = forbidden
+      pair, e.g. same-trial). The self-terms stay unmasked on purpose: W(mu,mu) with
+      same-trial pairs removed would penalise a trial for CONTAINING a burst (the very
+      object alpha detects), and the debiasing of Def. 5.4 is calibrated on the full
+      ground metric. Only the achievable cross value changes, so Prop 5.5's
+      ||grad S|| <= 2 a_i bound is untouched. The nu-self cache is support-independent
+      (it never sees the mask), so its cache key needs no mask term.
 
     Returns S (grad tensor through the cross AND mu-self sides, Prop 8.1(b)),
     plus plans, per-window drops d_i, unused mass u_j, D_norm_y = sum_i d_i
@@ -260,13 +310,23 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
         raise ValueError(f"class_ot_term: eps must be positive/finite, got {eps}")
     if not math.isfinite(tau) or tau < 0.0:
         raise ValueError(f"class_ot_term: tau must be finite >= 0, got {tau}")
+    if support is not None:
+        if support.shape != (n, keys.shape[0]):
+            raise ValueError(f"class_ot_term: support must be (n, m)="
+                             f"({n}, {keys.shape[0]}), got {tuple(support.shape)}")
+        if support.device != z_tilde.device:
+            support = support.to(z_tilde.device)
+        if bool(support.all()):
+            support = None            # fully open graph: identical solve, cheaper path
 
     cost_cross = 1.0 - z_tilde @ keys.t()          # grad-carrying; Rm 4.2 form
     cost_self_mu = 1.0 - z_tilde @ z_tilde.t()
     for name, C in (("cross", cost_cross), ("self-mu", cost_self_mu)):
         _validate_cost(C, f"class_ot_term {name} cost")
 
-    cross = sinkhorn_plan(cost_cross, a, b, eps, tau, n_iters=n_iters, tol=tol)
+    # Support restriction goes on the CROSS solve only (see docstring).
+    cross = sinkhorn_plan(cost_cross, a, b, eps, tau, n_iters=n_iters, tol=tol,
+                          support=support)
     W_cross = W_with_grad(cost_cross, cross["plan"], tau, eps)
 
     self_mu = sinkhorn_plan(cost_self_mu.detach(), a, a, eps, tau, n_iters=n_iters, tol=tol)
@@ -293,8 +353,17 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
 
     S = W_cross - 0.5 * W_self_mu - 0.5 * W_self_nu
     D_norm = float(cross["di"].sum().item())
+    diag = {"D_norm_y": D_norm, "matched_mass": float(a.sum()) - D_norm,
+            "cross_residual": cross["residual"], "self_mu_residual": self_mu["residual"]}
+    if support is not None:
+        # A forbidden pair carries no mass and no gradient; an all-forbidden row drops
+        # entirely (d_i = a_i) through the open dustbin. Reported so D_norm_y can be
+        # read as burst-drop vs. structural-drop instead of guessed at.
+        diag["mask_rows_fully_forbidden"] = int(cross["rows_fully_masked"])
+        diag["mask_cols_fully_forbidden"] = int(cross["cols_fully_masked"])
+        diag["mask_forbidden_mass"] = float(cross["forbidden_mass"])
+        diag["mask_forbidden_frac"] = float(1.0 - support.to(cost_cross.dtype).mean())
     return {"S": S, "W_cross": W_cross, "W_self_mu": W_self_mu, "W_self_nu": W_self_nu,
             "plan": cross["plan"], "d": cross["di"], "u": cross["uj"],
             "self_nu_cache": fresh_cache,
-            "diagnostics": {"D_norm_y": D_norm, "matched_mass": float(a.sum()) - D_norm,
-                            "cross_residual": cross["residual"], "self_mu_residual": self_mu["residual"]}}
+            "diagnostics": diag}

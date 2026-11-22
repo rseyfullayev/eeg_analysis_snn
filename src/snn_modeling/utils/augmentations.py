@@ -336,7 +336,42 @@ class FourierMixup(nn.Module):
         
         return mixed_frames.permute(1, 0, 2, 3).reshape(orig_shape)
 
-def build_fourier_mixup(dataset, retention_ratio=0.95, p=0.5, beta_alpha=1.0, 
+def _window_data_fingerprint(dataset, samples_dir, max_samples_per_subject=200):
+    """Digest of the EXACT window files the variance-map scan consumes, over the
+    per-subject leading `max_samples_per_subject` samples in dataset order (the same
+    set compute_subject_variance_map loads), keyed by (subject, filename, on-disk size).
+
+    Why: index.csv holds only filename/bag_id/emotion_id, so it is byte-identical
+    after a fp32->fp16 (or any re-precompute) regeneration of the window .pt files,
+    while md5(index.csv) alone would silently reuse the OLD donor centroids/σ. The
+    file-size term halves when the on-disk dtype changes fp32->fp16, invalidating the
+    cache. This is an invalidation proxy, not an exact content hash (a same-size
+    in-place retrain that changes values but not bytes is out of scope)."""
+    import os
+    import hashlib
+    from collections import defaultdict
+    per_subject = defaultdict(list)
+    for (_bag, files, _emo, subj_raw, _vid, _ts) in dataset.samples:
+        if subj_raw == -1 or not files:
+            continue
+        if len(per_subject[subj_raw]) >= max_samples_per_subject:
+            continue
+        per_subject[subj_raw].append(files[0])   # representative window the scan loads first
+    h = hashlib.md5()
+    total = 0
+    for subj in sorted(per_subject):
+        for fname in per_subject[subj]:
+            try:
+                size = os.path.getsize(os.path.join(samples_dir, fname))
+            except OSError:
+                size = -1   # missing file: scan will raise; keep it deterministic here
+            total += size
+            h.update(f"{subj}|{fname}|{size}\n".encode())
+    h.update(f"TOTAL|{total}\n".encode())
+    return h.hexdigest()[:12]
+
+
+def build_fourier_mixup(dataset, retention_ratio=0.95, p=0.5, beta_alpha=1.0,
                         max_samples_per_subject=200, device='cuda',
                         cache_dir=None, loso_id=None):
     import os
@@ -355,8 +390,18 @@ def build_fourier_mixup(dataset, retention_ratio=0.95, p=0.5, beta_alpha=1.0,
             f"build_fourier_mixup: index not found at {index_file}; cache keys must be tied "
             "to dataset contents to avoid stale-cache reuse.")
     with open(index_file, 'rb') as f:
-        digest = hashlib.md5(f.read()).hexdigest()[:12]
-    loso_tag = f"loso{loso_id}" if loso_id is not None else "losoAll"
+        index_digest = hashlib.md5(f.read()).hexdigest()[:12]
+    # Plus a fingerprint of the actual window files (the index alone is blind to an
+    # fp32->fp16 / re-precompute regeneration — see _window_data_fingerprint).
+    data_digest = _window_data_fingerprint(
+        dataset, dataset.samples_dir, max_samples_per_subject=max_samples_per_subject)
+    digest = f"{index_digest}-{data_digest}"
+    if loso_id is None:
+        loso_tag = "losoAll"
+    elif isinstance(loso_id, (list, tuple)):
+        loso_tag = "loso" + "-".join(str(s) for s in loso_id)   # multi-subject holdout
+    else:
+        loso_tag = f"loso{loso_id}"
     cache_key = f"{digest}_{loso_tag}_ret{retention_ratio:.2f}"
     cache_path = os.path.join(cache_dir, f"fourier_mixup_cache_complex_3d_{cache_key}.pt")
     

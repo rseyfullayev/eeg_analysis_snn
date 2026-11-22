@@ -200,11 +200,25 @@ def run_data_setup(config=None):
                 video_batch = topo(batch_tensor)
                 video_batch = video_batch.cpu()
 
+                # Hard range guard before the lossy fp16 write. Every step upstream
+                # is a convex combination (feats clamp(-4,4) -> F.interpolate linear
+                # -> TopoMapper row-normalised Gaussian weights summing to 1), so the
+                # tensor already lies in [-4, 4]; this tripwire fires only if a future
+                # transform breaks that invariant. fp16 holds +-4 with ~1e-3 resolution
+                # (band powers after log1p + median/IQR are order-unity), so no clipping
+                # is expected — and it is announced, never silent.
+                video_batch = torch.nan_to_num(video_batch, nan=0.0, posinf=4.0, neginf=-4.0)
+                _absmax = float(video_batch.abs().max())
+                if _absmax > 4.0 + 1e-3:
+                    print(f"[fp16 save][WARN] bag {bag_id} windows reached |x|={_absmax:.3f} "
+                          f"> 4 before fp16 cast — clipping (range guard tripped)")
+                video_batch = video_batch.clamp(-4.0, 4.0).to(torch.float16)
+
                 for k in range(video_batch.shape[0]):
                     # Unique filename for the window
                     fname = f"{subject_id}_{bag_id}_s{sample_global_id}.pt"
                     save_path = os.path.join(OUTPUT_FOLDER, fname)
-                    
+
                     torch.save(video_batch[k].clone(), save_path)
                     
                     # bag_id -> Acts as our Bag ID (The unique Movie Clip)

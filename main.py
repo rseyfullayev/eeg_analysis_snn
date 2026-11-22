@@ -22,7 +22,7 @@ def main():
 
     parser.add_argument('--config', type=str, required=True, help='Path to config YAML')
     parser.add_argument('--mode', type=str, default='train', help='Mode: train or test')
-    parser.add_argument('--loso', type=int, help='The integer ID of the subject to hold out for testing (1-16).')
+    parser.add_argument('--loso', type=str, help='Subject id(s) held out for validation: one (1) or a comma list (1,2), ids 1-16.')
     parser.add_argument('--subj', type=int, help='The integer ID of the subject (1-16).')
 
     parser.add_argument('--phase', type=str, help="Specify training phase ('1a'; legacy 1b/2/3 were retired in Stage 0 tranche 2)")
@@ -57,9 +57,22 @@ def main():
     if args.loso is not None and args.subj is not None:
         parser.error("You CANNOT specify both --loso and --subj at the same time.")
 
-    for _name, _val in (('loso', args.loso), ('subj', args.subj)):
-        if _val is not None and not (1 <= _val <= 16):
-            parser.error(f"--{_name} must be a SEED-V subject id in 1..16, got {_val}.")
+    def _parse_loso(v):
+        if v is None:
+            return None
+        ids = [int(p) for p in str(v).replace(' ', '').split(',') if p != '']
+        if not ids:
+            parser.error(f"--loso got no subject ids: {v!r} (expected e.g. 1 or 1,2)")
+        if len(set(ids)) != len(ids):
+            parser.error(f"--loso has duplicate subject ids: {ids}")
+        for s in ids:
+            if not (1 <= s <= 16):
+                parser.error(f"--loso ids must be SEED-V subject ids in 1..16, got {s}.")
+        return ids
+
+    args.loso = _parse_loso(args.loso)
+    if args.subj is not None and not (1 <= args.subj <= 16):
+        parser.error(f"--subj must be a SEED-V subject id in 1..16, got {args.subj}.")
     
     # We now use true Hydra resolution so we can combine folders (dataset/, model/) dynamically!
     import sys
@@ -84,7 +97,10 @@ def main():
     if args.phase is None and hasattr(config, 'training'):
         args.phase = config.training.get('phase')
     if args.loso is None and hasattr(config, 'data'):
-        args.loso = config.data.get('loso')
+        args.loso = _parse_loso(config.data.get('loso'))
+
+    def _loso_sfx(v):
+        return "-".join(str(s) for s in v) if isinstance(v, (list, tuple)) else str(v)
     if args.subj is None and hasattr(config, 'data'):
         args.subj = config.data.get('subj')
     if args.raw_path is None and hasattr(config, 'data'):
@@ -102,7 +118,7 @@ def main():
     if not (args.mode == 'test' or args.test or args.audit_bio or args.calculate_stat):
         from datetime import datetime
         time_str = datetime.now().strftime('%m%d_%H%M%S')
-        id_tag = f"loso{args.loso}" if args.loso else (f"subj{args.subj}" if args.subj else "run")
+        id_tag = f"loso{_loso_sfx(args.loso)}" if args.loso else (f"subj{args.subj}" if args.subj else "run")
         base_name = config.logger.get('run_name', config.get('experiment_name', 'snn_run'))
         run_name = f"{base_name}_{time_str}_{id_tag}"
         
@@ -158,7 +174,7 @@ def main():
             parser.error("You MUST specify --loso or --subj for test.")
 
         # Init W&B for eval logging
-        id_label = f"loso{args.loso}" if args.loso else f"subj{args.subj}"
+        id_label = f"loso{_loso_sfx(args.loso)}" if args.loso else f"subj{args.subj}"
         wandb.init(
             project=config.logger.project_name,
             name=f"eval-{config.logger.run_name}-{id_label}",

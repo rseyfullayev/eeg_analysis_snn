@@ -55,7 +55,9 @@ class SpikingMobileNetEncoder(nn.Module):
         self.stage1 = _make_stage(20, 32, stride=2, dilation=1, blocks=2, odconv=False, **no_norm_layer_params)
         self.stage2 = _make_stage(32, 64, stride=2, dilation=1, blocks=3, odconv=False, **no_norm_layer_params)
         self.stage3 = _make_stage(64, 128, stride=2, dilation=2, blocks=3, odconv=use_odconv, **no_norm_layer_params)
-        self.stage4 = _make_stage(128, 256, stride=2, dilation=4, blocks=2, odconv=use_odconv, **last_layer_params)
+        # stride 2->1 + dilation 4->2 (owner 2026-11-20): stage4 stays at 4x4
+        # so the projector's depthwise 4x4 pad-0 conv can land on exactly 1x1.
+        self.stage4 = _make_stage(128, 256, stride=1, dilation=2, blocks=2, odconv=use_odconv, **last_layer_params)
 
 
         if vit:

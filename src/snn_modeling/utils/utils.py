@@ -55,7 +55,14 @@ def generate_masks(config, subject_id=None, loso_subject_id=None):
     
     # 1. Load Index
     df = pd.read_csv(os.path.join(config.data.dataset_path, "index.csv"))
-    df = df[df['filename'].str.split('_').str[0] != str(subj_id)] if loso else df[df['filename'].str.split('_').str[0] == str(subj_id)]
+    _subj_col = df['filename'].str.split('_').str[0]
+    if loso:
+        # multi-subject holdout lists are first-class: a str(list) equality would
+        # exclude NOTHING and leak every val subject into the mask statistics.
+        hold = {str(s) for s in (subj_id if isinstance(subj_id, (list, tuple)) else [subj_id])}
+        df = df[~_subj_col.isin(hold)]
+    else:
+        df = df[_subj_col == str(subj_id)]
     
     if len(df) == 0: raise ValueError(f"No data found for Subject {subj_id}")
 

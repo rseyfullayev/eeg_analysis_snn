@@ -144,8 +144,26 @@ class TopoMapper(nn.Module):
     def __call__(self, tensor):
         return self.transform(tensor)
 
+def _contains_fourier_mixup(module) -> bool:
+    """True if this augmentation chain holds a FourierMixup (donor-blending) module.
+
+    Structural check, not a name match on the top-level object, because train.py wraps
+    the chain in nn.Sequential and a nested/aliased instance must still be caught."""
+    from ..utils.augmentations import FourierMixup
+    if isinstance(module, FourierMixup):
+        return True
+    return any(isinstance(m, FourierMixup) for m in getattr(module, 'modules', lambda: [])())
+
+
 class SWEEPDataset(Dataset):
-    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None, precomputed=False, subject_map=None):
+    # Sentinel: key_augmentations was never declared. Distinct from None, which means
+    # "the key view is deliberately CLEAN". Assigning `augmentations` after construction
+    # (train.py builds FourierMixup from the dataset) is supported, so the mismatch is
+    # caught at read time in __getitem__ rather than at __init__.
+    KEY_VIEW_UNSET = object()
+
+    def __init__(self, config, loso=None, subj=None, split='train', experiment=False, prototypes=None, augmentations=None, precomputed=False, subject_map=None,
+                 key_augmentations=KEY_VIEW_UNSET):
         # subject_map arg is retained for call-site compatibility only; the mapping
         # is now always built index-wide (audit B7). See self.subject_map below.
         self.precomputed = precomputed
@@ -153,11 +171,16 @@ class SWEEPDataset(Dataset):
         self.split = split
         self.num_classes = config.data.get('n_emotions', 5)
         self.grid_size = config.data.get('grid_size', 32)
-        self.dataset_path = config.data.dataset_path 
+        self.dataset_path = config.data.dataset_path
         self.samples_dir = os.path.join(self.dataset_path)
         self.preload = config.data.get('preload_ram', False)
         self.train_size = config.data.get('train_size', 0.8)
         self.augmentations = augmentations
+        # Asymmetric dual-view: the ONLINE query gets `augmentations` (FourierMixup
+        # first), the MOMENTUM KEY gets `key_augmentations` — which must NOT contain
+        # FourierMixup, so the queue clouds nu_y and the subject means mu_s are built
+        # from donor-free windows and stay test-like.
+        self.key_augmentations = key_augmentations
         self.cache = {}
 
         index_file = os.path.join(self.dataset_path, "index.csv")
@@ -180,8 +203,11 @@ class SWEEPDataset(Dataset):
             df_val = df.iloc[val_idx]
 
         else:
-            df_train = df[df['filename'].str.split('_').str[0] != str(loso)]
-            df_val = df[df['filename'].str.split('_').str[0] == str(loso)]
+            # loso accepts one id or a list (multi-subject validation, e.g. [1,2]).
+            hold = {str(s) for s in (loso if isinstance(loso, (list, tuple)) else [loso])}
+            _subj_col = df['filename'].str.split('_').str[0]
+            df_train = df[~_subj_col.isin(hold)]
+            df_val = df[_subj_col.isin(hold)]
     
 
         if split == 'all':
@@ -364,9 +390,22 @@ class SWEEPDataset(Dataset):
         # When augmentations happen, they need to handle the batched/bag 5D size 
         # or we iteratively apply it. Assuming it's applied correctly later.
         if self.augmentations is not None and self.split == 'train':
+            if self.key_augmentations is SWEEPDataset.KEY_VIEW_UNSET:
+                raise RuntimeError(
+                    "dual-view train dataset: 'key_augmentations' was never set while "
+                    "'augmentations' is active. Passing one chain to BOTH views leaks the "
+                    "FourierMixup donor spectrum into the momentum keys (queue clouds nu_y, "
+                    "subject means mu_s). Set key_augmentations=<light chain> or =None for a "
+                    "clean key view.")
+            if _contains_fourier_mixup(self.key_augmentations):
+                raise RuntimeError(
+                    "key_augmentations must not contain FourierMixup: the momentum/key view "
+                    "has to stay donor-free (p=0) so nu_y and mu_s track clean, test-like "
+                    "baselines.")
             # Note: you may need to apply augmentations over the batch dimension K safely
             video1 = self.augmentations(bag_video)
-            video2 = self.augmentations(bag_video)
+            video2 = (self.key_augmentations(bag_video) if self.key_augmentations is not None
+                      else bag_video.clone())   # clean key view (explicit None)
             return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, window_ids
 
         return bag_video, target_map, label_idx, bag_id, video_id, window_ids

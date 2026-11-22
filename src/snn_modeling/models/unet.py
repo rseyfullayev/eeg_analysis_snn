@@ -11,7 +11,7 @@ tower, so nothing here should be re-added.
 import torch
 import torch.nn as nn
 
-from ..layers.stem import ProjectionHead
+from ..layers.stem import MeanMaxPoolHead, ProjectionHead
 
 
 class SpikingMobileNetProjector(nn.Module):
@@ -33,7 +33,7 @@ class SpikingMobileNetProjector(nn.Module):
                  num_classes=5, feature_dim=256,
                  use_batchnorm=False,
                  use_swiglu=False, use_dann=False, use_vib=False, use_subj=False,
-                 num_subjects=15, max_windows=1000):
+                 num_subjects=15, max_windows=1000, pool_kernel=4):
         super().__init__()
         flag_values = {'use_swiglu': use_swiglu, 'use_dann': use_dann,
                        'use_vib': use_vib, 'use_subj': use_subj}
@@ -55,6 +55,11 @@ class SpikingMobileNetProjector(nn.Module):
                      for m in self.encoder.modules())
         self.classifier = ProjectionHead(feature_dim, 128,
                                          use_batchnorm=use_batchnorm or has_bn)
+        # Owner redesign 2026-11-20: the GAP collapse is replaced by
+        # depthwise 4x4 squeeze (pad 0, exact-fit on the 4x4 stage-4 map)
+        # + GroupNorm + per-channel 0.5*mean_t / 0.5*max_t pool. Output stays
+        # (B, feature_dim) UNNORMALIZED - callers keep their F.normalize step.
+        self.pool_head = MeanMaxPoolHead(feature_dim, kernel=pool_kernel)
 
     def extract_features(self, x, K=None):
         """Backbone embedding BEFORE the projection head.
@@ -72,7 +77,7 @@ class SpikingMobileNetProjector(nn.Module):
 
         features, _ = self.encoder(x)
         if features.dim() == 5:
-            out = features.mean(dim=[0, 3, 4])  # mean over T, H, W
+            out = self.pool_head(features)  # (T,B,256,4,4) -> (B,256), burst-preserving pool
         else:
             out = features.mean(dim=[-2, -1])
 
