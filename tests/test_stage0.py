@@ -94,19 +94,83 @@ def _cfg(tmp, bagging=True):
 # --------------------------------------------------------------------------- B1
 
 def test_encode_windows_swaps_time_first():
+    from src.snn_modeling.layers.stem import MeanMaxPoolHead
     enc = TimeFirstEncoder()
+    pool = MeanMaxPoolHead(TimeFirstEncoder.D, kernel=1)   # stub emits (T,B,D,1,1)
     windows = torch.rand(6, 2, 1, 4, 4)            # (W=6, T=2, C=1, H=4, Wg=4)
-    z = ft.encode_windows(enc, windows, torch.device('cpu'))
+    z = ft.encode_windows(enc, windows, torch.device('cpu'), pool_head=pool)
     assert enc.seen_shape == (2, 6, 1, 4, 4), \
         f"B1 regression: windows must become BATCH dim; encoder saw {enc.seen_shape}"
     assert z.shape == (6, TimeFirstEncoder.D), "rows must be window count, not a constant"
     assert torch.allclose(z.norm(dim=1), torch.ones(6), atol=1e-5), "z rows unit-normalized"
 
 
+def test_encode_windows_requires_shared_pool_head():
+    # The trained embedding is encoder+head together: encode_windows must not
+    # offer a private mean-GAP fallback (B1-class train/serve skew).
+    import inspect
+    sig = inspect.signature(ft.encode_windows).parameters
+    assert 'pool_head' in sig and sig['pool_head'].default is inspect.Parameter.empty, \
+        "pool_head must be a required keyword (no silent GAP default)"
+
+
+def test_mean_max_pool_head_semantics():
+    """Owner redesign 2026-11-20: depthwise 4x4 pad-0 squeeze on the 4x4
+    stage-4 map, per-channel 0.5*mean_t + 0.5*max_t, no activation pre-pool."""
+    from src.snn_modeling.layers.stem import MeanMaxPoolHead
+    head = MeanMaxPoolHead(256, kernel=4)
+    head.eval()
+    with torch.no_grad():
+        head.dw.weight.fill_(0.0)
+        head.dw.weight[:, 0, :, :] = 1.0 / 16.0     # every channel = mean of its 4x4 field
+        head.norm.weight.fill_(1.0); head.norm.bias.fill_(0.0)
+        m = torch.zeros(8, 1, 256, 4, 4)
+        m[3, 0, 5] += 1000.0                        # one-frame burst in channel 5
+        per_frame = head.norm(head.dw(m.reshape(8, 256, 4, 4))).view(8, 1, 256)
+        expected = 0.5 * per_frame.mean(dim=0) + 0.5 * per_frame.max(dim=0).values
+        out = head(m)
+    assert torch.allclose(out, expected, atol=1e-5), "blend must be exactly 0.5*mean+0.5*max"
+    z_peak = float(per_frame[3, 0, 5])
+    assert z_peak > 0 and float(out[0, 5]) > 0.45 * z_peak, \
+        "max term must retain the burst peak (mean-only would give z_peak/8)"
+    with _Raises(ValueError, "time-first"):
+        head(torch.zeros(256, 4, 4))                # 3D (no T/B axes) must fail loudly
+    with _Raises(ValueError, "HxW == kernel"):
+        head(torch.zeros(8, 1, 256, 2, 2))          # stale 2x2 schedule must fail loudly
+    # NOTE: a batch-first (B,T,C,H,W) map is shape-indistinguishable here; T/B
+    # swap is caught upstream by encode_windows' window-count guard (B1 test).
+    xin = torch.randn(4, 2, 256, 4, 4, requires_grad=True)
+    head(xin).sum().backward()
+    assert torch.isfinite(xin.grad).all() and head.dw.weight.grad is not None, \
+        "grads must flow through squeeze+GN+pool"
+
+
+def test_real_projector_end_to_end_4x4_schedule():
+    """Backbone schedule pinned: stage4 stays 4x4 (stride 1, dilation 2) and
+    projector.extract_features returns (B, FEATURE_DIM) through the shared head."""
+    from src.snn_modeling.models.encoders import SpikingMobileNetEncoder
+    from src.snn_modeling.models.unet import SpikingMobileNetProjector
+    enc = SpikingMobileNetEncoder(in_channels=5, p_drop=0.3, use_odconv=True,
+                                  use_batchnorm=False, spike_model="SiLU")
+    model = SpikingMobileNetProjector(encoder_backbone=enc, num_classes=5)
+    model.eval()
+    x = torch.randn(8, 2, 5, 32, 32)               # (T,B,C,H,Wg), small batch
+    with torch.no_grad():
+        s = model.encoder.stem(x)
+        s = model.encoder.stage1(s); s = model.encoder.stage2(s)
+        s = model.encoder.stage3(s); s4 = model.encoder.stage4(s)
+        assert tuple(s4.shape[-2:]) == (4, 4), f"stage4 must stay 4x4, got {tuple(s4.shape)}"
+        feats = model.extract_features(x)
+    assert feats.shape == (2, ft.FEATURE_DIM)
+    assert torch.isfinite(feats).all()
+
+
 def test_encode_windows_rejects_wrong_rank():
+    from src.snn_modeling.layers.stem import MeanMaxPoolHead
     enc = TimeFirstEncoder()
     with _Raises(ValueError, "5D"):
-        ft.encode_windows(enc, torch.rand(2, 1, 4, 4), torch.device('cpu'))
+        ft.encode_windows(enc, torch.rand(2, 1, 4, 4), torch.device('cpu'),
+                          pool_head=MeanMaxPoolHead(TimeFirstEncoder.D, kernel=1))
 
 
 def test_bag_payload_roundtrip_and_legacy_refusal():
@@ -188,6 +252,65 @@ def test_subject_map_is_index_wide_B7():
         va = SWEEPDataset(cfg, loso='2', split='val')
         assert tr.subject_map == va.subject_map, "one shared label space across splits"
         assert 2 in tr.subject_map and tr.subject_map[2] != -1, "held-out subject maps to a real slot"
+
+
+# --------------------------------------------------------------------------- asymmetric dual view
+
+class _Doubles(__import__('torch').nn.Module):
+    """Deterministic marker: any chain containing it is visibly not the clean view."""
+
+    def forward(self, x):
+        return x * 2.0
+
+
+def _aug_cfg(tmp):
+    import torch.nn as nn
+    return nn.Sequential(_Doubles())
+
+
+def test_key_view_must_be_declared():
+    """One chain for BOTH views is the donor-leak defect: an active query chain with an
+    undeclared key chain must raise, not silently reuse the query chain."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _fake_dataset_dir(tmp)
+        ds = SWEEPDataset(_cfg(tmp), loso='3', split='train', augmentations=_aug_cfg(tmp))
+        try:
+            ds[0]
+        except RuntimeError as e:
+            assert 'key_augmentations' in str(e), f"wrong guard message: {e}"
+        else:
+            raise AssertionError("dual-view dataset accepted an undeclared key view")
+
+
+def test_key_view_clean_is_unaugmented():
+    import torch
+    with tempfile.TemporaryDirectory() as tmp:
+        _fake_dataset_dir(tmp)
+        clean = SWEEPDataset(_cfg(tmp), loso='3', split='train')
+        both = SWEEPDataset(_cfg(tmp), loso='3', split='train',
+                            augmentations=_aug_cfg(tmp), key_augmentations=None)
+        v1, v2 = both[0][0], both[0][1]
+        ref = clean[0][0]
+        assert torch.equal(v2, ref), "clean key view must be the untouched window"
+        assert torch.equal(v1, ref * 2.0), "query view must still be augmented"
+
+
+def test_key_view_rejects_fourier_mixup():
+    import torch.nn as nn
+    from src.snn_modeling.utils.augmentations import FourierMixup
+    with tempfile.TemporaryDirectory() as tmp:
+        _fake_dataset_dir(tmp)
+        # nested inside a Sequential — a top-level isinstance check would miss it
+        ds = SWEEPDataset(_cfg(tmp), loso='3', split='train',
+                          augmentations=_aug_cfg(tmp),
+                          key_augmentations=nn.Sequential(FourierMixup(sigma=2.0, shape=(4, 4, 4)),
+                                                          _Doubles()))
+        try:
+            ds[0]
+        except RuntimeError as e:
+            assert 'FourierMixup' in str(e), f"wrong guard message: {e}"
+        else:
+            raise AssertionError("key view accepted a chain containing FourierMixup")
 
 
 # --------------------------------------------------------------------------- PKSampler

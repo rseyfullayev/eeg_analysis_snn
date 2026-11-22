@@ -182,10 +182,12 @@ class SupMoCoQueue(nn.Module):
     def read_class_clouds(self, exclude_window_ids=None):
         """Per-class beta-weighted clouds (OT reference nu_y, Rm 9.2/9.3).
 
-        Returns {y: {'keys','weights','beta_sum','n'}} for classes with entries;
-        weights = beta/sum(beta) so the class slice is a probability cloud
+        Returns {y: {'keys','weights','beta_sum','n','window_ids'}} for classes with
+        entries; weights = beta/sum(beta) so the class slice is a probability cloud
         (Def. 5.2's nu_y). Classes with positive mass but sum(beta)=0 raise —
         that contradicts Rm 4.2 interiority and means upstream alpha is wrong.
+        `window_ids` are the composed uids, so a caller can recover each key's trial
+        (uid >> UID_SHIFT) and build the per-pair LOTO support mask.
         """
         sl, filled = self._active()
         out = {}
@@ -195,6 +197,7 @@ class SupMoCoQueue(nn.Module):
         keys = self.keys[sl][keep]
         labels = self.labels[sl][keep]
         betas = self.betas[sl][keep]
+        win_ids = self.window_ids[sl][keep]
         for y in labels.unique().tolist():
             m = labels == y
             bsum = float(betas[m].sum().item())
@@ -207,6 +210,7 @@ class SupMoCoQueue(nn.Module):
                 "weights": betas[m] / bsum,
                 "beta_sum": bsum,
                 "n": int(m.sum()),
+                "window_ids": win_ids[m],
             }
         return out
 

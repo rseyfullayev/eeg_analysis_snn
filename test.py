@@ -329,6 +329,10 @@ def test(config, loso, subj, device, model):
 
     model.eval()
 
+    # filename/label-safe rendering of the holdout spec (int or list like [1,2]);
+    # `loso` itself stays raw for the dataset split.
+    loso_sfx = "-".join(str(s) for s in loso) if isinstance(loso, (list, tuple)) else loso
+
     # ------------------
     # Data Loaders
     # ------------------
@@ -434,7 +438,7 @@ def test(config, loso, subj, device, model):
     emb_train, labels_train, groups_train, subj_train = extract_embs(train_loader, desc="Train Embeddings")
 
     num_classes = config.model.get('num_classes', 5)
-    id_label = f"LOSO {loso}" if loso else f"Subj {subj}"
+    id_label = f"LOSO {loso_sfx}" if loso else f"Subj {subj}"
 
     print(f"Val Embeddings: {emb_val.shape} | Train Embeddings: {emb_train.shape}")
 
@@ -478,7 +482,7 @@ def test(config, loso, subj, device, model):
         print(np.array2string(sim, precision=3, suppress_small=True))
 
         # 5. Cosine Similarity Heatmap
-        suffix = f"loso{loso}" if loso else f"subj{subj}"
+        suffix = f"loso{loso_sfx}" if loso else f"subj{subj}"
 
         tick_labels = EMOTION_NAMES[:num_classes]
         fig_sim, ax_sim = plt.subplots(figsize=(5.5, 4.8))
@@ -523,7 +527,7 @@ def test(config, loso, subj, device, model):
     # =================================================================
     # Leave-One-Trial-Out (LOTO) Probes
     # =================================================================
-    suffix = f"loso{loso}" if loso else f"subj{subj}"
+    suffix = f"loso{loso_sfx}" if loso else f"subj{subj}"
     print(f"\n{'='*60}")
     print(f"  LOTO (Leave-One-Trial-Out) Linear Probe  ({id_label})")
     print(f"{'='*60}")
@@ -589,7 +593,7 @@ def test(config, loso, subj, device, model):
     # =================================================================
     # UMAP Visualizations (3 purpose-built plots)
     # =================================================================
-    suffix = f"loso{loso}" if loso else f"subj{subj}"
+    suffix = f"loso{loso_sfx}" if loso else f"subj{subj}"
     print(f"\n{'='*60}")
     print(f"  UMAP 1: Subject Fingerprint")
     print(f"{'='*60}")

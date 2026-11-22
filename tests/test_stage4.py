@@ -327,6 +327,105 @@ def test_class_ot_term_fail_loud():
         _expect((ValueError, RuntimeError), bad, "bad class_ot_term input accepted")
 
 
+# ------------------------------------------------------------------ LOTO support mask
+
+def test_support_mask_is_structural_zero():
+    """Forbidden pairs must carry EXACTLY zero plan mass and zero cost-gradient, while
+    the cost tensor itself stays in [0, 2] so M~ = max(2, tau) — and therefore every
+    Thm 12.2 / B2a / B2b bound — is unchanged by masking."""
+    z, keys = _ball(4, seed=41), _ball(5, seed=42)
+    a, b = _rand_marginal(4, 43), _rand_marginal(5, 44)
+    eps, tau = 0.4, 0.3
+    cost = 1.0 - z @ keys.t()
+
+    full = sinkhorn_plan(cost, a, b, eps, tau)
+    sup = torch.ones(4, 5, dtype=torch.bool)
+    sup[0, 1] = sup[2, 3] = False
+    res = sinkhorn_plan(cost, a, b, eps, tau, support=sup)
+    plan = res["plan"]
+    assert plan[1, 2].item() == 0.0 and plan[3, 4].item() == 0.0, "forbidden cell carries mass"
+    assert res["forbidden_mass"] == 0.0
+    assert torch.isfinite(plan).all() and res["residual"] < 1e-8
+    assert float(cost.max()) <= 2.0 + 1e-9, "mask leaked into the cost tensor"
+    # M~ = max(2, tau) is untouched by masking, so the B2a lower bound stays ~0.92.
+    # (A 1e4 cost sentinel would push the diameter to 1e4 -> lb ~4617, outside eps_max.)
+    assert abs(eps_lower_bound(1e-3, 30, max(2.0, tau)) - 0.9233) < 1e-3
+    assert eps_lower_bound(1e-3, 30, 1e4) > 4000.0
+    # Restricting the feasible set can only raise the optimal matching value.
+    assert res["W"] >= full["W"] - 1e-12, f"masked W {res['W']} < unmasked {full['W']}"
+    # Fully-open mask must be identical to no mask at all (the short-circuit path).
+    same = sinkhorn_plan(cost, a, b, eps, tau, support=torch.ones(4, 5, dtype=torch.bool))
+    assert abs(same["W"] - full["W"]) < 1e-12
+
+    # Danskin derivative restricted to the support: dW/dC == 0 on forbidden cells.
+    cleaf = cost.detach().clone().requires_grad_(True)
+    plan_m = sinkhorn_plan(cleaf, a, b, eps, tau, support=sup)["plan"]
+    g = torch.autograd.grad(W_with_grad(cleaf, plan_m, tau, eps), cleaf)[0]
+    assert g[0, 1].item() == 0.0 and g[2, 3].item() == 0.0, "gradient leaked through a forbidden pair"
+    assert (g[sup] != 0).any(), "mask killed the whole gradient"
+
+
+def test_support_mask_over_masked_row_drops_to_dustbin():
+    """A row with no transportable key must dump into the (always-open) dustbin column,
+    i.e. d_i == a_i — not make the balanced problem infeasible and raise."""
+    z, keys = _ball(3, seed=51), _ball(4, seed=52)
+    a, b = _rand_marginal(3, 53), _rand_marginal(4, 54)
+    cost = 1.0 - z @ keys.t()
+    sup = torch.ones(3, 4, dtype=torch.bool)
+    sup[1, :] = False                       # row 1 fully forbidden
+    res = sinkhorn_plan(cost, a, b, 0.4, 0.3, support=sup)
+    assert res["rows_fully_masked"] == 1
+    assert abs(float(res["di"][1]) - float(a[1])) < 1e-9, "fully-masked row must drop in full"
+    assert res["residual"] < 1e-8, "closed row broke marginal feasibility"
+
+
+def test_support_mask_rejects_sentinel_and_bad_input():
+    """The approved mechanism is a structural zero. A large-cost sentinel — the obvious
+    wrong way — must be refused, and a silent clamp must not be allowed to flatten it."""
+    z, keys = _ball(3, seed=61), _ball(4, seed=62)
+    a, b = _rand_marginal(3, 63), _rand_marginal(4, 64)
+    good = 1.0 - z @ keys.t()
+    sentinel = good.clone()
+    sentinel[0, 0] = 1e4                    # what a "hard guard" on the cost looks like
+    _expect(ValueError, lambda: sinkhorn_plan(sentinel, a, b, 0.4, 0.3),
+            "1e4 cost sentinel accepted instead of raising")
+    assert float(sentinel[0, 0].clamp(0.0, 2.0)) == 2.0, \
+        "clamp-to-2 no longer flattens the sentinel — re-check the silent-degradation guard"
+    for bad in [torch.ones(3, 4, dtype=torch.float32),          # not bool
+                torch.ones(4, 4, dtype=torch.bool),             # wrong shape
+                torch.ones(3, 5, dtype=torch.bool)]:
+        _expect(ValueError, lambda: sinkhorn_plan(good, a, b, 0.4, 0.3, support=bad),
+                f"bad support {tuple(bad.shape)}/{bad.dtype} accepted")
+
+
+def test_class_ot_term_support_contract():
+    """The OT cross term is masked; the self terms are NOT (masking W(mu,mu) would
+    penalise a trial for containing a burst) and the nu-self cache stays mask-free."""
+    z = _ball(4, seed=71).requires_grad_(True)
+    keys = _ball(5, seed=72)
+    a, b = _rand_marginal(4, 73), _rand_marginal(5, 74)
+    sup = torch.ones(4, 5, dtype=torch.bool)
+    sup[0, 0] = sup[1, 1] = sup[2, 2] = False
+    out = class_ot_term(z, a, keys, b, 0.4, 0.3, support=sup, self_nu_cache=None)
+    d = out["diagnostics"]
+    assert d["mask_forbidden_mass"] == 0.0
+    assert d["mask_forbidden_frac"] > 0.0 and d["mask_cols_fully_forbidden"] == 0
+    assert out["plan"][1, 1].item() == 0.0
+    assert torch.isfinite(out["S"]), "masked OT produced a non-finite value"
+    out["S"].backward()
+    assert torch.isfinite(z.grad).all() and float(z.grad.abs().sum()) > 0.0
+    # self-nu cache is support-independent: reusing it under a different mask is legal
+    cache = out["self_nu_cache"]
+    z2 = _ball(4, seed=71).requires_grad_(True)
+    sup2 = torch.ones(4, 5, dtype=torch.bool)
+    sup2[3, 4] = False
+    again = class_ot_term(z2, a, keys, b, 0.4, 0.3, support=sup2, self_nu_cache=cache)
+    assert abs(again["W_self_nu"] - cache["W"]) < 1e-12, "cache wrongly masked"
+    _expect(ValueError, lambda: class_ot_term(z, a, keys, b, 0.4, 0.3,
+                                             support=torch.ones(9, 9, dtype=torch.bool)),
+            "class_ot_term accepted a mis-shaped support")
+
+
 # ------------------------------------------------------------------ runner
 
 def main():

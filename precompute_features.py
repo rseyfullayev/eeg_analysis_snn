@@ -33,6 +33,11 @@ def run_precompute(config, checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     encoder = load_encoder_state_strict(model.encoder, checkpoint)
     encoder.eval()
+    # The pooling head is part of the trained embedding definition — load it
+    # strictly too, so payloads can never disagree with the 1A forward.
+    pool_head = load_encoder_state_strict(model.pool_head, checkpoint,
+                                          encoder_prefix="pool_head.")
+    pool_head.eval()
 
     # split='all': every subject's bags (this is feature generation, not evaluation).
     dataset = SWEEPDataset(config, split='all', precomputed=False)
@@ -65,7 +70,7 @@ def run_precompute(config, checkpoint_path):
                     f"bag {bag_id}: expected 4D window tensors (T, C, H, Wg), "
                     f"got stacked shape {tuple(windows.shape)}")
 
-            z = encode_windows(encoder, windows, device)  # (W, FEATURE_DIM), L2-normalized
+            z = encode_windows(encoder, windows, device, pool_head=pool_head)  # (W, FEATURE_DIM), L2-normalized
             payload = make_bag_payload(z, bag_id=int(bag_id), subject=int(subject_idx),
                                        label=int(label_idx))
             torch.save(payload, os.path.join(out_dir, f"bag_{bag_id}.pt"))

@@ -110,6 +110,14 @@ class SMCLossEngine(nn.Module):
         self.lambda_anc = float(g("lambda_anc", 1.0))
         self.lambda_sub = float(g("lambda_sub", 1.0))
         self.lambda_rho = float(g("lambda_rho", 0.1))
+        # Per-pair LOTO support mask on nu_y (structural zero; E-step + OT cross term).
+        # Same-TRIAL keys in the class cloud are free low-cost matches — consecutive 1 s
+        # windows of one clip are autocorrelated — so they leak into the burst detector
+        # exactly the way the DCL anchor's ghosting already guards against. Same-SUBJECT
+        # masking is deliberately NOT offered: nu_y keys and z~ are BOTH already projected
+        # through (I-UU^T), so it would only delete cross-subject same-emotion exemplars
+        # and route that mass into the dustbin, inflating D_norm_y (Table 1 #5).
+        self.ot_loto_mask = bool(g("ot_loto_mask", True))
         if self.lambda_anc < 0 or self.lambda_sub < 0 or self.lambda_rho < 0:
             raise ValueError("SMCLossEngine: lambda_anc/lambda_sub/lambda_rho must be >= 0")
         self.sn_tol = float(g("sinkhorn.tol", 1e-3))
@@ -136,6 +144,9 @@ class SMCLossEngine(nn.Module):
         self.coeff = OTCoefficient(momentum=float(g("gate_ema_momentum", 0.9)))
 
         self.register_buffer("rho", torch.full((self.num_classes,), float("nan")))
+        # Empirical class prior pi_y (from the Option-B seed pre-pass window counts).
+        # The §9.6 floor uses the SEEDED min_y(pi_y * rho_y), never the rho_min guess.
+        self.register_buffer("class_prior", torch.zeros(self.num_classes))
         self.register_buffer("seeded", torch.zeros(1, dtype=torch.bool))
         self.register_buffer("step", torch.zeros(1, dtype=torch.long))
         self._nu_cache = {}
@@ -153,12 +164,17 @@ class SMCLossEngine(nn.Module):
                              f"{sorted(norm_sq_by_class) if isinstance(norm_sq_by_class, dict) else 'list'}")
         rho = torch.empty(self.num_classes, dtype=torch.float64)
         diags = {}
+        counts = torch.zeros(self.num_classes, dtype=torch.float64)
         for y in range(self.num_classes):
             norm_sq = torch.as_tensor(norm_sq_by_class[y], dtype=torch.float64)
+            counts[y] = float(norm_sq.numel())
             delta = burst_delta_scores(norm_sq.float(), s=self.seed_s, log_coeff=self.seed_log_coeff)
             r, diag = option_b_seed(delta, self.rho_min)
             rho[y] = r
             diags[y] = diag
+        if float(counts.sum()) <= 0:
+            raise RuntimeError("seed_priors: zero windows scanned — pi_y is undefined")
+        self.class_prior.copy_((counts / counts.sum()).to(self.class_prior.dtype))
         self.rho.copy_(rho.to(self.rho.dtype))
         if self.eps is None:  # approved-default midpoint of the Thm 12.2 interval
             lb = max(eps_lower_bound(self.sn_tol, self.sn_T_sc,
@@ -182,15 +198,49 @@ class SMCLossEngine(nn.Module):
     # ------------------------------------------------------------------ init asserts
 
     def run_sizing_checks(self, batch_size, epochs, steps_per_epoch, L_const=1.0,
-                          d_eff=None, tol_eff=0.1, C_const=4.0, eps_tol=1e-2):
+                          d_eff=None, tol_eff=0.1, C_const=4.0, eps_tol=1e-2,
+                          allow_smoke_sizing=False):
         """§9.6 floor/ceiling + §9.4 staleness bound for the ACTUAL run budget —
-        called by train.py once shapes/steps are known. Loud, no auto-shrink."""
+        called by train.py once shapes/steps are known.
+
+        The floor uses the SEEDED ``min_y(pi_y * rho_y)`` (the Option-B pre-pass
+        priors), NOT the ``rho_min`` construction floor — the expected burst-key
+        count ``N_q * pi_y * rho_y`` per class is printed so the run reports how
+        many burst keys the queue actually carries.
+
+        ``allow_smoke_sizing=True`` downgrades a §9.6 floor breach from a hard
+        raise to an announced warning (5-subject smoke runs); the §9.6 ceiling
+        and the §9.4 staleness bound ALWAYS hard-raise — an over-long queue is a
+        correctness defect, never a sizing nicety. Full-LOSO runs keep the floor
+        raise (the default)."""
+        if not bool(self.seeded.item()):
+            raise RuntimeError("run_sizing_checks before seed_priors — pi_y/rho_y are undefined")
+        pi = self.class_prior.to(torch.float64)
+        rho = self.rho.to(torch.float64)
+        if (pi <= 0).any() or (rho <= 0).any():
+            raise RuntimeError("run_sizing_checks: non-positive pi_y or rho_y in a seeded class")
+        burst_frac = pi * rho                    # fraction of the queue that is burst keys of class y
+        rho_tilde = float(burst_frac.min())       # §9.6 sizing uses the worst (rarest) class
         floor = queue_floor(C_const=C_const, d_eff=float(d_eff or self.space.feature_dim),
-                            tol=tol_eff, rho_tilde_min=self.rho_min)
+                            tol=tol_eff, rho_tilde_min=rho_tilde)
         ceiling = queue_ceiling(eps_tol=eps_tol, B=batch_size,
                                 T_total=int(epochs * steps_per_epoch),
                                 L=L_const, D=float(self.space.feature_dim))
-        check_sizing(self.queue.queue_size, floor, ceiling)
+        burst_keys = self.queue.queue_size * burst_frac
+        print("  [SMC §9.6] seeded min_y(pi_y*rho_y)={:.4f} -> floor={} ceiling={} n_q={}".format(
+            rho_tilde, floor, ceiling, self.queue.queue_size))
+        print("  [SMC §9.6] expected burst keys/class (N_q*pi_y*rho_y): "
+              + ", ".join(f"y{y}={float(burst_keys[y]):.1f}" for y in range(self.num_classes)))
+        if not floor <= self.queue.queue_size <= ceiling:
+            if self.queue.queue_size < floor and allow_smoke_sizing:
+                print(f"  [SMC §9.6 WARNING] allow_smoke_sizing=True: n_q={self.queue.queue_size} "
+                      f"is below the prototype-richness floor={floor} for this {self.num_classes}-class/"
+                      f"{self.space.num_subjects}-subject smoke run — proceeding (NOT valid for full LOSO).")
+            else:
+                check_sizing(self.queue.queue_size, floor, ceiling)
+        # ceiling is never waived: an over-long queue is a staleness defect, not a smoke nicety
+        if self.queue.queue_size > ceiling:
+            check_sizing(self.queue.queue_size, floor, ceiling)
         check_staleness(self.queue.queue_size, batch_size, self.queue_momentum,
                         L_const, float(self.space.feature_dim), eps_tol)
         return floor, ceiling
@@ -200,6 +250,22 @@ class SMCLossEngine(nn.Module):
     def _subject_baseline(self, subjects):
         """mu_hat'_s = (I-UU^T)(mu_bar_s - mu): detached M-step tables (Rm 6.5)."""
         return self.space.apply_projector(self.space.ema_mean[subjects] - self.space.mu).detach()
+
+    def _loto_support(self, clouds, trial_ids):
+        """{y: (B, m_y) bool} — True = key j transportable for query i.
+
+        Forbids same-TRIAL pairs only. Exact-window pairs never reach here: they are
+        already gone from the cloud via read_class_clouds(exclude_window_ids=uids)."""
+        support = {}
+        for y, cl in clouds.items():
+            if "window_ids" not in cl:
+                raise RuntimeError(
+                    "ot_loto_mask: class cloud carries no 'window_ids' — the queue must "
+                    "expose composed uids (SupMoCoQueue.read_class_clouds). Refusing to "
+                    "train with the LOTO mask silently disabled.")
+            key_trial = cl["window_ids"].to(trial_ids.device) // UID_SHIFT
+            support[int(y)] = key_trial.view(1, -1) != trial_ids.view(-1, 1)
+        return support
 
     @staticmethod
     def _compose_uids(trial_ids, window_ids):
@@ -267,6 +333,11 @@ class SMCLossEngine(nn.Module):
 
         clouds = self.queue.read_class_clouds(exclude_window_ids=uids)
         neg_keys, _, _, neg_uids = self.queue.read_negatives(exclude_window_ids=uids)
+        # One support graph feeds BOTH the E-step density and the OT cross term (Rm 4.2:
+        # alpha and S_eps must score the same transportable pairs, or the responsibilities
+        # and the emotion term disagree about what evidence exists).
+        support = self._loto_support(clouds, trial_ids) if (self.ot_loto_mask and clouds) else None
+        loto_cold_rows = 0
 
         # ---- anchor (Eq. 22) + bootstrap cold path (§11.4ii: defined zero, flagged)
         cold_anchor = neg_keys.shape[0] == 0
@@ -291,12 +362,20 @@ class SMCLossEngine(nn.Module):
             rows = (present >= 0).nonzero(as_tuple=True)[0]
             cold_rows = B - int(rows.numel())
             if rows.numel() > 0:
-                lp, _costs = cloud_log_p_matrix(zt_q, clouds, eps)
+                lp, _costs = cloud_log_p_matrix(zt_q, clouds, eps, support=support)
                 log_p_y = lp[rows, present[rows]]
-                log_p_s = log_baseline_gaussian(h_q, self._subject_baseline(subjects), self.sigma_sq)
-                a_present, ainfo = alpha_1a(log_p_y, log_p_s[rows], rho_vec[labels[rows]], T)
-                alpha = alpha.clone()
-                alpha[rows] = a_present
+                # A window whose ENTIRE class-y cloud is same-trial has no admissible
+                # prototype: log p_y is -inf, so it joins the cold set (alpha stays at the
+                # seeded rho) rather than becoming a fabricated near-certain burst.
+                keep = torch.isfinite(log_p_y)
+                if support is not None and not bool(keep.all()):
+                    loto_cold_rows = int((~keep).sum())
+                    rows, log_p_y = rows[keep], log_p_y[keep]
+                if rows.numel() > 0:
+                    log_p_s = log_baseline_gaussian(h_q, self._subject_baseline(subjects), self.sigma_sq)
+                    a_present, ainfo = alpha_1a(log_p_y, log_p_s[rows], rho_vec[labels[rows]], T)
+                    alpha = alpha.clone()
+                    alpha[rows] = a_present
 
         # ---- sparsity prior (Eq. 21) with the CURRENT rho table, then Eq. 12 M-step
         L_spr = sparsity_loss(alpha, labels, rho_vec)
@@ -335,7 +414,8 @@ class SMCLossEngine(nn.Module):
                     dustbin_price(eps, float(self.rho[y])))
                 out = class_ot_term(zt_q[rows], a_y, cl["keys"], cl["weights"],
                                     eps, tau_y, self_nu_cache=self._nu_cache.get(y),
-                                    n_iters=self.sn_iters, tol=self.sn_solver_tol)
+                                    n_iters=self.sn_iters, tol=self.sn_solver_tol,
+                                    support=None if support is None else support[y][rows])
                 L_em = L_em + out["S"]
                 self._nu_cache[y] = out["self_nu_cache"]
                 d_norm[y] = out["diagnostics"]["D_norm_y"]
@@ -378,6 +458,12 @@ class SMCLossEngine(nn.Module):
                 "C_K": C_K, "K": K, "n_negatives": int(neg_keys.shape[0]),
                 "cold_anchor": cold_anchor, "cold_em": cold_em,
                 "cold_alpha_rows": cold_rows,
+                "loto_mask": bool(self.ot_loto_mask),
+                "loto_cold_rows": loto_cold_rows,
+                "loto_forbidden_frac": (
+                    float(torch.stack([(1.0 - s.to(torch.float32).mean())
+                                       for s in support.values()]).mean())
+                    if support else 0.0),
                 "alpha_mean": float(alpha.detach().mean()),
                 "alpha_std": float(alpha.detach().std()) if B > 1 else 0.0,
                 "D_norm": d_norm, "queue": self.queue.summary(),

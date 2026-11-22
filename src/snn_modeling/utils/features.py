@@ -40,24 +40,25 @@ def load_encoder_state_strict(encoder, checkpoint, encoder_prefix="encoder."):
     return encoder
 
 
-def encode_windows(encoder, windows, device):
+def encode_windows(encoder, windows, device, *, pool_head):
     """(W, T, C, H, Wg) stacked windows -> (W, FEATURE_DIM) L2-normalized z.
 
     dim0 of `windows` is the window/bag axis, dim1 is each window's time axis.
     The encoder consumes (T, B, C, H, Wg), so the permute below is mandatory —
-    omitting it makes windows the time axis and the GAP averages the wrong
+    omitting it makes windows the time axis and pooling averages the wrong
     dimension (that was audit bug B1).
+
+    `pool_head` is REQUIRED and must be the model's own MeanMaxPoolHead: the
+    trained encoder's (B,256) embedding is defined by encoder + head together.
+    A local mean here would silently precompute payloads that disagree with
+    what the SMC engine saw in training (the B1-class train/serve skew).
     """
     if windows.dim() != 5:
         raise ValueError(
             f"encode_windows expects (W,T,C,H,Wg) 5D stacked windows, got shape {tuple(windows.shape)}")
     n_windows = windows.shape[0]
     features, _ = encoder(windows.permute(1, 0, 2, 3, 4).to(device))
-    if features.dim() == 5:
-        z = features.mean(dim=[0, 3, 4])          # over T, H, W -> (B=windows, D)
-    else:
-        raise ValueError(
-            f"Encoder returned unexpected {features.dim()}D features of shape {tuple(features.shape)}")
+    z = pool_head(features)                        # (T,B,D,4,4) -> (B,D), shared with training
     if z.shape[0] != n_windows:
         raise RuntimeError(
             f"Window-count mismatch: encoded {n_windows} windows into {z.shape[0]} rows — "
@@ -69,18 +70,19 @@ def encode_windows(encoder, windows, device):
 
 
 @torch.no_grad()
-def encode_bag_batch(encoder, video, device):
-    """Encode a dataloader batch of bags into per-bag GAP'd embeddings.
+def encode_bag_batch(encoder, video, device, *, pool_head):
+    """Encode a dataloader batch of bags into per-bag pooled embeddings.
 
     video: (B, K, T, C, H, Wg) 6D bagged batch or (B, T, C, H, Wg) 5D
-    (bagging off, K=1). Returns (B, FEATURE_DIM).
+    (bagging off, K=1). Returns (B, FEATURE_DIM). `pool_head` is required —
+    see encode_windows.
     """
     if video.dim() == 5:
         video = video.unsqueeze(1)               # (B,1,T,C,H,Wg)
     if video.dim() != 6:
         raise ValueError(f"Expected 5D/6D video batch, got {video.dim()}D shape {tuple(video.shape)}")
     B, K = video.shape[0], video.shape[1]
-    rows = [encode_windows(encoder, video[b], device) for b in range(B)]   # each (K, D)
+    rows = [encode_windows(encoder, video[b], device, pool_head=pool_head) for b in range(B)]  # each (K, D)
     return torch.stack(rows, dim=0).mean(dim=1)
 
 

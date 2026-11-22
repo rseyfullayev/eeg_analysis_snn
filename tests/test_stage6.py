@@ -188,6 +188,78 @@ def test_loto_ghosting_is_trial_scoped():
     assert out3["diagnostics"]["n_negatives"] <= 24 + 24, "LOTO ghosting must bound same-trial negatives"
 
 
+# ------------------------------------------------------------------ cloud LOTO support mask
+
+def _same_trial_other_window(eng, base, win_offset):
+    """Same batch, same trials, DIFFERENT window ids: these keys survive the queue's
+    uid exclusion and can only be removed by the per-pair trial mask."""
+    z, kz, lb, sb, w, tr = base
+    return z, kz, lb, sb, w + win_offset, tr
+
+
+def test_cloud_loto_mask_excludes_same_trial_keys():
+    from src.snn_modeling.utils.sm_loss import UID_SHIFT
+    eng, _ = _seeded_engine()
+    base = _batch(eng, 0)
+    eng.forward(*base)                                  # queue holds trials 0..5
+    z, kz, lb, sb, w, tr = _same_trial_other_window(eng, base, 1000)
+    out = eng.forward(z, kz, lb, sb, w, tr)
+    d = out["diagnostics"]
+    assert d["loto_mask"] is True and d["loto_forbidden_frac"] > 0.0, \
+        f"trial mask did not forbid any pair: {d['loto_forbidden_frac']}"
+    # the mask must be exactly the trial-equality relation on the recovered cloud trials
+    clouds = eng.queue.read_class_clouds(exclude_window_ids=eng._compose_uids(tr, w))
+    for y, cl in clouds.items():
+        assert "window_ids" in cl, "cloud lost its uids — trial recovery would be impossible"
+        key_trial = cl["window_ids"] // UID_SHIFT
+        sp = eng._loto_support(clouds, tr)[int(y)]
+        assert torch.equal(sp, key_trial.view(1, -1) != tr.view(-1, 1))
+        assert (~sp).any(), f"class {y}: expected some same-trial pairs to be forbidden"
+
+
+def test_cloud_loto_mask_changes_alpha_and_emotion_only():
+    """Mask ON vs OFF on identical state must move alpha / L_em / D_norm, and nothing
+    that is not supposed to change (costs stay in [0,2], anchor is untouched)."""
+    def run(mask):
+        eng, _ = _seeded_engine()
+        eng.ot_loto_mask = mask
+        base = _batch(eng, 0)
+        eng.forward(*base)
+        z, kz, lb, sb, w, tr = _same_trial_other_window(eng, base, 1000)
+        return eng.forward(z, kz, lb, sb, w, tr)
+    off, on = run(False), run(True)
+    assert not torch.allclose(off["alpha"], on["alpha"]), \
+        "the mask left the E-step responsibilities unchanged — it is not wired in"
+    assert abs(float(off["L_em"]) - float(on["L_em"])) > 1e-9, "L_em ignored the mask"
+    assert off["diagnostics"]["loto_forbidden_frac"] == 0.0
+    assert on["diagnostics"]["loto_forbidden_frac"] > 0.0
+    # D_norm is reported per class in both runs; masked drop mass is accounted, not lost
+    for y in on["diagnostics"]["D_norm"]:
+        assert float(on["diagnostics"]["D_norm"][y]) >= 0.0
+
+
+def test_cloud_loto_mask_refuses_silent_disable():
+    """A cloud payload without uids must raise, not silently train unmasked."""
+    eng, _ = _seeded_engine()
+    z, kz, lb, sb, w, tr = _batch(eng, 0)
+    eng.forward(z, kz, lb, sb, w, tr)
+    bad_clouds = {y: {"keys": c["keys"], "weights": c["weights"], "beta_sum": c["beta_sum"],
+                      "n": c["n"]} for y, c in eng.queue.read_class_clouds().items()}
+    _expect(RuntimeError, lambda: eng._loto_support(bad_clouds, tr),
+            "LOTO mask silently disabled when the cloud lost its uids")
+
+
+def test_cloud_loto_mask_off_matches_previous_behaviour():
+    eng, _ = _seeded_engine()
+    eng.ot_loto_mask = False
+    base = _batch(eng, 0)
+    eng.forward(*base)
+    z, kz, lb, sb, w, tr = _same_trial_other_window(eng, base, 1000)
+    out = eng.forward(z, kz, lb, sb, w, tr)
+    assert out["diagnostics"]["loto_mask"] is False
+    assert out["diagnostics"]["loto_cold_rows"] == 0
+
+
 # ------------------------------------------------------------------ state + lock
 
 def test_state_roundtrip_forward_identical():
@@ -229,13 +301,31 @@ def test_lock_fullpass_schema():
 
 def test_sizing_and_staleness_init_checks():
     eng, _ = _seeded_engine()          # n_q = 256
+    from src.snn_modeling.memory.queue import queue_floor
+    # §9.6 floor now uses the SEEDED min_y(pi_y*rho_y), never the rho_min guess:
+    burst = eng.class_prior.double() * eng.rho.double()
+    rho_tilde = float(burst.min())
+    assert abs(rho_tilde - 0.0177) < 5e-3, f"seeded burst min off: {rho_tilde}"
+    # feasible: tol large enough that the seeded floor lands at/below n_q=256
     floor, ceiling = eng.run_sizing_checks(batch_size=24, epochs=10, steps_per_epoch=50,
-                                           L_const=1.0, d_eff=8.0, tol_eff=2.5,
+                                           L_const=1.0, d_eff=8.0, tol_eff=3.0,
                                            C_const=4.0, eps_tol=20.0)
-    assert floor <= 256 <= ceiling, f"engine's own queue {256} outside [{floor}, {ceiling}]"
+    assert floor == queue_floor(C_const=4.0, d_eff=8.0, tol=3.0, rho_tilde_min=rho_tilde)
+    assert floor <= 256 <= ceiling, f"engine queue 256 outside [{floor}, {ceiling}]"
+    # hard raise on a sub-floor breach by default (§9.6 gate is live)
     _expect(ValueError, lambda: eng.run_sizing_checks(
         batch_size=24, epochs=10, steps_per_epoch=50, L_const=1.0, d_eff=64.0,
-        tol_eff=0.1, C_const=4.0, eps_tol=10.0), "infeasible sizing accepted (§9.6 gate)")
+        tol_eff=0.1, C_const=4.0, eps_tol=20.0), "infeasible sizing accepted (§9.6 gate)")
+    # allow_smoke_sizing downgrades that same sub-floor breach to a warning (no raise)
+    s_floor, s_ceiling = eng.run_sizing_checks(
+        batch_size=24, epochs=10, steps_per_epoch=50, L_const=1.0, d_eff=64.0,
+        tol_eff=0.1, C_const=4.0, eps_tol=20.0, allow_smoke_sizing=True)
+    assert s_floor > 256, "smoke path should only be reachable when n_q is below the floor"
+    # ceiling breach STILL raises even with allow_smoke_sizing (staleness is never waived)
+    _expect(ValueError, lambda: eng.run_sizing_checks(
+        batch_size=24, epochs=10, steps_per_epoch=50, L_const=1.0, d_eff=8.0,
+        tol_eff=3.0, C_const=4.0, eps_tol=2.0, allow_smoke_sizing=True),
+        "over-ceiling queue accepted in smoke mode")
 
 
 def test_bad_config_inputs_rejected():

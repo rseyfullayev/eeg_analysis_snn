@@ -46,6 +46,40 @@ class ProjectionHead(nn.Module):
         embedding = F.normalize(proj.view(B, -1), dim=1, eps=1e-6)
         return embedding
 
+class MeanMaxPoolHead(nn.Module):
+    """(T, B, C, H, W) -> depthwise kernel x kernel (padding=0) -> GroupNorm
+    -> per-channel 0.5*mean_t + 0.5*max_t -> (B, C), UNNORMALIZED (the caller
+    owns the L2 step).
+
+    With kernel=4 on the 4x4 stage-4 map the conv lands on exactly 1x1: the
+    convolution IS the spatial squeeze (each channel learns to mix its own 4x4
+    topographic positions). The max term keeps short alpha-burst peaks that a
+    plain mean over T dilutes. No activation before the pooling stats on
+    purpose - SiLU would rectify away the negative half of the embedding that
+    L2-normalization is meant to keep. GroupNorm is per (frame, sample) only:
+    no cross-time or cross-batch statistics.
+    """
+
+    def __init__(self, channels=256, kernel=4):
+        super().__init__()
+        self.kernel = int(kernel)
+        self.dw = nn.Conv2d(channels, channels, kernel_size=self.kernel,
+                            groups=channels, padding=0, bias=False)
+        self.norm = nn.GroupNorm(1, channels)
+
+    def forward(self, feats):
+        if feats.dim() != 5:
+            raise ValueError(f"MeanMaxPoolHead expects time-first (T,B,C,H,W), got {tuple(feats.shape)}")
+        T, B, C, H, W = feats.shape
+        # Exact-fit guard: silently averaging a leftover k x k residue would
+        # change the embedding semantics, so any spatial drift fails loudly.
+        if H != self.kernel or W != self.kernel:
+            raise ValueError(f"depthwise squeeze needs HxW == kernel ({self.kernel}x{self.kernel}), "
+                             f"got {H}x{W} - encoder spatial schedule changed?")
+        x = self.norm(self.dw(feats.reshape(T * B, C, H, W)))  # (T*B, C, 1, 1)
+        x = x.view(T, B, C)
+        return 0.5 * x.mean(dim=0) + 0.5 * x.max(dim=0).values
+
 class VIBLayer(nn.Module):
     def __init__(self, in_channels):
         super(VIBLayer, self).__init__()
