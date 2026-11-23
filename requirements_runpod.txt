@@ -1,0 +1,15 @@
+hydra-core
+matplotlib
+mne
+numpy
+omegaconf
+pandas
+Requests
+scikit_learn
+scipy
+seaborn
+segmentation_models_pytorch
+snntorch
+tqdm
+wandb
+umap-learn
