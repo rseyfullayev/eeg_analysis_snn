@@ -13,7 +13,7 @@ import torch.optim as optim
 
 # ──────────────────────── Muon Wrapper ──────────────────────── #
 
-class Muon(torch.optim.Muon):
+class Muon():
     """Wrapper around torch.optim.Muon that handles >2D tensor reshaping.
 
     torch.optim.Muon expects 2D matrices for Newton-Schulz orthogonalization.
@@ -37,7 +37,7 @@ class Muon(torch.optim.Muon):
                     # its ndim==2 validation check
                     p.data = p.data.view(p.size(0), -1)
 
-        super().__init__(param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum)
+        #super().__init__(param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum)
 
         # Immediately restore original shapes so model.forward() works
         for group in param_groups:
