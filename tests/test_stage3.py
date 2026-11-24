@@ -217,9 +217,13 @@ def test_cloud_kernel_lse_equals_sinkhorn_cost():
     eps = 0.5
     lp, costs = cloud_log_p_matrix(z, clouds, eps)
     assert lp.shape == (10, 4) and set(costs) == {0, 1, 2, 3}
+    from src.snn_modeling.utils.estep import half_sq_cost
     for col, y in enumerate(sorted(clouds)):
-        # cost matrix must be EXACTLY 1 - z~^T r_j (Stage 4 reuses this object)
-        c_ref = 1.0 - z @ clouds[y]["keys"].t()
+        # cost matrix must be EXACTLY 0.5*||z~ - r_j||^2 (Eq. 9; Stage 4 reuses it).
+        # On the unit sphere this coincides with the old cosine cost 1 - z~^T r_j.
+        c_ref = half_sq_cost(z, clouds[y]["keys"])
+        assert torch.allclose(c_ref, 1.0 - z @ clouds[y]["keys"].t(),
+                              atol=1e-12), "norm-1 rows: Euclid != cosine (algebra slip)"
         assert torch.allclose(costs[y], c_ref, atol=1e-12), "shared kernel != cost matrix"
         assert costs[y].min() >= -1e-9 and costs[y].max() <= 2.0 + 1e-9
         # logsumexp implementation == direct mixture sum
@@ -243,6 +247,103 @@ def test_cloud_kernel_lse_equals_sinkhorn_cost():
                 lambda: cloud_log_p_matrix(z, {0: {"keys": clouds[0]["keys"][:, :3],
                                                    "weights": clouds[0]["weights"]}}, eps)]:
         _expect((ValueError, RuntimeError), bad, "bad cloud input accepted")
+
+
+def test_cloud_kernel_interior_self_zero():
+    """Eq. 9 on the ACTUAL interior (||z~|| < 1, the tau_norm-floored regime):
+    a window coinciding with an interior cloud key must see cost EXACTLY 0
+    (the old cosine cost charged 1 - ||v||^2 > 0 for the identical vector)."""
+    keys = F.normalize(torch.randn(6, D, dtype=torch.float64), dim=1) * 0.6   # ||r|| = 0.6 < 1
+    clouds = {0: {"keys": keys, "weights": torch.full((6,), 1.0 / 6, dtype=torch.float64)}}
+    lp, costs = cloud_log_p_matrix(keys.clone(), clouds, eps=0.5)
+    diag = costs[0].diagonal()
+    assert torch.allclose(diag, torch.zeros(6, dtype=torch.float64), atol=1e-15), \
+        f"C(v, v) != 0 in the interior: {diag}"
+    assert torch.allclose(lp, torch.log(clouds[0]["weights"] * 1.0 + 0), atol=1e-12) or \
+        (lp <= 1e-12).all(), "log p_y must stay a valid log-mixture (<= 0)"
+
+
+def test_solve_offset_bisection_and_alpha_calibrated():
+    """Rm 4.2 / Eq. 7-8: 25-step bisection roots mean sigma((s + u)/T) = rho_y on
+    the buffer, and alpha_calibrated reduces to alpha_1a at u = T*logit(rho_y)."""
+    from src.snn_modeling.utils.estep import (alpha_calibrated, solve_offset_bisection)
+    s = torch.tensor([-2.0, -1.0, 0.5, 1.5, 3.0], dtype=torch.float64)
+    T, rho = 1.0, 0.5
+    u, info = solve_offset_bisection(s, rho, T, steps=25)
+    assert abs(float(torch.sigmoid(s + u).mean()) - rho) < 1e-6, info
+    assert info["steps"] == 25 and info["residual"] < 1e-6
+    # T-scaled target: mean sigma((s + u*)/T) hits rho_y for a hotter schedule too
+    u2, _ = solve_offset_bisection(s, 0.25, 8.0, steps=25)
+    assert abs(float(torch.sigmoid((s + u2) / 8.0).mean()) - 0.25) < 1e-4
+    # uncalibrated anchor: u = T*logit(rho) makes alpha_calibrated == alpha_1a exactly
+    lp_y = -3.0 * torch.rand(12, dtype=torch.float64)
+    lp_s = -4.0 * torch.rand(12, dtype=torch.float64)
+    rho_v = torch.full((12,), 0.2, dtype=torch.float64)
+    a_eq, _ = alpha_1a(lp_y, lp_s, rho_v, T=3.0)
+    a_cal, _ = alpha_calibrated(lp_y - lp_s, 3.0 * torch.log(rho_v / (1 - rho_v)), 3.0)
+    assert torch.allclose(a_eq, a_cal, atol=1e-12), "calibrated form != Eq. 6 at the seed offset"
+    assert (a_cal > 0).all() and (a_cal < 1).all()
+    for bad in [lambda: solve_offset_bisection(torch.empty(0), 0.5, 1.0),
+                lambda: solve_offset_bisection(torch.tensor([0.0, float("nan")]), 0.5, 1.0),
+                lambda: solve_offset_bisection(s, 0.0, 1.0),
+                lambda: solve_offset_bisection(s, 0.5, 0.0),
+                lambda: solve_offset_bisection(s, 0.5, 1.0, steps=0),
+                lambda: alpha_calibrated(s, s[:3], 1.0),
+                lambda: alpha_calibrated(s, torch.full_like(s, float("nan")), 1.0)]:
+        _expect((ValueError, RuntimeError), bad, "bad calibration input accepted")
+
+
+def test_option_b_seed_is_self_map_on_clamped_box():
+    """Prop 9.3 (REVISED): the Option-B seeding loop clamps F(u) to
+    [logit(rho_min), logit(1 - rho_min)] at EVERY iteration, so even wildly
+    skewed Delta scores cannot push the seed outside the interiority box."""
+    rho_min = 0.02
+    lo, hi = math.log(rho_min / (1 - rho_min)), -math.log(rho_min / (1 - rho_min))
+    torch.manual_seed(11)
+    for delta in (50.0 + 0.01 * torch.randn(64, dtype=torch.float64),
+                  -50.0 + 0.01 * torch.randn(64, dtype=torch.float64),
+                  1000.0 * torch.eye(8, dtype=torch.float64).reshape(-1)[:8] +
+                  torch.arange(8, dtype=torch.float64)):
+        rho, diag = option_b_seed(delta, rho_min=rho_min)
+        assert rho_min - 1e-9 <= rho <= 1 - rho_min + 1e-9, f"seed left the box: {rho}"
+        assert lo - 1e-9 <= diag["u_star"] <= hi + 1e-9, "u_star outside I_clamp"
+
+
+def test_alpha_1b_calibration_offset():
+    """Eq. 14/18 hookup: the locked c_y enters the numerator as l_y + c_y, keeps
+    class-permutation invariance (label-free), and c = 0 reproduces raw Eq. 14."""
+    torch.manual_seed(4)
+    lp = -4 * torch.rand(12, 4, dtype=torch.float64)
+    ls = -3 * torch.rand(12, dtype=torch.float64)
+    rho = torch.tensor([0.3, 0.05, 0.2, 0.4], dtype=torch.float64)
+    zero = torch.zeros(4, dtype=torch.float64)
+    assert torch.allclose(alpha_1b(lp, ls, rho, calibration=zero),
+                          alpha_1b(lp, ls, rho), atol=1e-15)
+    c = torch.tensor([-0.5, 0.1, 0.0, 0.7], dtype=torch.float64)
+    a_c = alpha_1b(lp, ls, rho, calibration=c)
+    perm = torch.tensor([2, 0, 3, 1])
+    a_p = alpha_1b(lp[:, perm], ls, rho[perm], calibration=c[perm])
+    assert torch.allclose(a_c, a_p, atol=1e-12), "calibration broke 1B permutation invariance"
+    # raising class-3's offset can only raise the responsibility (monotone numerator)
+    c_hi = c.clone(); c_hi[3] += 2.0
+    assert (alpha_1b(lp, ls, rho, calibration=c_hi) >= a_c - 1e-12).all()
+    _expect(ValueError, lambda: alpha_1b(lp, ls, rho, calibration=torch.ones(3, dtype=torch.float64)),
+            "mis-sized calibration accepted")
+    _expect(ValueError, lambda: alpha_1b(lp, ls, rho,
+                                         calibration=torch.full((4,), float("nan"),
+                                                                dtype=torch.float64)),
+            "NaN calibration accepted")
+    # two_step_baseline carries the same calibration (Eq. 18 G-operator numerator)
+    h, lp_b = _synthetic_bag(nb=4)
+    rho2 = torch.tensor([0.1, 0.2], dtype=torch.float64)
+    tb0 = two_step_baseline(h, lp_b, rho2, 1.0, calibration=torch.zeros(2, dtype=torch.float64))
+    tb1 = two_step_baseline(h, lp_b, rho2, 1.0)
+    assert torch.allclose(tb0["mu_hat"], tb1["mu_hat"], atol=1e-15)
+    tb2 = two_step_baseline(h, lp_b, rho2, 1.0, calibration=torch.tensor([1.0, -1.0]))
+    assert not torch.allclose(tb2["mu_hat"], tb1["mu_hat"], atol=1e-9), "calibration inert in G"
+    _expect(ValueError, lambda: two_step_baseline(h, lp_b, rho2, 1.0,
+                                                  calibration=torch.ones(3)),
+            "mis-sized two_step calibration accepted")
 
 
 def test_log_baseline_gaussian():

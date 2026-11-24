@@ -88,8 +88,10 @@ def test_seed_priors_interior_and_eps_admissible():
     from src.snn_modeling.utils.sinkhorn import check_eps_admissible, dustbin_price
     for y in range(C):
         check_eps_admissible(eng.eps, eng.sn_tol, eng.sn_T_sc,
-                             float(dustbin_price(eng.eps, float(rho[y]))))
+                             float(dustbin_price(float(rho[y]), eng.tau_0, eng.kappa_cost)))
     assert 0.9 < eng.eps <= 1.0, f"midpoint eps {eng.eps} off Thm 12.2 interval"
+    # Eq. 11 config defaults are the approved pair
+    assert eng.tau_0 == 0.35 and eng.kappa_cost == 0.50
 
 
 def test_forward_requires_seed():
@@ -295,6 +297,53 @@ def test_lock_fullpass_schema():
     bad = dict(lock)
     bad["rho"] = torch.full((C,), float("nan"))
     _expect(ValueError, lambda: validate_lockpass(bad), "NaN rho lock accepted")
+    # v2 fields: calibrated offsets + sigma_hat^2 are mandatory (Eq. 18 hookup)
+    assert torch.isfinite(lock["c"]).all() and lock["c"].shape == (C,)
+    assert isinstance(lock["sigma_hat_sq"], float) and lock["sigma_hat_sq"] > 0.0
+    rho_d = lock["rho"].double()
+    c_ref = eng.u_bar.double() - torch.log(rho_d / (1.0 - rho_d))
+    assert torch.allclose(lock["c"].double(), c_ref, atol=1e-6), "c != u_bar - logit(rho)"
+    for drop in ("c", "sigma_hat_sq"):
+        cut = dict(lock); cut.pop(drop)
+        _expect(ValueError, lambda: validate_lockpass(cut), f"lockpass without {drop} accepted")
+    badc = dict(lock); badc["c"] = torch.full((C,), float("nan"))
+    _expect(ValueError, lambda: validate_lockpass(badc), "NaN c lock accepted")
+
+
+def test_lock_refuses_uncalibrated_lock():
+    """Step 0 alone leaves buffer B_y unscored (cold start) — the lock must REFUSE
+    to export a silent zero offset, not ship a half-calibrated artifact."""
+    eng, _ = _seeded_engine()
+    z, kz, lb, sb, w, tr = _batch(eng, 0)
+    eng.forward(z, kz, lb, sb, w, tr)
+    assert not torch.isfinite(eng.u_bar).any(), "step 0 must not calibrate on an empty buffer"
+    _expect(RuntimeError, lambda: eng.lock_fullpass(),
+            "lockpass exported an uncalibrated (NaN) c_y offset")
+
+
+def test_calibrated_offset_matches_rho_and_sigma_floor():
+    """Rm 4.2 / Eq. 7-8: after enough steps every u_bar_y is finite, sigma_hat^2
+    respects the sigma_min^2 floor, and the within-class mean responsibility
+    tracks the bisection target rho_y (mean alpha_y ~= rho_y)."""
+    eng, _ = _seeded_engine()
+    out = None
+    for t in range(8):
+        z, kz, lb, sb, w, tr = _batch(eng, t)
+        out = eng.forward(z, kz, lb, sb, w, tr)
+    d = out["diagnostics"]
+    assert torch.isfinite(eng.u_bar).all(), f"u_bar uncalibrated after 8 steps: {d['u_bar']}"
+    assert float(eng.sigma_hat_sq) >= eng.sigma_sq - 1e-12, "sigma_hat^2 broke the sigma_min^2 floor"
+    assert abs(d["sigma_hat_sq"] - float(eng.sigma_hat_sq)) < 1e-12
+    assert d["calib"] and all(v["calibrated"] for v in d["calib"].values()), d["calib"]
+    alpha = out["alpha"].detach()
+    rho = eng.rho.detach()
+    labels = _batch(eng, 7)[2]                     # same deterministic batch builder
+    for y in range(C):
+        m = labels == y
+        mean_a = float(alpha[m].mean())
+        r_y = float(rho[y])
+        assert abs(mean_a - r_y) <= 0.5 * r_y + 0.05, \
+            f"class {y}: mean(alpha)={mean_a:.4f} !~= rho_y={r_y:.4f}"
 
 
 # ------------------------------------------------------------------ §9.6 / §9.4 init asserts

@@ -6,9 +6,14 @@ One ring buffer, TWO readouts (Rm 9.2):
 
 Each entry stores: the norm-floored nullspace key r_j in B^d, its class y_j,
 its burst weight beta_j = alpha^(1A)_j (detached), its window_id (§9.4 leakage
-guard: same-window keys are masked at READ time on BOTH readouts), and the
-enqueue step (staleness accounting, §9.4). Queue-vs-queue use is forbidden
-(Prop 9.1): every readout pairs with current-batch gradients upstream.
+guard: same-window keys are masked at READ time on BOTH readouts), the
+enqueue step (staleness accounting, §9.4), and — Rm 4.2 / Eq. 7-8 — the RAW
+calibration score s_{j,y_j} = l_y(z~_j) - l_s(h'_j) of the window AT ENQUEUE
+TIME (key view, detached). The class slice of the score ring IS the rolling
+class buffer B_y the E-step offset calibration solves against; entries stored
+without scores carry NaN and any calibration read over them raises (never a
+silent zero offset). Queue-vs-queue use is forbidden (Prop 9.1): every readout
+pairs with current-batch gradients upstream.
 
 §9.6 sizing helpers (floor/ceiling) and the §9.4 staleness bound are exact
 formula ports; training setup (Stage 6) must call check_sizing()/check_staleness().
@@ -83,19 +88,37 @@ class SupMoCoQueue(nn.Module):
         self.register_buffer("betas", torch.zeros(self.queue_size))
         self.register_buffer("window_ids", torch.full((self.queue_size,), -1, dtype=torch.long))
         self.register_buffer("steps", torch.full((self.queue_size,), -1, dtype=torch.long))
+        # Rm 4.2 / Eq. 7-8 rolling class buffer B_y material: s_{j,y_j} at enqueue.
+        self.register_buffer("scores", torch.full((self.queue_size,), float("nan")))
         self.register_buffer("ptr", torch.zeros(1, dtype=torch.long))
         self.register_buffer("filled", torch.zeros(1, dtype=torch.long))
 
     # ---------------------------------------------------------------- write
 
     @torch.no_grad()
-    def enqueue(self, keys, labels, betas, window_ids, step):
+    def enqueue(self, keys, labels, betas, window_ids, step, scores=None):
         """Append current-window entries. keys must ALREADY be projected
         z-tilde (NullspaceState.project) and detached (they are stop-grad
-        references; Prop 8.4/§9.1)."""
+        references; Prop 8.4/§9.1).
+
+        scores: optional (n,) RAW calibration scores s_{j,y_j} = l_y - l_s of the
+        KEY view (Rm 4.2 / Eq. 7-8 buffer B_y). Omitting them stores NaN — the
+        entries still serve both §9.2 readouts, but any later calibration read
+        over the slice raises (read_class_scores), never calibrating on a hole.
+        """
         n = keys.shape[0]
         if keys.requires_grad or betas.requires_grad:
             raise RuntimeError("enqueue expects detached keys/betas (stop-grad queue, Prop 8.4)")
+        if scores is None:
+            scores = keys.new_full((n,), float("nan"))
+        else:
+            scores = scores.detach().to(keys.dtype).reshape(-1)
+            if scores.shape != (n,):
+                raise ValueError(f"scores must be (n,)={n}, got {tuple(scores.shape)}")
+            if bool(torch.isinf(scores).any()):
+                raise ValueError("enqueue: +-inf calibration score is a poisoned value; NaN is "
+                                 "the only legal entry (it marks 'score undefined at enqueue "
+                                 "time' and is excluded from buffer B_y at calibration)")
         if keys.shape != (n, self.feature_dim):
             raise ValueError(f"keys must be (n, {self.feature_dim}), got {tuple(keys.shape)}")
         for name, t in (("labels", labels), ("betas", betas), ("window_ids", window_ids)):
@@ -127,6 +150,7 @@ class SupMoCoQueue(nn.Module):
             self.labels.copy_(labels[keep])
             self.betas.copy_(betas[keep])
             self.window_ids.copy_(window_ids[keep])
+            self.scores.copy_(scores[keep])
             self.steps.copy_(torch.full((self.queue_size,), step, dtype=torch.long))
             self.ptr.zero_()
             self.filled.fill_(self.queue_size)
@@ -139,12 +163,13 @@ class SupMoCoQueue(nn.Module):
             self.labels[ptr:end] = labels
             self.betas[ptr:end] = betas
             self.window_ids[ptr:end] = window_ids
+            self.scores[ptr:end] = scores
             self.steps[ptr:end] = step
         else:
             first = self.queue_size - ptr
             second = n - first
             for buf, src in ((self.keys, keys), (self.labels, labels), (self.betas, betas),
-                             (self.window_ids, window_ids)):
+                             (self.window_ids, window_ids), (self.scores, scores)):
                 buf[ptr:] = src[:first]
                 buf[:second] = src[first:]
             self.steps[ptr:] = step
@@ -198,6 +223,7 @@ class SupMoCoQueue(nn.Module):
         labels = self.labels[sl][keep]
         betas = self.betas[sl][keep]
         win_ids = self.window_ids[sl][keep]
+        scores = self.scores[sl][keep]
         for y in labels.unique().tolist():
             m = labels == y
             bsum = float(betas[m].sum().item())
@@ -211,8 +237,35 @@ class SupMoCoQueue(nn.Module):
                 "beta_sum": bsum,
                 "n": int(m.sum()),
                 "window_ids": win_ids[m],
+                "scores": scores[m],          # B_y material (NaN = stored without score)
             }
         return out
+
+    def read_class_scores(self, exclude_window_ids=None, drop_unscored=True):
+        """Rolling class buffer B_y (Rm 4.2 / Eq. 7-8): {y: (n_y,) stored raw
+        scores s_{j,y_j} = l_y - l_s of the class-y ring slice}.
+
+        drop_unscored=True (calibration path) filters the NaN bootstrap entries
+        and RAISES for a class left with zero scored entries — the offset is
+        never solved on an empty/hole-only buffer (no silent zero fallback).
+        The excluded count is returned alongside for loud diagnostics."""
+        clouds = self.read_class_clouds(exclude_window_ids=exclude_window_ids)
+        out, n_nan = {}, {}
+        for y, c in clouds.items():
+            s = c["scores"]
+            if not drop_unscored:
+                out[int(y)] = s
+                n_nan[int(y)] = int((~torch.isfinite(s)).sum())
+                continue
+            fin = torch.isfinite(s)
+            if not bool(fin.any()):
+                raise ValueError(
+                    f"class {y} buffer B_y has {s.numel()} entries and NONE scored — "
+                    "enqueue ran without calibration scores; refusing to solve the "
+                    "offset on an empty buffer (no silent zero-offset fallback)")
+            out[int(y)] = s[fin]
+            n_nan[int(y)] = int(s.numel() - int(fin.sum()))
+        return out, n_nan
 
     # ---------------------------------------------------------------- diagnostics
 

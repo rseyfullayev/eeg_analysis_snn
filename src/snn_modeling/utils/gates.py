@@ -1,16 +1,18 @@
-"""Readiness gate + OT gradient-ratio coefficient (fixed.pdf §8.3, §9.7 Eq. 13, §11.1,
-Prop 12.4(iv), Thm 12.5(i), B5(iii)).
+"""Readiness gate + OT gradient-ratio coefficient (SWEEP-Net Rev. Certified
+§8.3, §9.7, §11.1, Eq. 13/15, Prop 12.4(iv), B5(iii)).
 
-Eq. 13:   g = clamp(C_K^DCL / log(K-1), g_floor, 1),
-          lambda_OT = c * ||grad_z~ L_anc|| / ||grad_z~ L_em|| * g
+Eq. 13:   g = clamp(C_K^DCL / log(K-1), g_floor, 1)
+Eq. 15:   lambda_OT = min(lambda_max, c * g * ||grad_z~ L_anc|| /
+                                      (||grad_z~ L_em|| + 1e-8))
 
 Both norms are gradients w.r.t. the SAME variable z~ (Remark 8.2) — the ratio
 is measured on the projected-embedding tensor via torch.autograd.grad
 (grad_norm below); the batch norms are EMA-carried between steps so single
-spikes cannot throttle or unleash the OT term. The product
-lambda_OT * ||grad L_em|| = c * ||grad L_anc|| * g stays bounded as
-||grad L_em|| -> 0: that regime returns EXACTLY 0 (Thm 12.5(i) OT-inert),
-never a capped surrogate.
+spikes cannot throttle or unleash the OT term. The REVISED spec (Eq. 15) caps
+the ratio at lambda_max (default 1.0) instead of letting it run unbounded: as
+||grad_z~ L_em|| -> 0 the unbounded ratio explodes, so the cap is what KEEPS
+the Anti-Ghost push alive (bounded, never zero, never infinite) in exactly
+that regime — the 1e-8 additive denominator term is part of the equation.
 
 Prop 12.4(iv): the gate is continuous, non-decreasing in C_K and
 1/log(K-1)-Lipschitz away from the clamp boundaries.
@@ -64,21 +66,28 @@ def check_c_gate(c, c_min=0.05, c_max=0.9):
 
 
 class OTCoefficient:
-    """EMA-carried lambda_OT = c * (anc_ema / em_ema) * g (§8.3, §11.1).
+    """EMA-carried lambda_OT = min(lambda_max, c * g * anc_ema / (em_ema + em_floor))
+    (Eq. 15 capped upper bound, §8.3, §11.1).
 
     Pure float bookkeeping (no tensors) — checkpointable via state_dict.
     ``momentum`` is the carry weight on the PREVIOUS value, the same
     convention as NullspaceState/queue EMAs; momentum=0 => latest-wins.
+    ``lambda_max`` (Eq. 15 default 1.0) caps the ratio: the OT push stays
+    ANTI-GHOST ACTIVE (bounded by lambda_max, never 0) as ||grad L_em|| -> 0.
     First observation initialises (no zero-bias); value() before that raises.
     """
 
-    def __init__(self, momentum=0.9, em_floor=_EM_FLOOR):
+    def __init__(self, momentum=0.9, em_floor=_EM_FLOOR, lambda_max=1.0):
         if not (0.0 <= momentum < 1.0):
             raise ValueError(f"OTCoefficient: momentum must lie in [0,1), got {momentum}")
         if not (em_floor > 0.0) or not math.isfinite(em_floor):
             raise ValueError(f"OTCoefficient: em_floor must be positive/finite, got {em_floor}")
+        if not math.isfinite(lambda_max) or lambda_max <= 0.0:
+            raise ValueError(f"OTCoefficient: lambda_max must be positive/finite (Eq. 15), "
+                             f"got {lambda_max}")
         self.momentum = float(momentum)
         self.em_floor = float(em_floor)
+        self.lambda_max = float(lambda_max)
         self.anc = None
         self.em = None
 
@@ -102,6 +111,10 @@ class OTCoefficient:
         return self
 
     def value(self, c, g):
+        """Eq. 15 capped upper bound: min(lambda_max, c*g*anc/(em + em_floor)).
+        g == 0 (closed gate, bootstrap) or anc == 0 still give exactly 0; the
+        em -> 0 regime now saturates at lambda_max (Anti-Ghost preserved)
+        instead of switching the term off."""
         c = float(c)
         g = float(g)
         if not self.ready:
@@ -114,15 +127,16 @@ class OTCoefficient:
             raise ValueError(f"OTCoefficient: c must be finite >= 0, got {c}")
         if g == 0.0 or self.anc == 0.0:
             return 0.0
-        if self.em <= self.em_floor:
-            return 0.0  # Thm 12.5(i): OT gradient vanishing => lambda is exactly 0
-        return c * (self.anc / self.em) * g
+        return min(self.lambda_max, c * g * self.anc / (self.em + self.em_floor))
 
     def inert(self):
+        """Deprecated diagnostic of the OLD Thm 12.5(i) zero-switch; Eq. 15 keeps
+        the capped push alive here. Retained only as the em-floor observer."""
         return self.ready and self.em <= self.em_floor
 
     def state_dict(self):
-        return {"anc": self.anc, "em": self.em, "momentum": self.momentum}
+        return {"anc": self.anc, "em": self.em, "momentum": self.momentum,
+                "lambda_max": self.lambda_max}
 
     def load_state_dict(self, payload):
         """Restores state AND hyperparameters — a checkpoint trained at momentum
@@ -135,6 +149,11 @@ class OTCoefficient:
         if not (0.0 <= self.momentum < 1.0):
             raise ValueError(f"OTCoefficient.load_state_dict: momentum out of range "
                              f"{payload['momentum']}")
+        if payload.get("lambda_max") is not None:
+            lm = self._check_norm(payload["lambda_max"], "lambda_max")
+            if lm <= 0.0:
+                raise ValueError(f"OTCoefficient.load_state_dict: lambda_max must be > 0, got {lm}")
+            self.lambda_max = lm
         self.anc = None if payload["anc"] is None else self._check_norm(payload["anc"], "anc")
         self.em = None if payload["em"] is None else self._check_norm(payload["em"], "em")
         return self

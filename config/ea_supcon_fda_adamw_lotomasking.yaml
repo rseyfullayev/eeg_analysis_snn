@@ -80,7 +80,16 @@ loss:
     rank_energy_band: 0.85      # §11.4ii dynamic spectral rank (0.85–0.90)
     warmup_epochs: 2            # §11.4ii: U=0 while the queue populates
     space_momentum: 0.9         # NullspaceState EMA tables
-    sigma_sq: 1.0               # baseline Gaussian scale (Rm 4.2)
+    sigma_sq: 1.0               # FLOOR sigma_min^2 of the calibrated EMA nullspace variance
+                                # (Rm 4.2 Eq. 7-8: sigma_hat^2 = max(sigma_min^2, EMA estimate))
+    tau_0: 0.35                 # Eq. 11 decoupled geometric drop price: tau_y = tau_0
+                                # - kappa_cost*log(1-rho_y) (no longer eps-scaled)
+    kappa_cost: 0.50            # Eq. 11 log-geometric coefficient (config default pair)
+    calib:                      # Rm 4.2 / Eq. 7-8 offset calibration on the queue buffer B_y
+      bisection_steps: 25       # spec: exactly 25 bisection steps for u_y*
+      ema_momentum: 0.9         # u_bar_y EMA carry (also used for sigma_hat^2)
+    lambda_max: 1.0             # Eq. 15 capped upper bound on lambda_OT (Anti-Ghost preserved
+                                # as ||grad L_em|| -> 0 via the +1e-8 denominator)
     rho_min: 0.02
     seed: {s: 2.0}              # §9.5 burst spread; seed.log_coeff defaults to feature_dim
     seed_max_batches: 96        # Option-B pre-pass cap over train_loader (key must match

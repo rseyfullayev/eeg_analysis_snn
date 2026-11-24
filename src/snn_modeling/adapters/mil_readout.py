@@ -1,16 +1,20 @@
 """Phase 1B R_b readout adapter — fixed.pdf §10.2 (Eq. 17/18, Props 10.3/10.4),
 §11.2/§11.4(iii); plan §5 Stage 7.
 
-Consumes a `smc-lockpass-v1` artifact (frozen mu/U/rank, rho, beta-weighted
-class clouds, eps) plus per-bag UNIT-NORM window embeddings z (T_b, D) — the
+Consumes a `smc-lockpass-v2` artifact (frozen mu/U/rank, rho, the calibrated
+c_y offsets + sigma_hat^2 (Rm 4.2 Eq. 7-8 / Eq. 18), beta-weighted class
+clouds, eps) plus per-bag UNIT-NORM window embeddings z (T_b, D) — the
 v2 bag payload's stored tensor. h'/z~ come ONLY through NullspaceState.project
 (the single geometry path; Rm 6.5 makes unseen subjects work by construction —
 the `subject` field of a payload is deliberately never read here: Phase 1B is
 label- AND subject-free at inference).
 
-Per bag (Prop 10.1/10.2, Eq. 14-16):
-    log p_y(z~) from the frozen clouds; baseline mu_hat_b = G^2(h_bar') via the
-    CERTIFIED two_step_baseline (kappa >= 1 raises, never a silent extra step);
+Per bag (Prop 10.1/10.2, Eq. 14-16/18, Rm 4.2 Eq. 7-8):
+    l_y(z~) from the frozen clouds SHIFTED by the locked offsets c_y (l_y + c_y
+    in the Eq. 14 numerator); baseline mu_hat_b = G^2(h_bar') via the CERTIFIED
+    two_step_baseline (kappa >= 1 raises, never a silent extra step), Gaussian
+    term -||h'-mu_hat'||^2/(2*sigma_hat^2) with the LOCKED calibrated
+    sigma_hat^2 (the sigma_sq ctor arg is an explicit caller override only);
     R_b = (1/T_b) sum_t alpha_t^(1B) h'_t  (Eq. 17, NOT normalized by sum alpha
     — magnitude keeps the burst rate; ||R_b|| <= 2 by construction).
 
@@ -69,7 +73,7 @@ def bags_from_payloads(paths):
 class Phase1BReadout(nn.Module):
     """Frozen geometry + clouds + certified bag statistics + Eq. 18 head."""
 
-    def __init__(self, payload, sigma_sq=1.0, two_step_max_iter=64, two_step_tol=1e-12,
+    def __init__(self, payload, sigma_sq=None, two_step_max_iter=64, two_step_tol=1e-12,
                  omit_duration_norm=False):
         super().__init__()
         # Failure-Catalogue ablation switch (§13 row "Omit 1/T_b"): default False IS
@@ -94,6 +98,11 @@ class Phase1BReadout(nn.Module):
         eps = payload.get("eps")
         if eps is None or not (float(eps) > 0) or not math.isfinite(float(eps)):
             raise ValueError(f"lockpass eps must be positive/finite, got {eps!r}")
+        # Eq. 18 / Rm 4.2: the baseline Gaussian uses the CALIBRATED sigma_hat^2
+        # locked by Phase 1A. sigma_sq is an explicit override knob (ablations /
+        # harness SNR), never a silent default — None means "take the lock".
+        if sigma_sq is None:
+            sigma_sq = float(payload["sigma_hat_sq"])
         if not (sigma_sq > 0) or not math.isfinite(sigma_sq):
             raise ValueError(f"sigma_sq must be positive/finite, got {sigma_sq}")
 
@@ -109,6 +118,9 @@ class Phase1BReadout(nn.Module):
         self.ts_tol = float(two_step_tol)
         self.num_classes = C
         self.register_buffer("rho", rho.float().clone())
+        # Eq. 7-8/18 calibrated offsets c_y = u_bar_y - logit(rho_y) (validated in
+        # lockpass v2): alpha^(1B) scores the clouds with l_y(z~_t) + c_y.
+        self.register_buffer("c", payload["c"].float().clone())
         self.clouds = nn.ModuleList([_Cloud(clouds[y]["keys"], clouds[y]["weights"])
                                      for y in range(C)])
         self.register_buffer("centroids", torch.zeros(C, sp["feature_dim"]))
@@ -152,7 +164,8 @@ class Phase1BReadout(nn.Module):
         h, lp = self._bag_geometry(z)
         if mode == "per_bag":
             tb = two_step_baseline(h, lp, self.rho, self.sigma_sq,
-                                   max_iter=self.ts_max_iter, tol=self.ts_tol)
+                                   max_iter=self.ts_max_iter, tol=self.ts_tol,
+                                   calibration=self.c)
             alpha, kappa, bound, gap = tb["alpha"], tb["kappa"], tb["bound"], tb["gap"]
         else:
             hb = [h]; lb = [lp]
@@ -162,8 +175,10 @@ class Phase1BReadout(nn.Module):
             h_ext = torch.cat(hb, dim=0)
             lp_ext = torch.cat(lb, dim=0)
             tb = two_step_baseline(h_ext, lp_ext, self.rho, self.sigma_sq,
-                                   max_iter=self.ts_max_iter, tol=self.ts_tol)
-            alpha = alpha_1b(lp, log_baseline_gaussian(h, tb["mu_hat"], self.sigma_sq), self.rho)
+                                   max_iter=self.ts_max_iter, tol=self.ts_tol,
+                                   calibration=self.c)
+            alpha = alpha_1b(lp, log_baseline_gaussian(h, tb["mu_hat"], self.sigma_sq),
+                             self.rho, calibration=self.c)
             kappa, bound, gap = tb["kappa"], tb["bound"], tb["gap"]
         if self.omit_duration_norm:
             R = (alpha.unsqueeze(1) * h).sum(dim=0)   # §13 row 8 ablation: no 1/T_b
@@ -303,11 +318,13 @@ class Phase1BReadout(nn.Module):
 
 
 def run_phase_1b(payload, train_z, train_labels, eval_z, eval_labels, *,
-                 lambda_wd=0.05, finetune_epochs=30, lr=1e-3, sigma_sq=1.0,
+                 lambda_wd=0.05, finetune_epochs=30, lr=1e-3, sigma_sq=None,
                  mode="per_bag", buffers=None,
                  omit_duration_norm=False, ablate_bias=False):
     """Full Phase 1B pass in the mandated order; returns the smoke-report dict.
     finetune_epochs=0 skips fine-tuning (pure zero-train evaluation).
+    sigma_sq=None takes the LOCKED calibrated sigma_hat^2 (Eq. 18); an explicit
+    value is a caller-side override, never a silent substitute.
     omit_duration_norm / ablate_bias are the §13 Failure-Catalogue ablation
     switches (defaults False = spec behaviour)."""
     rd = Phase1BReadout(payload, sigma_sq=sigma_sq, omit_duration_norm=omit_duration_norm)

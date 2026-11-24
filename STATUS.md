@@ -1,6 +1,6 @@
 # SWEEP-Net — Project Status
 
-*Companion to `REVIEW_SMC_AUDIT.md` (full plan + build log) and `CERTIFICATION_RUNBOOK.md` (lab-box run order). Authority: `fixed.pdf`. Snapshot 2026-10-21; test counts are live `def test_` counts of `tests/test_stage*.py`.*
+*Companion to `REVIEW_SMC_AUDIT.md` (full plan + build log) and `CERTIFICATION_RUNBOOK.md` (lab-box run order). Authority: `SWEEP-Net Specification Revised  Certified.pdf` (supersedes `fixed.pdf` since the 2026-11-25 sync below). Snapshot 2026-10-21; test counts are live `def test_` counts of `tests/test_stage*.py`.*
 
 ## Build — Stages 0–8 (all delivered)
 
@@ -56,6 +56,20 @@
 | **Cloud LOTO support mask** (NEW) | Per-pair same-**trial** mask as a **structural zero** (`-inf` on `logK`), shared by the E-step `log p_y` and the OT cross term (Rm 4.2). A `C_ij = 1e4` sentinel is impossible here: `_validate_cost` raises outside [0,2] and `estep` clamps to 2.0, and it would push `eps_lower_bound` 0.92 → 4617. Dustbin row/col never maskable; self-terms unmasked. `loss.sm.ot_loto_mask: true`; logged as `SMC/LotoMaskOn`, `SMC/LotoForbiddenFrac`, `SMC/LotoColdRows`. Same-**subject** masking deliberately rejected — it routes freed mass to the dustbin and inflates `D_norm_y` (Table 1 #5) |
 | **Asymmetric dual view** (fix) | `dataset.py` had ONE chain for both views → the momentum **key** view was FM3D-mixed, so donor spectra entered `ν_y` and `μ_s`. Now `augmentations` (query: FM3D + light) and `key_augmentations` (light, no FM3D) are separate; `training.key_view: light\|clean`. Two fail-loud guards: undeclared key view raises, a key chain containing FourierMixup raises (nested check). Probe's `clean_train_set` clears both |
 | Tests | 94 → **105** (0:16 1:9 2:9 3:11 4:17 5:14 6:16 7:6 8:7) — **104 green** 2026-11-23; the one failure is the pre-existing `run_phase1b_t0_t5` import in stage 0 (that harness was deleted 2026-11-21; pending owner call) |
+
+## Post-plan change · 2026-11-25 — sync to the REVISED CERTIFIED spec (6-point ticket)
+
+| # | What | Detail |
+|---|---|---|
+| 1 | **Half-squared Euclidean ground cost** (Eq. 9 / Prop 8.1) | `estep.half_sq_cost(z, r) = 0.5·(‖z‖²+‖r‖²−2z·r).clamp(min=0)` — sqrt-free Gram expansion (smooth at z=r, no cdist NaN). Replaces the cosine `1 − z̃ᵀr` in `cloud_log_p_matrix` AND all three `class_ot_term` costs. Gives **C(v,v)=0 in the interior ‖v‖<1** (the norm-floored z̃ regime), stays in [0,2] so the B2a diameter bound and `-inf` support masking are untouched. On the sphere it coincides with cosine bit-near (old tests pass unchanged) |
+| 2 | **Decoupled geometric drop price** (Eq. 11) | `dustbin_price(rho, tau_0=0.35, kappa_cost=0.50) = tau_0 − kappa_cost·log1p(−rho)` — signature no longer carries eps; **seed_priors' eps solve lost its 3-step self-consistency loop** (tau is eps-constant → B2a lb = 0.9233, midpoint eps = 0.9617). `loss.sm.tau_0/kappa_cost` config-exposed. Solver was and stays strictly log-domain (log-sum-exp on logK with −inf mask) — required now more than ever: at ρ≈0.9, exp(−τ/ε) ≈ 1e−7 would underflow linear scaling |
+| 3 | **Calibrated nullspace E-step + buffer B_y + 1B hookup** (Rm 4.2, Eq. 7–8, Prop 10.1) | `queue.py` stores the per-window raw score s_{j,y_j}=l_y(z̃_j)−l_s(h′_j) (key view) in a new `scores` ring — NaN = "undefined at enqueue" (cold start), strict `read_class_scores` refuses an all-hole buffer. `estep.solve_offset_bisection` = 25-step bisection of mean σ((s+u)/T)=ρ_y on B_y; the root is stored in **natural (T-normalised) units** (w*=u*/T) so the EMA + c_y=ū_y−logit(ρ_y) are anneal-schedule-invariant. Engine: `u_bar`/`sigma_hat_sq` EMA buffers (σ̂² = max(σ_min²=floor from `sigma_sq`, EMA[Σ(1−α)‖h′−μ̂′ₛ‖²/((d−m)Σ(1−α))]), m=rank); α^(1A)=σ(s/T+ū_y) for calibrated classes, raw Eq. 6 until first root. **lockpass schema → `smc-lockpass-v2`** (mandatory `c` + `sigma_hat_sq`, validate refuses NaN/absent); `mil_readout` defaults `sigma_sq=None` → locked σ̂², and α^(1B)/G² numerators use **l_y + c_y** (Eq. 18; `alpha_1b`/`two_step_baseline` gained `calibration`). `train.py` preview drops the sigma override |
+| 4 | **Capped λ_OT upper bound** (Eq. 15) | `OTCoefficient.value = min(lambda_max, c·g·anc/(em+1e-8))`, `lambda_max: 1.0` config-exposed — the em→0 regime now **saturates at λ_max (Anti-Ghost kept alive)** instead of the old exact-zero Thm 12.5(i) switch; g=0/anc=0 still give exactly 0; λ_max rides the checkpoint state_dict |
+| 5 | **Option-B self-map clamp** (Prop 9.3) | already in place since 8a7c25b (u clamped to [logit ρ_min, logit(1−ρ_min)] every iteration) — now pinned by `test_option_b_seed_is_self_map_on_clamped_box` |
+| 6 | **Asymmetric FourierMixup dual views** | already delivered 2026-11-23 (query FM3D p=0.5 + light chain; key chain FM3D-free, two fail-loud guards) — no change, covered by stage-0 guards |
+| Voids | every pre-sync checkpoint queue state (`scores` buffer → strict load refuses), every `smc-lockpass-v1` artifact, and any eps pinned against the old eps-coupled lb — full 1A rerun required (free: no lab numbers exist yet) |
+| Smoke | `.qwen` scratch ticket-smoke (30 synthetic steps + lock → readout): finite grads; fp64 interior C(v,v)=0 exact (fp32 diagonal ≤ 6e−8); per-class mean α = ρ_y to 4 dp after Eq. 12; λ_OT cap binds at 1.0 as ‖∇L_em‖→0; R finite, centroid == Eq. 18 head |
+| Tests | 105 → **113** (0:16 1:9 2:11 3:15 4:18 5:14 6:18 7:6 8:7) — **112 green** 2026-11-25; the single failure remains the pre-existing stage-0 `run_phase1b_t0_t5` import (owner call) |
 
 ## Final audit (10 checks, `AUDIT.md`) — 2026-11-23
 

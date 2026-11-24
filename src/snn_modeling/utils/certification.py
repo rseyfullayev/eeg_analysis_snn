@@ -142,14 +142,15 @@ def remediation_ladder(dnorm_y, eps, eps_min, eps_max, rho_y, rho_min,
     steps = [
         {"step": 1, "fires": bool(near_min),
          "action": f"epsilon={eps:.4f} sits near eps_min={eps_min:.4f} (interval "
-                   f"[{eps_min:.4f}, {eps_max:.4f}]): early cosine costs give "
-                   "exp(-C/eps) << 1-rho_y, forcing mass into the drop slack d_i. "
+                   f"[{eps_min:.4f}, {eps_max:.4f}]): early half-squared costs give "
+                   "exp(-C/eps) << exp(-tau_y/eps), forcing mass into the drop slack d_i. "
                    "SHIFT epsilon toward the midpoint of its admissible interval.",
          "evidence": f"(eps-eps_min)/width = {(eps - eps_min) / width:.3f} <= {LADDER_EPS_NEAR_MIN}"},
         {"step": 2, "fires": bool(under_seeded),
          "action": f"rho_y={rho_y:.4f} under-seeded near rho_min={rho_min:.4f} => "
-                   "tau_y = -eps*log(1-rho_y) too small, dropping nearly free. "
-                   "RE-VERIFY the Option-B fixed-point seed and the burst spread s > 1.",
+                   "tau_y = tau_0 - kappa_cost*log(1-rho_y) at its floor tau_0, dropping "
+                   "nearly free. RE-VERIFY the Option-B fixed-point seed and the burst "
+                   "spread s > 1.",
          "evidence": f"rho_y <= rho_min*(1+{LADDER_RHO_SLACK})"},
         {"step": 3, "fires": bool(ess_y < ess_floor),
          "action": f"ESS_y={ess_y:.1f} << prototype-richness floor {ess_floor:.1f} "

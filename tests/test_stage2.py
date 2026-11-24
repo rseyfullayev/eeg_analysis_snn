@@ -204,6 +204,73 @@ def test_summary_empty_and_full():
     assert s["filled"] == 2 and s["oldest_step"] == 7 and abs(s["fill_ratio"] - 0.5) < 1e-9
 
 
+# ------------------------------------------------------------------ buffer B_y (Rm 4.2 / Eq. 7-8)
+
+def _expect(exc, fn, msg):
+    try:
+        fn()
+    except exc:
+        return
+    raise AssertionError(msg)
+
+
+
+def test_class_buffer_scores_roundtrip():
+    """queue.py stores per-window raw scores s_{j,y_j} alongside keys/labels/betas/
+    uids, forming the rolling class buffer B_y; un-scored entries are NaN and the
+    STRICT reader refuses to calibrate on a hole."""
+    q = _q(size=8)
+    k = _keys(4, seed=21)
+    sc = torch.tensor([0.5, -1.25, 3.0, 0.0], dtype=torch.float32)
+    q.enqueue(k, torch.tensor([0, 1, 0, 1]), torch.full((4,), 0.5),
+              torch.tensor([10, 11, 12, 13]), step=1, scores=sc)
+    clouds = q.read_class_clouds()
+    assert torch.allclose(clouds[0]["scores"], torch.tensor([0.5, 3.0]))
+    assert torch.allclose(clouds[1]["scores"], torch.tensor([-1.25, 0.0]))
+    bufs, nan = q.read_class_scores()
+    assert torch.allclose(bufs[0], torch.tensor([0.5, 3.0])) and nan[0] == 0
+    # ring writes keep each stored score ALIGNED with its key/label slice
+    q.enqueue(_keys(4, seed=22), torch.tensor([0, 0, 1, 1]), torch.full((4,), 0.25),
+              torch.tensor([14, 15, 16, 17]), step=2,
+              scores=torch.full((4,), -7.0))
+    bufs, nan = q.read_class_scores()
+    assert nan == {0: 0, 1: 0} and bufs[0].numel() == 4 and bufs[1].numel() == 4
+    assert torch.allclose(bufs[0], torch.tensor([0.5, 3.0, -7.0, -7.0]))
+    assert torch.allclose(bufs[1], torch.tensor([-1.25, 0.0, -7.0, -7.0]))
+    # no-score enqueue -> NaN entries; strict read raises, raw read counts them
+    q2 = _q(size=4)
+    q2.enqueue(_keys(2, seed=23), torch.tensor([0, 0]), torch.full((2,), 0.5),
+               torch.tensor([1, 2]), step=0)
+    assert torch.isnan(q2.scores[:2]).all()
+    _expect(ValueError, lambda: q2.read_class_scores(),
+            "calibration accepted an all-NaN buffer (silent zero offset)")
+    raw, nan = q2.read_class_scores(drop_unscored=False)
+    assert int((~torch.isfinite(raw[0])).sum()) == 2 and nan[0] == 2
+    # poisoned +-inf score is rejected at the door (NaN is the ONLY legal marker)
+    _expect(ValueError, lambda: q2.enqueue(_keys(1, seed=24), torch.tensor([1]),
+                                           torch.tensor([0.5]), torch.tensor([9]), step=3,
+                                           scores=torch.tensor([float("inf")])),
+            "+-inf score accepted at enqueue")
+    # mixed buffer: finite subset returned, NaN count exposed for diagnostics
+    q3 = _q(size=8)
+    q3.enqueue(_keys(2, seed=25), torch.tensor([0, 0]), torch.full((2,), 0.5),
+               torch.tensor([3, 4]), step=0)                      # unscored class-0 keys
+    q3.enqueue(_keys(4, seed=26), torch.tensor([0, 1, 1, 1]), torch.full((4,), 0.5),
+               torch.tensor([5, 6, 7, 8]), step=1,
+               scores=torch.tensor([1.5, -0.5, 0.25, 0.75]))
+    bufs, nan = q3.read_class_scores()
+    assert torch.allclose(bufs[0], torch.tensor([1.5])) and nan[0] == 2
+    assert torch.allclose(bufs[1], torch.tensor([-0.5, 0.25, 0.75])) and nan[1] == 0
+
+
+def test_scores_shape_and_length_guard():
+    q = _q(size=4)
+    _expect(ValueError, lambda: q.enqueue(_keys(2, seed=26), torch.tensor([0, 1]),
+                                          torch.full((2,), 0.5), torch.tensor([1, 2]),
+                                          step=0, scores=torch.ones(3)),
+            "mis-sized score vector accepted")
+
+
 # ------------------------------------------------------------------ runner
 
 def main():

@@ -179,31 +179,55 @@ def test_lambda_ema_arithmetic():
     coeff = OTCoefficient(momentum=0.9)
     _expect(RuntimeError, lambda: coeff.value(0.5, 1.0), "value defined before any observation")
     coeff.observe(2.0, 4.0)
-    assert abs(coeff.value(0.5, 1.0) - 0.25) < 1e-12
+    assert abs(coeff.value(0.5, 1.0) - 0.25) < 1e-8
     coeff.observe(4.0, 4.0)  # anc: 0.9*2 + 0.1*4 = 2.2 ; em stays 4.0
     assert abs(coeff.anc - 2.2) < 1e-12 and abs(coeff.em - 4.0) < 1e-12
-    assert abs(coeff.value(0.5, 1.0) - 0.5 * (2.2 / 4.0)) < 1e-12
-    assert coeff.value(0.5, 0.0) == 0.0
-    raw = OTCoefficient(momentum=0.0)  # latest-wins sanity
+    assert abs(coeff.value(0.5, 1.0) - 0.5 * (2.2 / 4.0)) < 1e-8
+    assert coeff.value(0.5, 0.0) == 0.0                     # closed gate -> exactly 0
+    raw = OTCoefficient(momentum=0.0)  # latest-wins sanity, uncapped below lambda_max
     raw.observe(1.0, 2.0); raw.observe(5.0, 2.0)
-    assert abs(raw.value(1.0, 1.0) - 2.5) < 1e-12
+    assert abs(raw.value(0.1, 1.0) - 0.25) < 1e-8           # 0.1 * 5/(2+1e-8)
+    assert raw.value(1.0, 1.0) == raw.lambda_max, "ratio above lambda_max must saturate, not run"
+    wide = OTCoefficient(momentum=0.0, lambda_max=3.0)
+    wide.observe(5.0, 2.0)
+    assert abs(wide.value(1.0, 1.0) - 2.5) < 1e-7            # 5/(2+1e-8), c*g = 1
     _expect(ValueError, lambda: OTCoefficient(momentum=1.0), "momentum=1 accepted")
+    _expect(ValueError, lambda: OTCoefficient(lambda_max=0.0), "lambda_max=0 accepted")
+    _expect(ValueError, lambda: OTCoefficient(lambda_max=-1.0), "negative lambda_max accepted")
+    _expect(ValueError, lambda: OTCoefficient(lambda_max=float("nan")), "nan lambda_max accepted")
     _expect(ValueError, lambda: raw.observe(-1.0, 2.0), "negative norm accepted")
     _expect(ValueError, lambda: raw.observe(float("nan"), 2.0), "nan norm accepted")
     _expect(ValueError, lambda: raw.value(0.5, 1.5), "g>1 accepted")
 
 
-def test_lambda_inert_zero_em_gradient():
+def test_lambda_capped_antighost_eq15():
+    """Eq. 15 (REVISED): lambda_OT = min(lambda_max, c*g*||grad L_anc|| /
+    (||grad L_em|| + 1e-8)). As ||grad L_em|| -> 0 the OLD spec switched OT off
+    (lambda = 0); the capped form KEEPS the Anti-Ghost push alive at lambda_max."""
     coeff = OTCoefficient().observe(1.0, 1e-12)
-    assert coeff.inert() and coeff.value(0.5, 1.0) == 0.0, "OT-inert regime must give lambda=0"
+    assert coeff.inert(), "em-floor diagnostic must still flag the vanishing-gradient regime"
+    lam = coeff.value(0.5, 1.0)
+    assert lam == coeff.lambda_max == 1.0, f"Anti-Ghost lost: lambda={lam} (expected cap 1.0)"
+    assert lam <= coeff.lambda_max + 1e-15
+    tight = OTCoefficient(lambda_max=0.25).observe(1.0, 0.0)
+    assert tight.value(0.5, 1.0) == 0.25, "cap must bind at lambda_max, never above"
+    # the +1e-8 denominator term: raw ratio 0.5*1/(0+1e-8) = 5e7 stays FINITE and the
+    # cap binds (the old unbounded Eq. 13 equality would have produced 5e7 here)
+    exact = OTCoefficient(momentum=0.0, lambda_max=10.0).observe(1.0, 0.0)
+    assert exact.value(0.5, 1.0) == 10.0, "must saturate at lambda_max=10, never exceed"
+    # cap holds across the whole (c, g) grid for arbitrarily small em
+    for c in (0.05, 0.5, 0.9):
+        for g in (0.0, 0.1, 0.7, 1.0):
+            assert OTCoefficient().observe(3.0, 1e-15).value(c, g) <= 1.0
 
 
 def test_lambda_state_dict_roundtrip():
-    src = OTCoefficient(momentum=0.8)
+    src = OTCoefficient(momentum=0.8, lambda_max=0.4)
     src.observe(3.0, 6.0); src.observe(2.0, 5.0)
     st = src.state_dict()
     dst = OTCoefficient().load_state_dict(st)
     assert dst.momentum == 0.8 and abs(dst.anc - src.anc) < 1e-15
+    assert dst.lambda_max == 0.4, "lambda_max must resume with the checkpoint it was tuned under"
     assert abs(dst.value(0.5, 0.7) - src.value(0.5, 0.7)) < 1e-15
     _expect(ValueError, lambda: OTCoefficient().load_state_dict({"anc": 1.0}), "partial state accepted")
 

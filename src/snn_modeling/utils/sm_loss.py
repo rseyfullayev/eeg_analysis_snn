@@ -37,7 +37,8 @@ from .space import NullspaceState
 from ..memory.queue import (SupMoCoQueue, check_sizing, check_staleness, queue_ceiling,
                             queue_floor)
 from .sparsity import (burst_delta_scores, option_b_seed, rho_mstep, sparsity_loss)
-from .estep import (alpha_1a, cloud_log_p_matrix, log_baseline_gaussian)
+from .estep import (alpha_1a, alpha_calibrated, cloud_log_p_matrix, log_baseline_gaussian,
+                    solve_offset_bisection)
 from .sinkhorn import (burst_marginal, class_ot_term, dustbin_price, check_eps_admissible,
                        eps_lower_bound)
 from .dcl import ProjectedAnchor
@@ -45,7 +46,7 @@ from .gates import OTCoefficient, check_c_gate, grad_norm, readiness_gate
 
 __all__ = ["SMCLossEngine", "LOCKPASS_SCHEMA"]
 
-LOCKPASS_SCHEMA = "smc-lockpass-v1"
+LOCKPASS_SCHEMA = "smc-lockpass-v2"   # v2 adds the calibrated c_y offsets + sigma_hat^2 (Eq. 7-8/18)
 UID_SHIFT = 2 ** 20
 
 
@@ -92,7 +93,23 @@ class SMCLossEngine(nn.Module):
                   "§13 row 2) — results from this run are paper evidence, NOT the model.")
         self.seed_s = float(g("seed.s", 2.0))
         self.seed_log_coeff = float(_get(cfg, "seed.log_coeff", float(feature_dim)))
+        # Eq. 11 decoupled geometric drop price (replaces the old tau = -eps*log1p(-rho) lock):
+        self.tau_0 = float(g("tau_0", 0.35))
+        self.kappa_cost = float(g("kappa_cost", 0.50))
+        if self.tau_0 < 0.0 or self.kappa_cost <= 0.0:
+            raise ValueError(f"SMCLossEngine: tau_0 must be >= 0 and kappa_cost > 0 (Eq. 11), "
+                             f"got {self.tau_0}/{self.kappa_cost}")
+        # Rm 4.2 / Eq. 7-8 calibration: sigma_sq is the FLOOR sigma_min^2 of the EMA
+        # empirical nullspace variance (sigma_hat^2 = max(sigma_min^2, running estimate));
+        # the offset bisection uses bisection_steps (spec: 25) and EMA-smooths with
+        # calib_momentum.
         self.sigma_sq = float(g("sigma_sq", 1.0))
+        self.calib_steps = int(_get(cfg, "calib.bisection_steps", 25))
+        self.calib_momentum = float(_get(cfg, "calib.ema_momentum", 0.9))
+        if self.calib_steps < 1 or not (0.0 <= self.calib_momentum < 1.0):
+            raise ValueError(f"SMCLossEngine: calib.bisection_steps >= 1 and "
+                             f"calib.ema_momentum in [0,1) required, got "
+                             f"{self.calib_steps}/{self.calib_momentum}")
         self.tau_dcl = float(g("tau_dcl", 0.1))
         self.anchor_on = str(g("anchor_on", "projected"))
         if self.anchor_on not in ("projected", "raw"):
@@ -104,6 +121,10 @@ class SMCLossEngine(nn.Module):
             raise ValueError(f"SMCLossEngine: bad anneal schedule {self.t_anneal}->{self.t_end} "
                              f"over {self.anneal_frac} of steps")
         self.c = check_c_gate(g("c", 0.5), c_min=g("c_min", 0.05), c_max=g("c_max", 0.9))
+        self.lambda_max = float(g("lambda_max", 1.0))   # Eq. 15 capped upper bound
+        if not math.isfinite(self.lambda_max) or self.lambda_max <= 0.0:
+            raise ValueError(f"SMCLossEngine: lambda_max must be positive/finite (Eq. 15), "
+                             f"got {self.lambda_max}")
         self.g_floor = float(g("g_floor", 0.1))
         if not (0.0 <= self.g_floor < 1.0):
             raise ValueError(f"SMCLossEngine: g_floor must lie in [0,1), got {self.g_floor}")
@@ -141,9 +162,15 @@ class SMCLossEngine(nn.Module):
                                     warmup_epochs=self.warmup_epochs)
         self.queue = SupMoCoQueue(int(g("n_q", 4096)), feature_dim, num_classes=self.num_classes)
         self.anchor = ProjectedAnchor(tau_dcl=self.tau_dcl, anchor_on=self.anchor_on)
-        self.coeff = OTCoefficient(momentum=float(g("gate_ema_momentum", 0.9)))
+        self.coeff = OTCoefficient(momentum=float(g("gate_ema_momentum", 0.9)),
+                                   lambda_max=self.lambda_max)
 
         self.register_buffer("rho", torch.full((self.num_classes,), float("nan")))
+        # Rm 4.2 / Eq. 7-8 calibration state: EMA offset u_bar_y (NaN until the class
+        # buffer B_y yields its first bisection root) and the EMA nullspace variance
+        # sigma_hat^2 (initialised AT the sigma_min^2 floor = sigma_sq knob).
+        self.register_buffer("u_bar", torch.full((self.num_classes,), float("nan")))
+        self.register_buffer("sigma_hat_sq", torch.full((), float(self.sigma_sq)))
         # Empirical class prior pi_y (from the Option-B seed pre-pass window counts).
         # The §9.6 floor uses the SEEDED min_y(pi_y * rho_y), never the rho_min guess.
         self.register_buffer("class_prior", torch.zeros(self.num_classes))
@@ -176,21 +203,16 @@ class SMCLossEngine(nn.Module):
             raise RuntimeError("seed_priors: zero windows scanned — pi_y is undefined")
         self.class_prior.copy_((counts / counts.sum()).to(self.class_prior.dtype))
         self.rho.copy_(rho.to(self.rho.dtype))
+        # Eq. 11 decoupled price: tau_y does NOT depend on eps, so the B2a lower
+        # bound is a constant — no self-consistency iteration (the old tau =
+        # eps*h(rho) lock needed a fixed-point scan for the midpoint eps).
+        taus = [float(dustbin_price(float(rho[y]), self.tau_0, self.kappa_cost))
+                for y in range(self.num_classes)]
         if self.eps is None:  # approved-default midpoint of the Thm 12.2 interval
-            lb = max(eps_lower_bound(self.sn_tol, self.sn_T_sc,
-                                     float(dustbin_price(0.5, float(rho[y])))) for y in range(self.num_classes))
-            # NOTE: tau_y = eps*h(rho_y) scales with eps; solve lb(eps)=eps self-consistently
-            # by scanning the midpoint definition eps = (lb(eps)+eps_max)/2 with 3 fixed-point steps.
-            eps = 0.5 * (lb + self._eps_max)
-            for _ in range(3):
-                lb_e = max(eps_lower_bound(self.sn_tol, self.sn_T_sc,
-                                           float(dustbin_price(eps, float(rho[y]))))
-                           for y in range(self.num_classes))
-                eps = 0.5 * (lb_e + self._eps_max)
-            self.eps = float(eps)
+            lb = max(eps_lower_bound(self.sn_tol, self.sn_T_sc, t) for t in taus)
+            self.eps = float(0.5 * (lb + self._eps_max))
         for y in range(self.num_classes):  # hard gate per class, per §12.2
-            check_eps_admissible(self.eps, self.sn_tol, self.sn_T_sc,
-                                 float(dustbin_price(self.eps, float(rho[y]))))
+            check_eps_admissible(self.eps, self.sn_tol, self.sn_T_sc, taus[y])
         self.seeded.fill_(True)
         return {"rho": {y: float(rho[y]) for y in range(self.num_classes)},
                 "diags": diags, "eps": self.eps}
@@ -267,6 +289,43 @@ class SMCLossEngine(nn.Module):
             support[int(y)] = key_trial.view(1, -1) != trial_ids.view(-1, 1)
         return support
 
+    def _calibrate_offsets(self, clouds, T):
+        """Rm 4.2 / Eq. 7-8: per class, solve (1/|B_y|) sum_{t in B_y}
+        sigma((s_t + u)/T) = rho_y by 25-step bisection on the queue's rolling
+        class buffer. The raw root u* is converted to NATURAL (T-normalised)
+        units w* = u*/T before the EMA, so u_bar_y carries the logit-scale
+        offset: applying it as sigma((s + T*u_bar)/T) = sigma(s/T + u_bar) hits
+        the calibration target at the CURRENT schedule and c_y = u_bar_y -
+        logit(rho_y) is the lock-passable correction (T-invariant, so a lock
+        taken mid- or post-anneal exports the same correction). u_bar stays NaN
+        until the first finite root — those classes follow the raw Eq. 6 path,
+        which coincides with u_bar = logit(rho_y). Buffer entries stored without
+        a score (NaN, cold-start bootstrap) are EXCLUDED and counted in the
+        returned diagnostics, never imputed."""
+        diag = {}
+        with torch.no_grad():
+            for y in sorted(int(k) for k in clouds):
+                s = clouds[y]["scores"]
+                if s is None or s.numel() == 0:
+                    continue
+                fin = torch.isfinite(s)
+                n_nan = int(s.numel() - int(fin.sum()))
+                if not bool(fin.any()):
+                    diag[y] = {"n_buf": int(s.numel()), "n_unscored": n_nan,
+                               "calibrated": False}
+                    continue
+                prev = float(self.u_bar[y])
+                seed = None if not math.isfinite(prev) else T * prev
+                u_star, binfo = solve_offset_bisection(s[fin], float(self.rho[y]), T,
+                                                       steps=self.calib_steps, seed_offset=seed)
+                w_star = float(u_star) / T
+                self.u_bar[y] = (w_star if not math.isfinite(prev) else
+                                 self.calib_momentum * prev + (1.0 - self.calib_momentum) * w_star)
+                diag[y] = {"n_buf": int(s.numel()), "n_unscored": n_nan, "calibrated": True,
+                           "u_star": float(u_star), "w_star": w_star,
+                           "residual": float(binfo["residual"])}
+        return diag
+
     @staticmethod
     def _compose_uids(trial_ids, window_ids):
         if trial_ids.dtype != torch.long or window_ids.dtype != torch.long:
@@ -329,7 +388,7 @@ class SMCLossEngine(nn.Module):
         # shared geometry (fixed.pdf §2): single project() path for every consumer
         h_q, zt_q, _ = self.space.project(z)                 # grad-carrying side
         with torch.no_grad():
-            _, zt_k, _ = self.space.project(key_z.detach())  # stop-grad key path
+            h_k, zt_k, _ = self.space.project(key_z.detach())  # stop-grad key path
 
         clouds = self.queue.read_class_clouds(exclude_window_ids=uids)
         neg_keys, _, _, neg_uids = self.queue.read_negatives(exclude_window_ids=uids)
@@ -349,11 +408,17 @@ class SMCLossEngine(nn.Module):
                               query_group=trial_ids, neg_group=neg_uids // UID_SHIFT)
             L_anc, C_K, K = anc["L_DCL"], float(anc["C_K"].detach()), int(anc["K"])
 
-        # ---- E-step responsibilities alpha^(1A) (Eq. 6) with cold-class fallback
+        # ---- E-step responsibilities alpha^(1A) (Eq. 6 / Rm 4.2 Eq. 7-8) with
+        #      cold-class fallback. Once a class buffer B_y has produced a finite
+        #      bisection root, its rows use the CALIBRATED form
+        #      alpha = sigma((l_y - l_s)/T + u_bar_y); until then they follow the raw
+        #      Eq. 6 path — the two agree exactly at u_bar = logit(rho_y).
         rho_vec = self.rho.detach()
         alpha = rho_vec[labels].clone()
         cold_rows = B
         ainfo = None
+        calib_diag = {}
+        log_p_s = None
         if clouds:
             classes = sorted(int(y) for y in clouds)
             col_of = {y: i for i, y in enumerate(classes)}
@@ -372,10 +437,40 @@ class SMCLossEngine(nn.Module):
                     loto_cold_rows = int((~keep).sum())
                     rows, log_p_y = rows[keep], log_p_y[keep]
                 if rows.numel() > 0:
-                    log_p_s = log_baseline_gaussian(h_q, self._subject_baseline(subjects), self.sigma_sq)
-                    a_present, ainfo = alpha_1a(log_p_y, log_p_s[rows], rho_vec[labels[rows]], T)
+                    log_p_s = log_baseline_gaussian(h_q, self._subject_baseline(subjects),
+                                                    float(self.sigma_hat_sq))
+                    # offset calibration FIRST (uses the buffer B_y of the key view),
+                    # then the responsibilities of the CURRENT batch follow u_bar.
+                    calib_diag = self._calibrate_offsets(clouds, T)
+                    s_rows = log_p_y - log_p_s[rows]
+                    # u_bar is in natural (logit-scale) units -> alpha_calibrated
+                    # applies sigma((s + T*u_bar)/T) = sigma(s/T + u_bar).
+                    u_rows = (self.u_bar.to(s_rows.device)[labels[rows]] * T)
+                    cal = torch.isfinite(u_rows)
                     alpha = alpha.clone()
-                    alpha[rows] = a_present
+                    if bool(cal.any()):
+                        a_cal, ainfo = alpha_calibrated(s_rows[cal], u_rows[cal], T)
+                        alpha[rows[cal]] = a_cal
+                    if bool((~cal).any()):
+                        a_ep, info_ep = alpha_1a(log_p_y[~cal], log_p_s[rows][~cal],
+                                                 rho_vec[labels[rows][~cal]], T)
+                        alpha[rows[~cal]] = a_ep
+                        if ainfo is None:
+                            ainfo = info_ep
+            # key-view raw scores for the buffer B_y (NaN where l_y is undefined:
+            # cold class / fully same-trial cloud — excluded at calibration time)
+            with torch.no_grad():
+                lp_k, _ = cloud_log_p_matrix(zt_k, clouds, eps, support=support)
+                s_key = lp_k.gather(1, present.clamp(min=0).unsqueeze(1)).squeeze(1)
+                s_key = torch.where(present >= 0, s_key, torch.full_like(s_key, float("nan")))
+                s_key = s_key - log_baseline_gaussian(h_k, self._subject_baseline(subjects),
+                                                      float(self.sigma_hat_sq))
+                s_key = torch.where(torch.isfinite(s_key)
+                                    & (present >= 0), s_key,
+                                    torch.full_like(s_key, float("nan")))
+                key_scores = s_key
+        else:
+            key_scores = None
 
         # ---- sparsity prior (Eq. 21) with the CURRENT rho table, then Eq. 12 M-step
         L_spr = sparsity_loss(alpha, labels, rho_vec)
@@ -411,7 +506,7 @@ class SMCLossEngine(nn.Module):
                 a_y = burst_marginal(alpha.detach()[rows])
                 cl = clouds[y]
                 tau_y = 1.0e6 if self.force_balanced else float(
-                    dustbin_price(eps, float(self.rho[y])))
+                    dustbin_price(float(self.rho[y]), self.tau_0, self.kappa_cost))
                 out = class_ot_term(zt_q[rows], a_y, cl["keys"], cl["weights"],
                                     eps, tau_y, self_nu_cache=self._nu_cache.get(y),
                                     n_iters=self.sn_iters, tol=self.sn_solver_tol,
@@ -449,7 +544,26 @@ class SMCLossEngine(nn.Module):
         # ---- M-step side effects (stop-grad material, Prop 8.4 / §6)
         with torch.no_grad():
             self.space.update_batch(z.detach(), alpha.detach(), subjects)
-            self.queue.enqueue(zt_k, labels, alpha.detach(), uids, step)
+            # Rm 4.2 / Eq. 7-8 EMA nullspace baseline variance:
+            # sigma_hat^2 = max(sigma_min^2, EMA[ sum_t (1-a_t) ||h'_t - mu_hat'_s_t||^2
+            #                                     / ((d - m) sum_t (1-a_t)) ])
+            # with m = current nullspace rank removed by U (Rm 6.4) — per-DIMENSION
+            # variance, so sigma_hat^2 plugs straight into log_baseline_gaussian.
+            base_s = self._subject_baseline(subjects)
+            w = 1.0 - alpha.detach()
+            wsum = float(w.sum())
+            if wsum <= 1e-12:
+                raise RuntimeError("sigma_hat update: sum(1-alpha) ~ 0 — the batch is fully "
+                                   "burst-flagged, no baseline mass to calibrate (Rm 4.2 "
+                                   "interiority upstream, never a silent skip)")
+            m_rank = int(self.space.rank.item()) if not self.space.warmup_active else 0
+            d_dims = self.space.feature_dim - m_rank
+            est = float((w * (h_q - base_s).pow(2).sum(dim=1)).sum()) / (d_dims * wsum)
+            sg = float(self.sigma_hat_sq)
+            self.sigma_hat_sq.fill_(max(self.sigma_sq,
+                                        self.calib_momentum * sg
+                                        + (1.0 - self.calib_momentum) * est))
+            self.queue.enqueue(zt_k, labels, alpha.detach(), uids, step, scores=key_scores)
             self.step += 1
 
         diag = {"step": step, "T": T, "gate": g, "lambda_ot": lam,
@@ -466,6 +580,10 @@ class SMCLossEngine(nn.Module):
                     if support else 0.0),
                 "alpha_mean": float(alpha.detach().mean()),
                 "alpha_std": float(alpha.detach().std()) if B > 1 else 0.0,
+                "sigma_hat_sq": float(self.sigma_hat_sq),
+                "u_bar": {int(k_): (None if not math.isfinite(float(v)) else float(v))
+                          for k_, v in zip(range(self.num_classes), self.u_bar.tolist())},
+                "calib": calib_diag,
                 "D_norm": d_norm, "queue": self.queue.summary(),
                 "space": self.space.summary(), "eps": self.eps,
                 "ess": {int(k_): v for k_, v in self.queue.ess_by_class().items()}}
@@ -490,17 +608,33 @@ class SMCLossEngine(nn.Module):
 
     def lock_fullpass(self):
         """End-of-Phase-1A lock artifact (§6.4/§9.3): exact (mu, U, rank), rho,
-        final beta-weighted clouds — everything Phase 1B is evaluated against."""
+        final beta-weighted clouds PLUS the calibrated c_y = u_bar_y - logit(rho_y)
+        offsets and sigma_hat^2 (Rm 4.2 / Eq. 7-8) that Phase 1B's alpha^(1B)
+        (Eq. 14/18) is evaluated with. A class whose buffer B_y never produced a
+        finite bisection root locks NO artifact — loud refusal, not a zero offset."""
         if not bool(self.seeded.item()):
             raise RuntimeError("lock_fullpass before seed_priors — refusing an artifact with NaN rho")
+        uncal = [y for y in range(self.num_classes) if not math.isfinite(float(self.u_bar[y]))]
+        if uncal:
+            raise RuntimeError(
+                f"lock_fullpass with uncalibrated classes {uncal} — buffer B_y never yielded a "
+                "finite offset root (run 1A past cold start / check queue scoring); Phase 1B "
+                "refuses a silently uncalibrated c_y")
+        if not math.isfinite(float(self.sigma_hat_sq)) or float(self.sigma_hat_sq) <= 0.0:
+            raise RuntimeError(f"lock_fullpass: sigma_hat^2 = {float(self.sigma_hat_sq)} is not "
+                               "a positive finite calibrated variance")
         clouds = self.queue.read_class_clouds()
+        rho = self.rho.detach().cpu().clone().double()
+        c = self.u_bar.detach().cpu().clone().double() - torch.log(rho / (1.0 - rho))
         payload = {
             "schema": LOCKPASS_SCHEMA,
             "space": self.space.lock_payload(),
             "rho": self.rho.detach().cpu().clone(),
-            "clouds": {y: {"keys": c["keys"].detach().cpu().clone(),
-                           "weights": c["weights"].detach().cpu().clone()}
-                       for y, c in clouds.items()},
+            "c": c.to(self.rho.dtype),
+            "sigma_hat_sq": float(self.sigma_hat_sq),
+            "clouds": {y: {"keys": c_["keys"].detach().cpu().clone(),
+                           "weights": c_["weights"].detach().cpu().clone()}
+                       for y, c_ in clouds.items()},
             "step": int(self.step.item()),
             "eps": self.eps,
         }
@@ -516,6 +650,17 @@ def validate_lockpass(payload):
         raise ValueError("lockpass rho must be a finite vector")
     if (rho <= 0).any() or (rho >= 1).any():
         raise ValueError("lockpass rho outside (0,1) — interiority violated")
+    # v2 fields: calibrated offsets c_y (Rm 4.2 / Eq. 7-8) and sigma_hat^2 (Eq. 18)
+    if "c" not in payload or "sigma_hat_sq" not in payload:
+        raise ValueError("lockpass v2 must carry the calibrated 'c' offsets and 'sigma_hat_sq' "
+                         "— a pre-calibration artifact cannot drive Phase 1B (Eq. 18)")
+    c = payload["c"]
+    if not torch.is_tensor(c) or c.shape != rho.shape or not torch.isfinite(c).all():
+        raise ValueError("lockpass c must be a finite vector matching rho — refusing a "
+                         "silently zero calibration offset")
+    sg = payload["sigma_hat_sq"]
+    if not (isinstance(sg, float) and math.isfinite(sg) and sg > 0.0):
+        raise ValueError(f"lockpass sigma_hat_sq must be a positive finite float, got {sg!r}")
     if not payload["clouds"]:
         raise ValueError("lockpass has empty clouds — 1A never filled the queue?")
     for y, c in payload["clouds"].items():

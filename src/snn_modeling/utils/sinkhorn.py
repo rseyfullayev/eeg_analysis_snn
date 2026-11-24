@@ -1,10 +1,21 @@
-"""Dustbin Sinkhorn OT for the SMC emotion term (fixed.pdf §5.3-5.6, §8, B2/B3).
+"""Dustbin Sinkhorn OT for the SMC emotion term (SWEEP-Net Rev. Certified
+§5.3-5.6, §8, Eq. 9/11, B2/B3 + numerical-safety clause).
 
 Balanced log-domain matrix scaling on the AUGMENTED (n+1)x(m+1) kernel:
   C~ = [[0, tau...],[tau..., C]],  row marginal (1, a), col marginal (1, b)
-with tau = tau_y = -eps*log(1-rho_y) (§5.4 Eq. 8): the Gibbs drop weight
-exp(-tau/eps) = 1 - rho_y is EXACTLY the prior baseline probability, so
-no free drop-rate hyperparameter exists (and none may be added).
+with the DECOUPLED geometric drop price (Eq. 11):
+  tau_y = tau_0 - kappa_cost * log(1 - rho_y)     (defaults tau_0=0.35,
+  kappa_cost=0.50)
+tau no longer scales with eps: the Gibbs drop weight exp(-tau_y/eps) is a
+DECOUPLED function of (eps, rho_y), not the exact 1 - rho_y of the old
+Eq. 8 lock. At rho_y ~ 0.9 and small eps that weight (~1e-7) UNDERFLOWS any
+linear-domain scaling — which is why this solver stays strictly in the LOG
+DOMAIN (log-sum-exp updates on logK = -C~/eps with -inf support masking);
+never port it to linear rescaling.
+
+The ground cost C is the HALF-SQUARED EUCLIDEAN metric on B^d (Eq. 9 /
+Prop 8.1) built by estep.half_sq_cost: C(v, v) = 0 in the interior ||v|| < 1,
+C stays in [0, 2] (so the B2a diameter bound is untouched).
 
 Def. 5.2/5.4:  W_eps(mu,nu) = min <P~,C~> + R_eps(P~)  (slack constraints (7)
 make this an EXACT balanced problem — unbalanced Sinkhorn is the dead list);
@@ -16,12 +27,14 @@ The nu-self solve is fully detached (cacheable per queue refresh); the mu-self
 solve carries gradients (Prop 8.1(b): ||grad_z~ S|| <= 2 a_i <= 2 on B^d).
 
 Cost matrices come from estep.cloud_log_p_matrix's SHARED kernel (Rm 4.2) —
-this module never recomputes 1 - z~^T r for the cross term.
+this module never recomputes 0.5*||z~ - r||^2 for the cross term.
 """
 
 import math
 
 import torch
+
+from .estep import half_sq_cost
 
 __all__ = ["dustbin_price", "eps_lower_bound", "check_eps_admissible", "min_iters_for_tol",
            "blur_bound", "augment_cost", "burst_marginal", "sinkhorn_plan", "solve_w",
@@ -38,19 +51,27 @@ def _finfo_tiny(dtype):
 
 # ------------------------------------------------------------------ §5.4 drop price + §12.2/B2a eps
 
-def dustbin_price(eps, rho):
-    """tau_y = -eps * log(1 - rho_y)  (Eq. 8). exp(-tau/eps) = 1 - rho_y exactly."""
-    if not (eps > 0.0) or not math.isfinite(eps):
-        raise ValueError(f"dustbin_price: eps must be positive/finite, got {eps}")
+def dustbin_price(rho, tau_0=0.35, kappa_cost=0.50):
+    """tau_y = tau_0 - kappa_cost * log(1 - rho_y)  (Eq. 11, decoupled geometric
+    drop price). No longer a function of eps: tau_0 is the base price of the
+    dustbin node and kappa_cost scales the log-geometric penalty for a high
+    burst prior. tau_y >= tau_0 > 0 always, and it is strictly increasing in
+    rho_y (dropping a near-certain class costs more)."""
+    tau_0 = float(tau_0)
+    kappa_cost = float(kappa_cost)
+    if not math.isfinite(tau_0) or tau_0 < 0.0:
+        raise ValueError(f"dustbin_price: tau_0 must be finite >= 0, got {tau_0}")
+    if not math.isfinite(kappa_cost) or kappa_cost <= 0.0:
+        raise ValueError(f"dustbin_price: kappa_cost must be positive/finite, got {kappa_cost}")
     if torch.is_tensor(rho):
         if not torch.isfinite(rho).all() or (rho <= 0).any() or (rho >= 1).any():
             raise ValueError("dustbin_price: rho_y must lie strictly in (0,1) — "
                              "the [rho_min, 1-rho_min] clamp happens upstream")
-        return -eps * torch.log1p(-rho)
+        return tau_0 - kappa_cost * torch.log1p(-rho)
     rho = float(rho)
     if not (0.0 < rho < 1.0):
         raise ValueError(f"dustbin_price: rho_y must lie strictly in (0,1), got {rho}")
-    return -eps * math.log1p(-rho)
+    return tau_0 - kappa_cost * math.log1p(-rho)
 
 
 def _artanh(x):
@@ -319,8 +340,8 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
         if bool(support.all()):
             support = None            # fully open graph: identical solve, cheaper path
 
-    cost_cross = 1.0 - z_tilde @ keys.t()          # grad-carrying; Rm 4.2 form
-    cost_self_mu = 1.0 - z_tilde @ z_tilde.t()
+    cost_cross = half_sq_cost(z_tilde, keys)       # grad-carrying; Eq. 9 ground cost
+    cost_self_mu = half_sq_cost(z_tilde, z_tilde)  # C(v, v) = 0 also for ||v|| < 1
     for name, C in (("cross", cost_cross), ("self-mu", cost_self_mu)):
         _validate_cost(C, f"class_ot_term {name} cost")
 
@@ -333,7 +354,7 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
     W_self_mu = W_with_grad(cost_self_mu, self_mu["plan"], tau, eps)
 
     if self_nu_cache is None:
-        cost_self_nu = (1.0 - keys @ keys.t()).detach()
+        cost_self_nu = half_sq_cost(keys, keys).detach()
         _validate_cost(cost_self_nu, "class_ot_term self-nu cost")
         snu = sinkhorn_plan(cost_self_nu, b, b, eps, tau, n_iters=n_iters, tol=tol)
         W_self_nu = snu["W"]

@@ -55,7 +55,9 @@ def make_lockpass(seed=0):
     mu = Fn.normalize(torch.randn(C, D), dim=1)
     off = Fn.normalize(torch.randn(S, D), dim=1)
     B = 16
-    for step in range(4):
+    # 20 steps: past the anneal floor (0.3 * 50) so the LOCKED c_y offsets are the
+    # T=1 calibration the Eq. 18 Phase-1B hookup is defined for.
+    for step in range(20):
         labels = torch.arange(B) % C
         subj = torch.arange(B) % S
         z = Fn.normalize(mu[labels] + 0.8 * off[subj] + 0.05 * torch.randn(B, D), dim=1)
@@ -104,6 +106,18 @@ def test_lockpass_strict():
     _expect(ValueError, lambda: Phase1BReadout(badrho), "rho=0 accepted")
     _expect(ValueError, lambda: Phase1BReadout(payload, sigma_sq=0.0), "sigma_sq=0 accepted")
     _expect(ValueError, lambda: Phase1BReadout(dict(payload, eps=0.0)), "eps=0 accepted")
+    # Eq. 18 hookup: the readout takes the LOCKED calibration by default...
+    rd = Phase1BReadout(payload)
+    assert torch.allclose(rd.c, payload["c"]) and rd.c.shape == payload["rho"].shape
+    assert abs(rd.sigma_sq - payload["sigma_hat_sq"]) < 1e-12, \
+        "sigma_sq defaulted away from the locked sigma_hat^2"
+    assert payload["schema"] == "smc-lockpass-v2"
+    # ...and an explicit sigma_sq is a caller OVERRIDE, never a silent substitute
+    assert Phase1BReadout(payload, sigma_sq=0.25).sigma_sq == 0.25
+    noc = dict(payload); noc["c"] = torch.zeros_like(payload["c"])
+    noc["sigma_hat_sq"] = 1.0
+    noc["schema"] = "smc-lockpass-v1"
+    _expect(ValueError, lambda: Phase1BReadout(noc), "pre-calibration v1 lockpass accepted")
 
 
 # ------------------------------------------------------------------ Eq. 17 + certification + duration row

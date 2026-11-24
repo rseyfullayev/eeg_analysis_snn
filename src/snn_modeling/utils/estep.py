@@ -1,17 +1,26 @@
-"""E-step responsibilities for the SMC objective (fixed.pdf Eq. 6/14/15/16/17, Rm 4.2).
+"""E-step responsibilities for the SMC objective (SWEEP-Net Rev. Certified
+Eq. 6-9/14-17, Rm 4.2, Prop 8.1/10.1).
 
 Densities (Rm 4.2 — the FAILURE-CATALOGUE row-5 guard):
-* log p_y(z~) = logsumexp_j [log b_j - (1 - z~^T r_j)/eps]   over the queue's
-  beta-weighted class cloud (Def. 5.2 nu_y). The cost matrix C = 1 - z~^T r_j
-  is RETURNED alongside: Stage 4's Sinkhorn consumes the exact same object
-  (Rm 4.2 kernel-matrix sharing — one computation per class per step).
+* log p_y(z~) = logsumexp_j [log b_j - 0.5*||z~ - r_j||^2 / eps]   over the queue's
+  beta-weighted class cloud (Def. 5.2 nu_y). The ground cost is the HALF-SQUARED
+  EUCLIDEAN metric on B^d (Eq. 9 / Prop 8.1): C(v, v) = 0 holds in the INTERIOR
+  (||v|| < 1), not just on the sphere as with the old cosine cost 1 - v^T v.
+  The cost matrix is RETURNED alongside: Stage 4's Sinkhorn consumes the exact
+  same object (Rm 4.2 kernel-matrix sharing — one computation per class per step).
 * log p_s(h') = -||h' - mu_hat'||^2 / (2 sigma^2) — evaluated on nullspace
   coordinates ONLY (h' from NullspaceState.project/apply_projector). Never
   call it with full-space z; the split-space failure row stays unrepresentable.
+  sigma^2 is the CALIBRATED EMA nullspace baseline variance (Rm 4.2 / Eq. 7-8),
+  not a free constant — see sm_loss.SMCLossEngine.sigma_hat_sq.
 
 Responsibilities:
 * alpha^(1A) (Eq. 6, Prop 4.1): sigma((log p_y - log p_s)/T + logit(rho_y)),
-  T annealed high -> low (deterministic annealing, Rose [3]).
+  T annealed high -> low (deterministic annealing, Rose [3]). The calibrated
+  form (Rm 4.2 / Eq. 7-8) replaces logit(rho_y) with the buffer-solved offset
+  u_bar_y: alpha = sigma((s_t + u_bar_y)/T) with s_t = log p_y - log p_s — see
+  solve_offset_bisection / alpha_calibrated below; the c_y = u_bar_y - logit(rho_y)
+  correction is what Phase 1B inherits through the lockpass (Eq. 18).
 * alpha^(1B) (Eq. 14, Prop 10.1): label-free marginal — invariant to any
   permutation of the class axis by construction.
 * Bag baseline mu_hat_b = G^2(h_bar'_b) (Eq. 15, Prop 10.2) with the CERTIFIED
@@ -29,11 +38,26 @@ import torch
 
 from .sparsity import _logit_tensor
 
-__all__ = ["cloud_log_p_matrix", "log_baseline_gaussian", "alpha_1a", "alpha_1b",
-           "anneal_temperature", "two_step_baseline", "batch_two_step_baselines",
-           "bag_statistic"]
+__all__ = ["half_sq_cost", "cloud_log_p_matrix", "log_baseline_gaussian",
+           "alpha_1a", "alpha_1b", "anneal_temperature", "two_step_baseline",
+           "batch_two_step_baselines", "bag_statistic",
+           "solve_offset_bisection", "alpha_calibrated"]
 
 _NORM_TOL = 1e-5
+
+
+def half_sq_cost(z, r):
+    """C_ij = 0.5 * ||z_i - r_j||^2 — half-squared Euclidean ground cost on B^d
+    (Eq. 9 / Prop 8.1). Gram-expansion form (no sqrt): smooth at z_i == r_j, so
+    C(v, v) = 0 exactly in the INTERIOR ||v|| < 1, and on B^d the cost stays in
+    [0, 2] (diameter bound 0.5 * (||z|| + ||r||)^2 <= 2).
+    """
+    if z.dim() != 2 or r.dim() != 2 or z.shape[1] != r.shape[1]:
+        raise ValueError(f"half_sq_cost: (n, D) vs (m, D) required, got "
+                         f"{tuple(z.shape)}/{tuple(r.shape)}")
+    d2 = (z.pow(2).sum(dim=1, keepdim=True) + r.pow(2).sum(dim=1).unsqueeze(0)
+          - 2.0 * (z @ r.t()))
+    return 0.5 * d2.clamp(min=0.0)
 
 
 def _check_ball(t, name):
@@ -92,11 +116,12 @@ def cloud_log_p_matrix(z_tilde, clouds, eps, support=None):
         wsum = float(w.sum().item())
         if abs(wsum - 1.0) > 1e-3:
             raise ValueError(f"class {y}: cloud weights must sum to 1 (Def. 5.2), got {wsum:.6f}")
-        cost = 1.0 - z_tilde @ keys.t()
+        cost = half_sq_cost(z_tilde, keys)
         lo, hi = float(cost.min().item()), float(cost.max().item())
         if lo < -1e-4 or hi > 2.0 + 1e-4:
             raise RuntimeError(
-                f"cost 1 - z~^T r left [0, 2] (min {lo:.6f}, max {hi:.6f}) — inputs violate B^d")
+                f"cost 0.5*||z~ - r||^2 left [0, 2] (min {lo:.6f}, max {hi:.6f}) — "
+                "inputs violate B^d")
         cost = cost.clamp(0.0, 2.0)
         lw = torch.full_like(w, float("-inf"))
         pos = w > 0
@@ -185,13 +210,100 @@ def alpha_1a(log_p_y, log_p_s, rho_y, T):
     return alpha, info
 
 
-def alpha_1b(log_p_by_class, log_p_s, rho):
+# ------------------------------------------------------------------ Rm 4.2 / Eq. 7-8 calibrated offset
+
+def solve_offset_bisection(scores, rho_y, T, steps=25, seed_offset=None):
+    """Solve  (1/|B_y|) sum_{t in B_y} sigma((s_t + u)/T) = rho_y  for u_y* by
+    BISECTION on the rolling class-buffer scores (Rm 4.2, Eq. 7-8).
+
+    scores: (N,) stored raw scores s = log p_y - log p_s of buffer B_y
+    (float vector, no grad — a scalar-root problem). g(u) is strictly increasing
+    (sigma is), so a bracket exists for any rho_y in (0,1): it is found by
+    DOUBLING around seed_offset (default T*logit(rho_y), the Eq. 6 anchor) and
+    then EXACTLY `steps` (spec: 25) bisection steps are taken. Raises when the
+    scores are all-identical and no finite bracket is reached — never returns an
+    unbracketed midpoint. Returns (u_star, diag).
+    """
+    s = torch.as_tensor(scores, dtype=torch.float64).reshape(-1)
+    if s.numel() == 0:
+        raise ValueError("solve_offset_bisection: empty buffer B_y — calibrate only after "
+                         "the queue holds scored entries (no silent zero offset)")
+    if not torch.isfinite(s).all():
+        raise ValueError("solve_offset_bisection: NaN/inf stored score — the queue score "
+                         "buffer was filled without calibration scores (wiring bug)")
+    if not (T > 0) or not math.isfinite(T):
+        raise ValueError(f"solve_offset_bisection: T must be positive/finite, got {T}")
+    if int(steps) < 1:
+        raise ValueError(f"solve_offset_bisection: steps >= 1 required, got {steps}")
+    rho_y = float(rho_y)
+    if not (0.0 < rho_y < 1.0) or not math.isfinite(rho_y):
+        raise ValueError(f"solve_offset_bisection: rho_y must lie strictly in (0,1), got {rho_y}")
+
+    def g(u):
+        return float(torch.sigmoid((s + u) / T).mean().item()) - rho_y
+
+    u0 = T * math.log(rho_y / (1.0 - rho_y)) if seed_offset is None else float(seed_offset)
+    if not math.isfinite(u0):
+        raise ValueError(f"solve_offset_bisection: non-finite seed_offset {seed_offset}")
+    span = max(T, 1.0)
+    lo, hi = u0 - span, u0 + span
+    for _ in range(60):
+        if g(lo) <= 0.0 <= g(hi):
+            break
+        span *= 2.0
+        lo, hi = u0 - span, u0 + span
+    else:
+        raise RuntimeError(
+            f"solve_offset_bisection: no bracket within +-u0 {span:.3e} — degenerate buffer "
+            "(all scores identical cannot root every rho); check the stored score pipeline")
+    for _ in range(int(steps)):
+        mid = 0.5 * (lo + hi)
+        if g(mid) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    u_star = 0.5 * (lo + hi)
+    return u_star, {"residual": abs(g(u_star)), "bracket": (lo, hi), "steps": int(steps)}
+
+
+def alpha_calibrated(scores, offsets, T):
+    """alpha^(1A) = sigma((s_t + u_bar_{y_t})/T) — the calibrated-offset form of
+    Eq. 6/7-8 (Rm 4.2): offsets carry the buffer-solved u_bar_y (EMA-smoothed),
+    which reduces to T*logit(rho_y) before the first calibration solve, so the
+    uncalibrated Eq. 6 path and this one are the SAME formula at seed time.
+
+    Returns (alpha, info) with the same interiority guarantee as alpha_1a.
+    """
+    if not (T > 0) or not math.isfinite(T):
+        raise ValueError(f"alpha_calibrated: T must be positive/finite, got {T}")
+    if scores.shape != offsets.shape:
+        raise ValueError(f"alpha_calibrated: scores/offsets must share shape, got "
+                         f"{tuple(scores.shape)}/{tuple(offsets.shape)}")
+    if scores.numel() == 0:
+        raise ValueError("alpha_calibrated on an empty batch (B14 discipline)")
+    if not torch.isfinite(scores).all() or not torch.isfinite(offsets).all():
+        raise ValueError("alpha_calibrated: non-finite score/offset (NaN u_bar means the "
+                         "class was never calibrated — route cold rows to alpha=rho instead)")
+    alpha = torch.sigmoid((scores + offsets) / T)
+    if (alpha <= 0).any() or (alpha >= 1).any():
+        raise RuntimeError("interiority violated: saturated alpha — check eps/sigma_hat_sq/T")
+    logit = (scores + offsets) / T
+    info = {"logit_abs_max": float(logit.abs().max().item()),
+            "alpha_std": float(alpha.std().item()) if alpha.numel() > 1 else 0.0}
+    return alpha, info
+
+
+def alpha_1b(log_p_by_class, log_p_s, rho, calibration=None):
     """alpha^(1B) — Eq. 14 (Prop 10.1), the label-free nullspace marginal:
 
-        sigma( log[(1/C) sum_y rho_y p_y(z~)] - log p_s(h') - log(1 - rho_bar) ).
+        sigma( log[(1/C) sum_y rho_y exp(l_y + c_y)] - log p_s(h') - log(1 - rho_bar) )
 
     log_p_by_class: (n, C); rho: (C,) strictly in (0,1). Invariant under any
     permutation of the class axis (no label is ever read) — Phase 1B safety.
+    calibration: optional (C,) per-class offsets c_y = u_bar_y - logit(rho_y)
+    exported by the Phase 1A lockpass (Eq. 18 / Prop 10.1); None = no calibrated
+    correction (the raw Eq. 14 rule). It shifts only the class-score axis, so
+    permutation invariance is preserved (c travels with its column).
     """
     if log_p_by_class.dim() != 2:
         raise ValueError(f"alpha_1b: log_p_by_class must be (n, C), got {tuple(log_p_by_class.shape)}")
@@ -209,7 +321,17 @@ def alpha_1b(log_p_by_class, log_p_s, rho):
     rho_bar = float(rho.mean().item())
     if rho_bar >= 1.0:
         raise ValueError("alpha_1b: marginal burst prior rho_bar >= 1 — no baseline mass left")
-    log_num = torch.logsumexp(torch.log(rho).unsqueeze(0) + log_p_by_class, dim=1) - math.log(C)
+    lp = log_p_by_class
+    if calibration is not None:
+        c = torch.as_tensor(calibration, device=log_p_by_class.device,
+                            dtype=log_p_by_class.dtype).view(-1)
+        if c.shape[0] != C:
+            raise ValueError(f"alpha_1b: calibration must have C={C} entries, got {c.shape[0]}")
+        if not torch.isfinite(c).all():
+            raise ValueError("alpha_1b: non-finite calibration offset c_y — the lockpass was "
+                             "written before calibration completed (wiring bug)")
+        lp = lp + c.unsqueeze(0)
+    log_num = torch.logsumexp(torch.log(rho).unsqueeze(0) + lp, dim=1) - math.log(C)
     logit = log_num - log_p_s - math.log(1.0 - rho_bar)
     return torch.sigmoid(logit)
 
@@ -230,13 +352,16 @@ def anneal_temperature(step, total_steps, t_start=20.0, t_end=1.0, anneal_frac=0
 
 # ------------------------------------------------------------------ Eq. 15/16 bag baseline
 
-def two_step_baseline(h_prime_bag, log_p_by_class, rho, sigma_sq, max_iter=64, tol=1e-12):
+def two_step_baseline(h_prime_bag, log_p_by_class, rho, sigma_sq, max_iter=64, tol=1e-12,
+                      calibration=None):
     """Certified two-step bag baseline mu_hat_b = G^2(h_bar'_b) (Eq. 15) with the
     Prop 10.2 contraction certificate kappa_mu and the explicit bound (16).
 
     G(mu') = sum_t (1 - alpha_t(1B; mu')) h'_t / sum_t (1 - alpha_t(1B; mu')),
     where ONLY log p_s depends on mu' (the burst numerator log[(1/C)sum rho_y p_y]
-    is mu'-free by Prop 10.1). Returns a dict:
+    is mu'-free by Prop 10.1). `calibration` (C,) = the locked c_y offsets
+    (Eq. 18) enters the numerator exactly as in alpha_1b; sigma_sq is the locked
+    CALIBRATED sigma_hat^2 (Rm 4.2 / Eq. 7-8), not a free constant. Returns a dict:
       mu_hat  : G^2(h_bar') — the estimator actually used downstream (Eq. 14/17)
       alpha   : alpha^(1B) evaluated AT mu_hat (the responsibilities for R_b)
       kappa   : max contraction estimate over the visited orbit (incl. fixed point)
@@ -264,7 +389,17 @@ def two_step_baseline(h_prime_bag, log_p_by_class, rho, sigma_sq, max_iter=64, t
         raise ValueError(f"two_step_baseline: max_iter >= 1 and tol > 0 required, got "
                          f"{max_iter}/{tol}")
     rho_bar = float(rho.mean().item())
-    log_num = (torch.logsumexp(torch.log(rho).unsqueeze(0) + log_p_by_class, dim=1)
+    lp = log_p_by_class
+    if calibration is not None:
+        c = torch.as_tensor(calibration, device=log_p_by_class.device,
+                            dtype=log_p_by_class.dtype).view(-1)
+        if c.shape[0] != C:
+            raise ValueError(f"two_step_baseline: calibration must have {C} entries, "
+                             f"got {c.shape[0]}")
+        if not torch.isfinite(c).all():
+            raise ValueError("two_step_baseline: non-finite calibration offset c_y")
+        lp = lp + c.unsqueeze(0)
+    log_num = (torch.logsumexp(torch.log(rho).unsqueeze(0) + lp, dim=1)
                - math.log(C))
     log_base_term = math.log(1.0 - rho_bar)
 

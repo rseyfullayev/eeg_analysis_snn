@@ -49,19 +49,58 @@ def _ball(n, seed, dtype=torch.float64):
 # ------------------------------------------------------------------ §5.4 drop price
 
 def test_dustbin_price():
-    t = dustbin_price(1.0, 0.5)
-    assert abs(t - math.log(2.0)) < 1e-12
-    eps, rho = 0.4, 0.3
-    t = dustbin_price(eps, rho)
-    # Eq. 8 (ii): the Gibbs drop weight is EXACTLY the baseline prior 1 - rho_y
-    assert abs(math.exp(-t / eps) - (1.0 - rho)) < 1e-12
-    assert dustbin_price(eps, 0.9) > dustbin_price(eps, 0.1), "h must be strictly increasing"
-    tv = dustbin_price(0.5, torch.tensor([0.1, 0.5], dtype=torch.float64))
-    assert torch.allclose(tv, torch.tensor([-0.5 * math.log(0.9), -0.5 * math.log(0.5)],
+    # Eq. 11 decoupled geometric drop price: tau_y = tau_0 - kappa_cost*log1p(-rho_y)
+    # (defaults tau_0=0.35, kappa_cost=0.50) — NO LONGER a function of eps.
+    t = dustbin_price(0.5)
+    assert abs(t - (0.35 - 0.50 * math.log(0.5))) < 1e-12
+    tau_0, kappa = 0.35, 0.50
+    t = dustbin_price(0.3, tau_0, kappa)
+    assert abs(t - (tau_0 - kappa * math.log1p(-0.3))) < 1e-12
+    assert dustbin_price(0.9, tau_0, kappa) > dustbin_price(0.1, tau_0, kappa), \
+        "tau must be strictly increasing in rho_y"
+    # decoupling: the price signature carries NO eps — the old Eq. 8 lock
+    # tau = -eps*log1p(-rho) must NOT be reconstructable at any eps.
+    assert all(abs(dustbin_price(0.4, tau_0, kappa) + e * math.log1p(-0.4)) > 1e-6
+               for e in (0.1, 0.4, 1.0)), "price drifted back to the eps-coupled form"
+    tv = dustbin_price(torch.tensor([0.1, 0.5], dtype=torch.float64), tau_0, kappa)
+    assert torch.allclose(tv, torch.tensor([tau_0 - kappa * math.log1p(-0.1),
+                                            tau_0 - kappa * math.log1p(-0.5)],
                                            dtype=torch.float64))
-    for bad in [lambda: dustbin_price(0.0, 0.3), lambda: dustbin_price(1.0, 0.0),
-                lambda: dustbin_price(1.0, 1.0), lambda: dustbin_price(1.0, float("nan"))]:
+    # tau_y >= tau_0 > 0 for every interior rho (drop is never free)
+    assert min(dustbin_price(r, tau_0, kappa) for r in (0.01, 0.5, 0.99)) >= tau_0 - 1e-12
+    for bad in [lambda: dustbin_price(0.0), lambda: dustbin_price(1.0),
+                lambda: dustbin_price(float("nan")),
+                lambda: dustbin_price(0.5, tau_0=-0.1), lambda: dustbin_price(0.5, tau_0=0.35,
+                                                                             kappa_cost=0.0),
+                lambda: dustbin_price(0.5, tau_0=float("nan"))]:
         _expect(ValueError, bad, "bad price input accepted")
+
+
+def test_half_sq_ground_cost_interior_and_range():
+    """Eq. 9 / Prop 8.1: C_ij = 0.5*||z_i - r_j||^2 on B^d — C(v, v) = 0 EVEN IN THE
+    INTERIOR (||v|| < 1, where the old cosine cost gave 1 - ||v||^2 > 0), values stay
+    in [0, 2], and class_ot_term now builds that cost (self-mu term vanishes on the
+    diagonal rows -> S(mu, mu) = 0 exactly also for interior clouds)."""
+    from src.snn_modeling.utils.estep import half_sq_cost
+    torch.manual_seed(4)
+    v = torch.randn(5, D, dtype=torch.float64)
+    v = v / v.norm(dim=1, keepdim=True)                       # direction…
+    v = v * torch.linspace(0.3, 0.9, 5, dtype=torch.float64).unsqueeze(1)  # …interior radii
+    assert (v.norm(dim=1) < 1.0).all()
+    c = half_sq_cost(v, v)
+    assert torch.allclose(c.diagonal(), torch.zeros(5, dtype=torch.float64), atol=1e-15), \
+        "C(v, v) != 0 in the interior of B^d"
+    assert float(c.min()) >= 0.0 and float(c.max()) <= 2.0 + 1e-12
+    # agrees with cosine exactly on the sphere (norm-1 rows)
+    z, r = _ball(4, seed=30), _ball(4, seed=31)
+    assert torch.allclose(half_sq_cost(z, r), 1.0 - z @ r.t(), atol=1e-12)
+    # class_ot_term path: interior mu == nu cloud -> S = 0 exactly (was > 0 under cosine)
+    vi = v.clone().requires_grad_(True)
+    a = burst_marginal(torch.full((5,), 0.3, dtype=torch.float64))
+    res = class_ot_term(vi, a, v.detach(), a, eps=0.4, tau=0.3)
+    assert abs(float(res["S"].detach())) < 1e-9, f"interior self-term not debiased to 0: {res['S']}"
+    _expect(ValueError, lambda: half_sq_cost(torch.zeros(3), torch.zeros(3, 3)),
+            "wrong-shape cost accepted")
 
 
 # ------------------------------------------------------------------ B2a eps interval + B2b blur

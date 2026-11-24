@@ -731,8 +731,9 @@ def training_loop(phase,
             if smc_engine is not None:
                 try:
                     from src.snn_modeling.adapters.mil_readout import Phase1BReadout
-                    rd = Phase1BReadout(smc_engine.lock_fullpass(),
-                                        sigma_sq=smc_engine.sigma_sq)
+                    # Eq. 18: sigma_hat^2 and c_y come from the lockpass itself
+                    # (Phase 1A calibration), no explicit override here.
+                    rd = Phase1BReadout(smc_engine.lock_fullpass())
 
                     def _group_bags(emb, grps, lbl):
                         zs_list, ys = [], []
