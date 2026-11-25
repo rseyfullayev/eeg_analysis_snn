@@ -626,8 +626,8 @@ def training_loop(phase,
             from test import _linear_probe_loto, _linear_probe_accuracy, _svm_probe_accuracy
             
             # Temporary inline extractor
-            def _extract_feats(loader):
-                embs, lbls, grps = [], [], []
+            def _extract_feats(loader, want_maps=False):
+                embs, lbls, grps, maps = [], [], [], []
                 model.eval()
                 with torch.no_grad():
                     for batch in loader:
@@ -638,7 +638,7 @@ def training_loop(phase,
                         else: # Standard val batch
                             lbl = batch[2].to(device)
                             bag_id = batch[3]
-                        
+
                         K_bag = None
                         if vid.dim() == 6:
                             B, K_bag, T, C, H, W = vid.shape
@@ -646,6 +646,10 @@ def training_loop(phase,
                         else:
                             B, T, C, H, W = vid.shape
 
+                        if want_maps:
+                            # per-band power map for the burst-localization diagnostic:
+                            # time-average of the CLEAN (T,C,H,W) window -> (C,H,W).
+                            maps.append(vid.mean(dim=1).cpu())
                         vid = vid.permute(1, 0, 2, 3, 4)
                         # Shared pooling path (encoder + MeanMaxPoolHead) — must match
                         # training exactly; a local GAP here graded stale geometry
@@ -655,8 +659,12 @@ def training_loop(phase,
                         embs.append(emb.cpu())
                         lbls.append(lbl.cpu())
                         grps.extend(bag_id)
-                        
-                return torch.cat(embs, dim=0).numpy(), torch.cat(lbls, dim=0).numpy(), np.array([int(b) for b in grps])
+
+                out = (torch.cat(embs, dim=0).numpy(), torch.cat(lbls, dim=0).numpy(),
+                       np.array([int(b) for b in grps]))
+                if want_maps:
+                    out = out + (torch.cat(maps, dim=0).numpy(),)   # (N, C, H, W)
+                return out
             
             # Need to get subjects from dataset
             tr_b2s = {str(item[0]): item[3] for item in train_loader.dataset.samples}
@@ -679,7 +687,7 @@ def training_loop(phase,
             clean_train_loader = DataLoader(clean_train_set, batch_size=bs, shuffle=False, num_workers=0)
             
             emb_t, lbl_t, grps_t = _extract_feats(clean_train_loader)
-            emb_v, lbl_v, grps_v = _extract_feats(val_loader)
+            emb_v, lbl_v, grps_v, maps_v = _extract_feats(val_loader, want_maps=True)
             
             subj_t = np.array([tr_b2s.get(str(g), -1) for g in grps_t])
             subj_v = np.array([vl_b2s.get(str(g), -1) for g in grps_v])
@@ -730,24 +738,30 @@ def training_loop(phase,
 
             if smc_engine is not None:
                 try:
-                    from src.snn_modeling.adapters.mil_readout import Phase1BReadout
+                    from src.snn_modeling.adapters.mil_readout import (
+                        Phase1BReadout, burst_localization_diff,
+                        save_burst_localization_png)
                     # Eq. 18: sigma_hat^2 and c_y come from the lockpass itself
                     # (Phase 1A calibration), no explicit override here.
                     rd = Phase1BReadout(smc_engine.lock_fullpass())
 
-                    def _group_bags(emb, grps, lbl):
-                        zs_list, ys = [], []
+                    def _group_bags(emb, grps, lbl, maps=None):
+                        zs_list, ys, ms_list = [], [], []
                         for b in np.unique(grps):
                             sel = np.where(grps == b)[0]
                             if not (lbl[sel] == lbl[sel[0]]).all():
                                 raise ValueError(f"bag {b} mixes emotion labels — window/label desync")
                             zs_list.append(torch.from_numpy(
                                 np.ascontiguousarray(emb[sel], dtype=np.float32)))
+                            if maps is not None:
+                                ms_list.append(torch.from_numpy(
+                                    np.ascontiguousarray(maps[sel], dtype=np.float32)))
                             ys.append(int(lbl[sel][0]))
-                        return zs_list, torch.tensor(ys, dtype=torch.long)
+                        return (zs_list, torch.tensor(ys, dtype=torch.long),
+                                ms_list if maps is not None else None)
 
-                    ztr, ytr = _group_bags(emb_t, grps_t, lbl_t)
-                    zte, yte = _group_bags(emb_v, grps_v, lbl_v)
+                    ztr, ytr, _ = _group_bags(emb_t, grps_t, lbl_t)
+                    zte, yte, mte = _group_bags(emb_v, grps_v, lbl_v, maps=maps_v)
                     zs_fit_cap = 256
                     if len(ztr) > zs_fit_cap:
                         print(f"  [ZeroStep preview] centroid fit capped to first "
@@ -755,7 +769,7 @@ def training_loop(phase,
                         ztr, ytr = ztr[:zs_fit_cap], ytr[:zs_fit_cap]
                     Rtr, _ = rd.encode_bags(ztr, ytr)
                     rd.fit_nearest_centroid(Rtr, ytr)
-                    Rte, _ = rd.encode_bags(zte, yte)
+                    Rte, stats_te = rd.encode_bags(zte, yte)
                     zs_acc = rd.evaluate(Rte, yte, use="centroid")
                     with torch.no_grad():  # unweighted control: plain mean h' (alpha == 1)
                         Ru_tr = torch.stack([rd._bag_geometry(z)[0].mean(dim=0) for z in ztr])
@@ -765,6 +779,22 @@ def training_loop(phase,
                         zs_unw = float((torch.cdist(Ru_te, cen_u).argmin(dim=1) == yte).float().mean())
                     print(f"  ZeroStep preview — bag acc (R_b): {zs_acc:.4f} | "
                           f"unweighted mean-h' baseline: {zs_unw:.4f} (gap = alpha-weighting payoff)")
+
+                    # ---- optional burst-localization diagnostic (2026-11-26):
+                    # alpha_1B-weighted minus (1-alpha_1B)-weighted per-band power
+                    # maps over the VAL bags, into the evidence PNG style. Cosmetic:
+                    # a failure here is announced and must never kill a billed run.
+                    try:
+                        diff = burst_localization_diff([s["alpha"] for s in stats_te], mte)
+                        os.makedirs("evidence", exist_ok=True)
+                        out_png = f"evidence/burst_topomaps_{suffix}.png"
+                        save_burst_localization_png(diff, out_png)
+                        print(f"  [burst-topomap] burst-minus-baseline power maps -> {out_png} "
+                              "(hot = where alpha_1B concentrates; want affective regions, "
+                              "NOT blink/edge rims)")
+                    except Exception as e:
+                        print(f"  [burst-topomap] diagnostic FAILED ({type(e).__name__}: {e}) "
+                              "— cosmetic only, preview numbers above are unaffected.")
                 except (ValueError, RuntimeError) as e:
                     print(f"  [ZeroStep preview] skipped this probe: {e}")
 
@@ -1039,55 +1069,72 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
             print(f"  Restored SMC engine (step={smc_engine.sm_state()['step']}, eps={smc_engine.eps:.4f}).")
         else:
             # §9.5 Option-B pre-pass (corrected 2026-11-25): the seed statistic is
-            # d_t^2 = ||(r_t - med)/sigma||^2 with r_t = x_t MEAN-POOLED over (T,H,W)
-            # -> the (freq_bands,) band response, med = corpus median and
-            # sigma = IQR/1.349 = Gaussian-consistent scale (the pooled mean is
-            # CLT-Gaussian), and the LLR normalisation B = that pooled dim — NOT the
-            # raw window sum of squares over T*C*H*W entries against a feature_dim
-            # normalisation (the old path summed 32*5*32*32 = 163,840 entries with
-            # B=256, inflating every d_t^2 by ~1e4 and saturating the sigmoids the
-            # option_b fixed point roots against: the priors were garbage).
-            pooled_by_class, scanned = {}, 0
+            # d_t^2 = ||(r_t - med_s)/sigma_s||^2 with r_t = per-band map POOLED TO
+            # 2x2 SCALP QUADRANTS: r_t = adaptive_avg_pool2d(x_t.mean(dim=T), (2,2))
+            # .flatten(1) -> (B, 4*freq_bands=20). Global (H,W) averaging CANCELS
+            # left/right asymmetric affective patterns (frontal asymmetry is the
+            # SEED-V literature's core signal); quadrants keep them. med/sigma are
+            # PER-SUBJECT (amplitude offsets are subject traits, not burst evidence);
+            # sigma = IQR/1.349 is the CLT-consistent scale for a quadrant-pooled
+            # mean; the LLR normalisation B_dim = 20 = the pooled support dim — NOT
+            # the raw-window sum of squares (the 163,840-entry path that saturated
+            # every sigmoid and garbage-pinned the priors).
+            pooled_rows, pooled_subj, pooled_lab, scanned = [], [], [], 0
             cap = int(_sm_cfg.get('seed_max_batches', 64))
             need = int(_sm_cfg.get('seed_min_windows', 512))
             with torch.no_grad():
                 for _b in train_loader:
-                    _view, _lab = (_b[0], _b[3]) if len(_b) == 8 else (_b[0], _b[2])
+                    if len(_b) != 8:
+                        raise RuntimeError("Option-B pre-pass needs dual-view 8-tuple "
+                                           "batches (subject slot required for the "
+                                           "per-subject robust standardization)")
+                    _view, _lab, _sub = _b[0], _b[3], _b[4]
                     if _view.dim() != 5:
                         raise RuntimeError(f"Option-B pre-pass expects (B,T,C,H,W) windows, "
                                            f"got dim={_view.dim()}")
-                    r = _view.to(torch.float64).mean(dim=(1, 3, 4)).cpu()   # (B, freq_bands)
-                    _lab = _lab.view(-1)
-                    for y in _lab.unique().tolist():
-                        pooled_by_class.setdefault(int(y), []).append(r[_lab == y])
+                    r = F.adaptive_avg_pool2d(_view.to(torch.float64).mean(dim=1),
+                                              (2, 2)).flatten(1).cpu()    # (B, 4*freq_bands)
+                    pooled_rows.append(r)
+                    pooled_subj.append(_sub.view(-1).cpu())
+                    pooled_lab.append(_lab.view(-1).cpu())
                     scanned += 1
-                    if scanned >= cap and all(sum(t.shape[0] for t in pooled_by_class.get(y, [])) >= need
-                                              for y in range(num_classes_sm)):
+                    if scanned >= cap:
                         break
-            starved = [y for y in range(num_classes_sm)
-                       if sum(t.shape[0] for t in pooled_by_class.get(y, [])) < need]
+            all_r = torch.cat(pooled_rows)
+            all_subj = torch.cat(pooled_subj)
+            all_lab = torch.cat(pooled_lab)
+            counts = torch.bincount(all_lab, minlength=num_classes_sm)
+            starved = [y for y in range(num_classes_sm) if int(counts[y]) < need]
             if starved:
                 raise RuntimeError(f"Option-B seed pre-pass has <{need} windows for classes {starved} after "
                                    f"{scanned} batches — raise loss.sm.seed_max_batches/seed_min_windows or "
                                    "fix the split (a starved Option-B seed is refused, not warned)")
-            all_r = torch.cat([torch.cat(v) for v in pooled_by_class.values()])
-            med = all_r.median(dim=0).values
-            iqr = torch.quantile(all_r, 0.75, dim=0) - torch.quantile(all_r, 0.25, dim=0)
-            # CLT: r_t is a mean over T*H*W = 32,768 band values, so the corpus bulk is
-            # near-Gaussian and IQR/1.349 is its CONSISTENT sigma. Dividing by sigma (not
-            # raw IQR) puts d_t^2 on the N(0, I) scale the §9.5 LLR assumes; the clamp only
-            # guards a degenerate (constant) band.
-            sigma = (iqr / 1.349).clamp(min=1e-6)
-            b_dim = all_r.shape[1]
-            norms_by_class = {y: torch.cat([(((t - med) / sigma) ** 2).sum(dim=1)
-                                            for t in pooled_by_class[y]])
-                              for y in range(num_classes_sm)}
-            seed_info = smc_engine.seed_priors(norms_by_class, log_coeff=b_dim)
-            print(f"  [SMC] Option-B priors (pooled r_t dim={b_dim}, log_coeff={b_dim}, "
-                  f"med={med.round(decimals=3).tolist()}, "
-                  f"sigma=iqr/1.349={sigma.round(decimals=3).tolist()}): "
+            # per-subject robust stats on every pooled channel (quadrant x band dim)
+            b_dim = int(all_r.shape[1])
+            d2 = torch.empty_like(all_r[:, 0])
+            for s in all_subj.unique().tolist():
+                m = all_subj == s
+                rs = all_r[m]
+                if rs.shape[0] < 4:
+                    raise RuntimeError(f"seed pre-pass: subject {s} has only {rs.shape[0]} "
+                                       "windows — per-subject IQR undefined (refusing a "
+                                       "corpus-level fallback silently substituting stats)")
+                med_s = rs.median(dim=0).values
+                iqr_s = (torch.quantile(rs, 0.75, dim=0) - torch.quantile(rs, 0.25, dim=0))
+                sig_s = (iqr_s / 1.349).clamp(min=1e-6)
+                d2[m] = (((rs - med_s) / sig_s) ** 2).sum(dim=1)
+            norms_by_class = {y: d2[all_lab == y] for y in range(num_classes_sm)}
+            seed_info = smc_engine.seed_priors(norms_by_class, log_coeff=float(b_dim))
+            sat = [y for y in range(num_classes_sm) if seed_info['diags'][y].get('saturated')]
+            print(f"  [SMC] Option-B priors (quadrant-pooled r_t dim={b_dim}=2x2x{b_dim // 4}bands, "
+                  f"log_coeff={b_dim}, per-subject sigma=iqr/1.349): "
                   + ", ".join(f"rho_{y}={v:.4f}" for y, v in seed_info['rho'].items())
                   + f" | eps={seed_info['eps']:.4f}")
+            if sat:
+                print(f"  [SMC WARNING] Option-B seed CLAMPED (rho at 0.05/0.95 boundary) for "
+                      f"classes {sat} — the pooled delta population is not separable at "
+                      "s=2.0 for those classes; priors there are the clamped self-consistency "
+                      "solution, inspect the quadrant histograms before trusting them.")
         smc_engine.run_sizing_checks(
             batch_size=int(config.training.get('batch_size', 64)),
             epochs=int(epochs), steps_per_epoch=max(1, len(train_loader)),

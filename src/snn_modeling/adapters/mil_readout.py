@@ -33,6 +33,7 @@ with an explicit same-subject session buffer; default is per-bag G^2.
 
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -184,7 +185,8 @@ class Phase1BReadout(nn.Module):
             R = (alpha.unsqueeze(1) * h).sum(dim=0)   # §13 row 8 ablation: no 1/T_b
         else:
             R = bag_statistic(alpha, h)               # Eq. 17: (1/T_b) Σ_t α_t h′_t
-        return {"R": R, "alpha_mean": float(alpha.mean()), "alpha_std": float(alpha.std()),
+        return {"R": R, "alpha": alpha.detach().cpu().float(),
+                "alpha_mean": float(alpha.mean()), "alpha_std": float(alpha.std()),
                 "T_b": int(h.shape[0]), "kappa": float(kappa), "bound": float(bound),
                 "gap": float(gap)}
 
@@ -362,6 +364,77 @@ class Phase1BReadout(nn.Module):
         missing = self.head.load_state_dict(blob["state_dict"], strict=True)
         assert not missing.missing_keys and not missing.unexpected_keys
         return self
+
+
+# ------------------------------------------------------------------ burst-localization diagnostic
+# (optional, 2026-11-26): does alpha_1B concentrate on affective generators or on blink/edge
+# artifacts? Burst-weighted power map minus baseline-weighted power map, per band.
+
+def burst_localization_diff(alpha_bags, map_bags):
+    """alpha_bags: per-bag (T_b,) alpha_1B tensors (encode_bag stats["alpha"]);
+    map_bags:    per-bag (T_b, C_band, H, W) CLEAN per-band power maps (time-mean of
+    the window tensor), aligned 1:1 with alpha_bags. Returns (C_band, H, W) float64
+
+        sum_b,t alpha_t * m_t / sum alpha  -  sum_b,t (1-alpha_t) * m_t / sum (1-alpha)
+
+    (positive cell = power that burst responsibility CLAIMS). Strict: counts aligned,
+    alpha in [0,1], per-bag T match, and both weight pools non-empty (an all-burst or
+    all-baseline bag set makes the contrast undefined — raise, never plot a zero)."""
+    if len(alpha_bags) != len(map_bags) or len(alpha_bags) == 0:
+        raise ValueError(f"burst_localization_diff: {len(alpha_bags)} alphas vs "
+                         f"{len(map_bags)} maps — must be aligned and non-empty")
+    num = den = None
+    wsum_a = wsum_b = 0.0
+    for i, (a, m) in enumerate(zip(alpha_bags, map_bags)):
+        a = torch.as_tensor(a, dtype=torch.float64).reshape(-1)
+        m = torch.as_tensor(m, dtype=torch.float64)
+        if m.dim() != 4 or m.shape[0] != a.shape[0]:
+            raise ValueError(f"bag {i}: map shape {tuple(m.shape)} vs alpha ({a.numel()},)")
+        if not (a >= 0).all() or not (a <= 1).all() or not torch.isfinite(a).all():
+            raise ValueError(f"bag {i}: alpha_1B outside [0,1]/non-finite — stats are broken")
+        if not torch.isfinite(m).all():
+            raise ValueError(f"bag {i}: non-finite power map")
+        num_i = (a.view(-1, 1, 1, 1) * m).sum(dim=0)
+        den_i = ((1.0 - a).view(-1, 1, 1, 1) * m).sum(dim=0)
+        num = num_i if num is None else num + num_i
+        den = den_i if den is None else den + den_i
+        wsum_a += float(a.sum())
+        wsum_b += float((1.0 - a).sum())
+    if wsum_a <= 0.0 or wsum_b <= 0.0:
+        raise ValueError(f"burst_localization_diff: degenerate weight pools "
+                         f"(sum alpha={wsum_a:.3e}, sum 1-alpha={wsum_b:.3e}) — the "
+                         "burst/baseline contrast is undefined, refusing a zero-map plot")
+    return num / wsum_a - den / wsum_b
+
+
+def save_burst_localization_png(diff_maps, out_path, band_names=None):
+    """One seismic (diverging, centered at 0) heatmap per band, same style as the
+    topology-proof plotter; vmin/vmax symmetric per band so hot = burst-favored,
+    cold = baseline-favored."""
+    import matplotlib
+    matplotlib.use("Agg")                    # headless pods
+    import matplotlib.pyplot as plt
+    d = diff_maps.detach().cpu().numpy() if torch.is_tensor(diff_maps) \
+        else np.asarray(diff_maps, dtype=np.float64)
+    if d.ndim != 3:
+        raise ValueError(f"burst-localization maps must be (bands,H,W), got {d.shape}")
+    nb = d.shape[0]
+    names = band_names or [f"band {i}" for i in range(nb)]
+    if len(names) != nb:
+        raise ValueError(f"{nb} maps vs {len(names)} band names")
+    fig, axes = plt.subplots(1, nb, figsize=(4 * nb, 4))
+    axes = np.atleast_1d(axes)
+    for ax, i in zip(axes, range(nb)):
+        v = float(np.abs(d[i]).max())
+        im = ax.imshow(d[i], cmap="seismic", vmin=-v, vmax=v)
+        ax.set_title(f"{names[i]} (±{v:.3f})")
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.046)
+    fig.suptitle("burst-minus-baseline power per band (alpha_1B weighted)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
 
 
 def run_phase_1b(payload, train_z, train_labels, eval_z, eval_labels, *,

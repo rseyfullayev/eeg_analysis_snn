@@ -267,6 +267,33 @@ def test_run_phase_1b_end_to_end():
             "rolling mode accepted without explicit buffers")
 
 
+def test_burst_localization_diagnostic():
+    """Optional diagnostic (2026-11-26): alpha-weighted minus baseline-weighted
+    per-band power maps; hand-computed check + strictness + real PNG write."""
+    import tempfile
+    from src.snn_modeling.adapters.mil_readout import (burst_localization_diff,
+                                                       save_burst_localization_png)
+    a = [torch.tensor([1.0, 0.0]), torch.tensor([0.5, 0.5])]
+    m = [torch.tensor([[[[2.0]]], [[[20.0]]]]),        # bag0: band0 maps 2 / 20
+         torch.tensor([[[[4.0]]], [[[8.0]]]])]         # bag1: band0 maps 4 / 8
+    d = burst_localization_diff(a, m)                  # (1 band,1,1)
+    # sum alpha = 1+0+0.5+0.5 = 2.0; sum (1-alpha) = 0+1+0.5+0.5 = 2.0
+    plus = (1 * 2 + 0 * 20 + 0.5 * 4 + 0.5 * 8) / 2.0   # = 4.0
+    base = (0 * 2 + 1 * 20 + 0.5 * 4 + 0.5 * 8) / 2.0   # = 13.0
+    assert torch.allclose(d.double(), torch.full_like(d, plus - base,
+                                                      dtype=d.dtype), atol=1e-6), d
+    _expect(ValueError, lambda: burst_localization_diff(
+        [torch.tensor([0.5])], [torch.zeros(2, 1, 1, 1)]), "misaligned bags accepted")
+    _expect(ValueError, lambda: burst_localization_diff(
+        [torch.tensor([1.5])], [torch.zeros(1, 1, 1, 1)]), "alpha outside [0,1] accepted")
+    _expect(ValueError, lambda: burst_localization_diff(
+        [torch.ones(3)], [torch.ones(3, 1, 2, 2)]), "empty baseline pool accepted")
+    with tempfile.TemporaryDirectory() as tmp:
+        p = save_burst_localization_png(torch.rand(2, 4, 4).double() - 0.5,
+                                        os.path.join(tmp, "burst.png"))
+        assert os.path.exists(p) and os.path.getsize(p) > 5000
+
+
 # ------------------------------------------------------------------ runner
 
 def main():

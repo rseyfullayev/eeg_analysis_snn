@@ -129,34 +129,41 @@ def run_pipeline(dev: str):
             .to(device)
         assert eng.space.U.device.type == dev
 
-        # ---- Option-B pre-pass STATS lines (mirrors train.py exactly): exercised on
-        # the loader so the pooling/standardize/log_coeff path runs per device. The
-        # PRIORS themselves are then seeded from a synthetic norm population at
-        # realistic burst rates (0.06-0.26/class): a 40-row toy CDF is too coarse
-        # for the 1e-10 Banach tolerance (residual stalls as a staircase) and the
-        # untrained encoder cannot cluster away the class-amplitude conflation —
-        # FIXTURE artifacts of this fast harness, not production bugs (the pod
-        # pre-pass sees >= 36k pooled rows).
-        pooled = {}
+        # ---- Option-B pre-pass STATS lines (mirrors train.py exactly): quadrant×band
+        # pooling r_t = adaptive_avg_pool2d(x.mean(T), (2,2)).flatten(1) -> (N, 4*bands)
+        # + PER-SUBJECT robust standardization. The PRIORS themselves are then seeded
+        # from a synthetic chi^2(d2) norm population at realistic burst rates
+        # (0.06-0.16/class): a 40-row toy CDF is too coarse for the 1e-10 Banach
+        # tolerance, and the untrained encoder cannot cluster the burst-vs-class
+        # amplitude conflation — FIXTURE artifacts of this fast harness, not
+        # production bugs (the pod pre-pass sees >= 36k pooled rows).
+        pooled = []
         with torch.no_grad():
             for b in ld_tr:
-                view, lab = b[0], b[3]
-                r = view.to(torch.float64).mean(dim=(1, 3, 4)).cpu()
-                for y in lab.unique().tolist():
-                    pooled.setdefault(int(y), []).append(r[lab == y])
-        all_r = torch.cat([torch.cat(v) for v in pooled.values()])
-        med = all_r.median(dim=0).values
-        iqr = (torch.quantile(all_r, 0.75, dim=0) - torch.quantile(all_r, 0.25, dim=0)) / 1.349
-        assert torch.isfinite(med).all() and (iqr > 0).all() and all_r.shape[1] == 1
-        b_dim = float(all_r.shape[1])
+                view, lab, sub = b[0], b[3], b[4]
+                r = F.adaptive_avg_pool2d(view.to(torch.float64).mean(dim=1),
+                                          (2, 2)).flatten(1).cpu()
+                pooled.append((r, sub.view(-1).cpu(), lab.view(-1).cpu()))
+        all_r = torch.cat([p[0] for p in pooled])
+        all_subj = torch.cat([p[1] for p in pooled])
+        b_dim = int(all_r.shape[1])
+        assert b_dim == 4 * 1                    # 2x2 quadrants x 1 fixture band
+        d2 = torch.empty_like(all_r[:, 0])
+        for s in all_subj.unique().tolist():
+            m = all_subj == s
+            rs = all_r[m]
+            med_s = rs.median(dim=0).values
+            iqr_s = (torch.quantile(rs, 0.75, dim=0) - torch.quantile(rs, 0.25, dim=0)) / 1.349
+            assert (iqr_s > 0).all() and torch.isfinite(med_s).all()
+            d2[m] = (((rs - med_s) / iqr_s.clamp(min=1e-6)) ** 2).sum(dim=1)
         rng = torch.Generator().manual_seed(11)
         norms = {}
         for y in range(NC):                      # d^2 ~ chi^2(b_dim) bulk; burst rows ~ s^2 x
             base = torch.linalg.vector_norm(
-                torch.randn(240, 32, generator=rng, dtype=torch.float64), dim=1) ** 2 / 32.0
+                torch.randn(240, b_dim, generator=rng, dtype=torch.float64), dim=1) ** 2 / b_dim
             burst = base[:int((0.06 + 0.10 * y) * 240)] * 4.0
             norms[y] = torch.cat([base, burst])
-        info = eng.seed_priors(norms, log_coeff=b_dim)
+        info = eng.seed_priors(norms, log_coeff=float(b_dim))
         rho = eng.rho.detach()
         assert rho.shape == (NC,) and torch.isfinite(rho).all() \
             and bool(((rho > 0) & (rho < 1)).all()), f"seed rho broken: {rho}"
