@@ -250,6 +250,12 @@ class Phase1BReadout(nn.Module):
                       "class collapse is the EXPECTED result.")
                 head.bias.data.zero_()
         self.head = head
+        # Proximal anchor for finetune: the prior for the LBFGS fit is centered on
+        # the Eq. 18 Bayes init itself (a zero-centered ridge would penalize the
+        # 1/sigma_R^2 scale of w and shrink it while b stays — breaking the w<->b
+        # consistency the decision-equivalence proof relies on).
+        self._w0 = head.weight.detach().clone()
+        self._b0 = head.bias.detach().clone()
         return head
 
     @torch.no_grad()
@@ -271,24 +277,65 @@ class Phase1BReadout(nn.Module):
         pred = self.head_predict(R) if use == "head" else self.centroid_predict(R)
         return float((pred == labels.to(pred.device)).float().mean())
 
-    def finetune(self, R, labels, epochs=30, lr=1e-3, lambda_wd=0.05):
-        """CE + L2 weight decay on the SINGLE linear head (plan §5 Stage 7)."""
+    def finetune(self, R, labels, epochs=30, lr=None, lambda_wd=0.05):
+        """LBFGS on the SINGLE linear head (Eq. 18; LBFGS switch 2026-11-26).
+
+        The Phase-1B head is a convex softmax problem on FROZEN features (R_b
+        fixed by the lock), a few hundred bags, ~1.3k params, and the warm start
+        (w, b) is already the Bayes-optimal centroid rule — the right optimizer
+        is full-batch quasi-Newton: LBFGS drives the objective to its EXACT
+        minimizer in tens of line-searched iterations (`epochs` = max_iter),
+        where 30 AdamW epochs at lr=1e-3 barely moved off the warm start.
+
+        The regularizer is PROXIMAL: lambda_wd * (||W - W0||^2 + ||b - b0||^2)
+        with (W0, b0) the Eq. 18 init — MAP fine-tuning with a Gaussian prior
+        around the Bayes estimate. A zero-centered ridge is NOT the faithful
+        analogue: w's norm IS the 1/sigma_R^2 Bayes scale, and shrinking it
+        while b stays fixed breaks the centroid-rule consistency (measured:
+        plain CE at the coupled optimum rose 0.0017 -> 1.02 on separable data).
+        The old AdamW decoupled decay was numerically ~0 over its 30 steps
+        ((1 - lr*wd)^30 ~ 1 - 1.5e-3), so nothing is lost by this change.
+        `lr` is the LBFGS step-scale (None = 1.0); history records every
+        closure evaluation (objective = CE + proximal term). CE uses reduction=
+        'mean' over bags (PyTorch default), so the optimum — objective value and
+        decisions — is invariant to dataset size and the [1e-2, 1e-1] lambda_wd
+        band means the same on the 600-bag smoke and the ~2.4k-bag 16-fold
+        (sum-reduction would scale the displacement ~N; pinned in stage 7)."""
         if self.head is None:
             raise RuntimeError("finetune before init_bayes_head")
         if not (1e-2 <= lambda_wd <= 1e-1):
             raise ValueError(f"lambda_wd must lie in [1e-2, 1e-1] (approved range), got {lambda_wd}")
+        if int(epochs) < 1:
+            raise ValueError(f"finetune: epochs (LBFGS max_iter) >= 1 required, got {epochs}")
+        if lr is not None and (not math.isfinite(float(lr)) or float(lr) <= 0.0):
+            raise ValueError(f"finetune: LBFGS lr must be positive/finite or None, got {lr}")
+        if getattr(self, "_w0", None) is None:
+            raise RuntimeError("finetune: no Eq. 18 warm-start anchor recorded — call "
+                               "init_bayes_head (the proximal prior center), never fit blind")
         labels = self._check_labels(labels, R.shape[0], self.num_classes)
         R = R.detach().float().to(self.centroids.device)
         y = labels.to(self.centroids.device)
-        opt = torch.optim.AdamW(self.head.parameters(), lr=lr, weight_decay=lambda_wd)
+        opt = torch.optim.LBFGS(self.head.parameters(), lr=(1.0 if lr is None else float(lr)),
+                                max_iter=int(epochs), history_size=10,
+                                tolerance_grad=1e-7, tolerance_change=1e-9,
+                                line_search_fn="strong_wolfe")
         history = []
-        for _ in range(int(epochs)):
+
+        def closure():
             opt.zero_grad()
-            loss = F.cross_entropy(self.head(R), y)
+            logits = self.head(R)
+            loss = F.cross_entropy(logits, y) + lambda_wd * (
+                (self.head.weight - self._w0).pow(2).sum()
+                + (self.head.bias - self._b0).pow(2).sum())
             loss.backward()
-            opt.step()
             history.append({"loss": float(loss.detach()),
-                            "acc": float((self.head(R).argmax(1) == y).float().mean())})
+                            "acc": float(logits.argmax(1).eq(y).float().mean())})
+            return loss
+
+        opt.step(closure)
+        if not history:
+            raise RuntimeError("finetune: LBFGS evaluated the closure zero times — no fit "
+                               "happened (never return an empty 'success')")
         return history
 
     # ------------------------------------------------------------------ head state I/O
@@ -318,11 +365,13 @@ class Phase1BReadout(nn.Module):
 
 
 def run_phase_1b(payload, train_z, train_labels, eval_z, eval_labels, *,
-                 lambda_wd=0.05, finetune_epochs=30, lr=1e-3, sigma_sq=None,
+                 lambda_wd=0.05, finetune_epochs=30, lr=None, sigma_sq=None,
                  mode="per_bag", buffers=None,
                  omit_duration_norm=False, ablate_bias=False):
     """Full Phase 1B pass in the mandated order; returns the smoke-report dict.
-    finetune_epochs=0 skips fine-tuning (pure zero-train evaluation).
+    finetune_epochs=0 skips fine-tuning (pure zero-train evaluation); otherwise it
+    is the LBFGS max_iter of the head fit (see Phase1BReadout.finetune), and lr is
+    the LBFGS step-scale (None = 1.0).
     sigma_sq=None takes the LOCKED calibrated sigma_hat^2 (Eq. 18); an explicit
     value is a caller-side override, never a silent substitute.
     omit_duration_norm / ablate_bias are the §13 Failure-Catalogue ablation

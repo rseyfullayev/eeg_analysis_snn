@@ -27,6 +27,16 @@ Here is a compact, copy-paste prompt for your coding agent:
 
 ---
 
+## Phase-1B head: LBFGS (2026-11-26, fifth) — APPLIED
+
+`Phase1BReadout.finetune` fits the (256→5) head with full-batch **LBFGS** (strong Wolfe, history 10; `epochs`→max_iter, `lr`→step scale, default 1.0 via `run_phase_1b(lr=None)`) straight off the Eq. 18 (w, b) — convex, frozen features, ~1.3k params, so quasi-Newton is the right tool and it converged in 3 closure evals on the stage-7 data (loss 0.00169 → 0.00164, acc unchanged). One deliberate deviation: the λ_wd penalty is **proximal** (`λ‖(W,b)−(W₀,b₀)‖²` around the Bayes init), not a zero-centered ridge — LBFGS actually minimizes what it's given, and a coupled ridge on W would shrink the 1/σ_R² Bayes scale while b stays fixed (measured pure CE 0.0017 → 1.02, decision-equivalence structure broken). The old AdamW loop's decoupled decay was numerically ~0 over 30 steps anyway. Battery **121, 120 green**; stage7 pins `epochs=0`/`lr=0` raises + strict descent from the warm start.
+
+---
+
+## Option-B seed-stat fix (2026-11-25, fourth) — APPLIED
+
+Confirmed by measurement: the pre-pass summed `d_t^2` over the ENTIRE window (T·C·H·W = 163,840 entries) with `B = 256` — median Δ ≈ 7.4e4, 100% sigmoid saturation, every class seeding at the 1−rho_min clamp (garbage priors). Now (train.py pre-pass): `r_t = x.mean(dim=(T,H,W))` → (5,) band response → corpus per-band median + **σ = IQR/1.349** (CLT makes the pooled mean Gaussian, so this is the consistent σ; owner call 2026-11-25) → `d_t^2 = ||(r−med)/σ||^2` → `seed_priors(..., log_coeff=5)`. Synthetic check: ρ = 0.116 vs true burst rate 0.106 (old path: 0.95 flat). `seed_priors` gained the explicit `log_coeff` argument (0/NaN rejected); `generate_dataset.py` untouched (its med/IQR is the on-disk wavelet normalization — different stage). Pin: `test_seed_priors_log_coeff_override`. Battery **121, 120 green**.
+
 ## Run commands (paths patched in, 2026-11-25)
 
 Pod paths: SEED-V raw + `coords.csv` at `/workspace/SEED-V`, preprocessed subject 1–7 slice (all 3 sessions) at `/workspace/SEED-V/preprocessed_eeg_ea_1_7`. The slice is already windowed (fp16), so no `--setup_data` and — since masks are optional now — no `--masks` step.

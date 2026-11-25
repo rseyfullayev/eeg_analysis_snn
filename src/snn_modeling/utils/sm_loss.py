@@ -193,11 +193,22 @@ class SMCLossEngine(nn.Module):
 
     # ------------------------------------------------------------------ priors
 
-    def seed_priors(self, norm_sq_by_class):
+    def seed_priors(self, norm_sq_by_class, log_coeff=None):
         """§9.5 Option-B: one threshold-free fixed-point seed per class from the
-        raw nullspace-embedding squared norms (pre-pass over training data).
+        squared norms of the STANDARDIZED MEAN-POOLED window statistics
+        r_t = mean over (T,H,W) -> (freq_bands,), robust-standardized against
+        corpus med/IQR (train.py pre-pass) — the LLR dimension B in
+        ((1-s^-2)/2)||r||^2 - B*log s MUST equal the support dim of r (5 for
+        SEED-V band maps), which is why the caller passes log_coeff explicitly;
+        None keeps the config knob (legacy contract, feature_dim default).
         Also resolves/validates eps (Thm 12.2 lower bound uses the seeded tau_y).
         Returns a per-class diagnostic dict."""
+        if log_coeff is not None:
+            log_coeff = float(log_coeff)
+            if not math.isfinite(log_coeff) or log_coeff <= 0.0:
+                raise ValueError(f"seed_priors: log_coeff must be positive/finite when given, "
+                                 f"got {log_coeff}")
+        lc = self.seed_log_coeff if log_coeff is None else log_coeff
         if len(norm_sq_by_class) != self.num_classes:
             raise ValueError(f"seed_priors: need all {self.num_classes} classes, got "
                              f"{sorted(norm_sq_by_class) if isinstance(norm_sq_by_class, dict) else 'list'}")
@@ -207,7 +218,7 @@ class SMCLossEngine(nn.Module):
         for y in range(self.num_classes):
             norm_sq = torch.as_tensor(norm_sq_by_class[y], dtype=torch.float64)
             counts[y] = float(norm_sq.numel())
-            delta = burst_delta_scores(norm_sq.float(), s=self.seed_s, log_coeff=self.seed_log_coeff)
+            delta = burst_delta_scores(norm_sq.float(), s=self.seed_s, log_coeff=lc)
             r, diag = option_b_seed(delta, self.rho_min)
             rho[y] = r
             diags[y] = diag

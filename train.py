@@ -1038,29 +1038,54 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
             smc_engine.load_sm_state(checkpoint['sm_state'])
             print(f"  Restored SMC engine (step={smc_engine.sm_state()['step']}, eps={smc_engine.eps:.4f}).")
         else:
-            # §9.5 Option-B pre-pass: standardized RAW WINDOW ||r||² per emotion class
-            norms_by_class, scanned = {}, 0
+            # §9.5 Option-B pre-pass (corrected 2026-11-25): the seed statistic is
+            # d_t^2 = ||(r_t - med)/sigma||^2 with r_t = x_t MEAN-POOLED over (T,H,W)
+            # -> the (freq_bands,) band response, med = corpus median and
+            # sigma = IQR/1.349 = Gaussian-consistent scale (the pooled mean is
+            # CLT-Gaussian), and the LLR normalisation B = that pooled dim — NOT the
+            # raw window sum of squares over T*C*H*W entries against a feature_dim
+            # normalisation (the old path summed 32*5*32*32 = 163,840 entries with
+            # B=256, inflating every d_t^2 by ~1e4 and saturating the sigmoids the
+            # option_b fixed point roots against: the priors were garbage).
+            pooled_by_class, scanned = {}, 0
             cap = int(_sm_cfg.get('seed_max_batches', 64))
             need = int(_sm_cfg.get('seed_min_windows', 512))
             with torch.no_grad():
                 for _b in train_loader:
                     _view, _lab = (_b[0], _b[3]) if len(_b) == 8 else (_b[0], _b[2])
-                    n2 = (_view.to(torch.float64).reshape(_view.shape[0], -1) ** 2).sum(dim=1).cpu()
+                    if _view.dim() != 5:
+                        raise RuntimeError(f"Option-B pre-pass expects (B,T,C,H,W) windows, "
+                                           f"got dim={_view.dim()}")
+                    r = _view.to(torch.float64).mean(dim=(1, 3, 4)).cpu()   # (B, freq_bands)
                     _lab = _lab.view(-1)
                     for y in _lab.unique().tolist():
-                        norms_by_class.setdefault(int(y), []).append(n2[_lab == y])
+                        pooled_by_class.setdefault(int(y), []).append(r[_lab == y])
                     scanned += 1
-                    if scanned >= cap and all(sum(t.numel() for t in norms_by_class.get(y, [])) >= need
+                    if scanned >= cap and all(sum(t.shape[0] for t in pooled_by_class.get(y, [])) >= need
                                               for y in range(num_classes_sm)):
                         break
             starved = [y for y in range(num_classes_sm)
-                       if sum(t.numel() for t in norms_by_class.get(y, [])) < need]
+                       if sum(t.shape[0] for t in pooled_by_class.get(y, [])) < need]
             if starved:
                 raise RuntimeError(f"Option-B seed pre-pass has <{need} windows for classes {starved} after "
                                    f"{scanned} batches — raise loss.sm.seed_max_batches/seed_min_windows or "
                                    "fix the split (a starved Option-B seed is refused, not warned)")
-            seed_info = smc_engine.seed_priors({y: torch.cat(norms_by_class[y]) for y in range(num_classes_sm)})
-            print("  [SMC] Option-B priors: "
+            all_r = torch.cat([torch.cat(v) for v in pooled_by_class.values()])
+            med = all_r.median(dim=0).values
+            iqr = torch.quantile(all_r, 0.75, dim=0) - torch.quantile(all_r, 0.25, dim=0)
+            # CLT: r_t is a mean over T*H*W = 32,768 band values, so the corpus bulk is
+            # near-Gaussian and IQR/1.349 is its CONSISTENT sigma. Dividing by sigma (not
+            # raw IQR) puts d_t^2 on the N(0, I) scale the §9.5 LLR assumes; the clamp only
+            # guards a degenerate (constant) band.
+            sigma = (iqr / 1.349).clamp(min=1e-6)
+            b_dim = all_r.shape[1]
+            norms_by_class = {y: torch.cat([(((t - med) / sigma) ** 2).sum(dim=1)
+                                            for t in pooled_by_class[y]])
+                              for y in range(num_classes_sm)}
+            seed_info = smc_engine.seed_priors(norms_by_class, log_coeff=b_dim)
+            print(f"  [SMC] Option-B priors (pooled r_t dim={b_dim}, log_coeff={b_dim}, "
+                  f"med={med.round(decimals=3).tolist()}, "
+                  f"sigma=iqr/1.349={sigma.round(decimals=3).tolist()}): "
                   + ", ".join(f"rho_{y}={v:.4f}" for y, v in seed_info['rho'].items())
                   + f" | eps={seed_info['eps']:.4f}")
         smc_engine.run_sizing_checks(

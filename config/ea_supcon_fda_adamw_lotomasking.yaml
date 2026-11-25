@@ -103,7 +103,12 @@ loss:
     lambda_max: 1.0             # Eq. 15 capped upper bound on lambda_OT (Anti-Ghost preserved
                                 # as ||grad L_em|| -> 0 via the +1e-8 denominator)
     rho_min: 0.05
-    seed: {s: 2.0}              # §9.5 burst spread; seed.log_coeff defaults to feature_dim
+    seed: {s: 2.0}              # §9.5 burst spread. 2026-11-25: the Option-B pre-pass now
+                                # measures d_t^2 on the MEAN-POOLED (T,H,W) band response
+                                # ((r-med)/(iqr/1.349) — CLT-Gaussian consistent sigma),
+                                # passes log_coeff = pooled
+                                # dim (5) explicitly, overriding seed.log_coeff — that knob
+                                # remains only the legacy default for direct seed_priors calls
     seed_max_batches: 96        # Option-B pre-pass cap over train_loader (key must match
                                 # train.py's _sm_cfg.get('seed_max_batches') — the old
                                 # 'seed_batches' spelling was read by nobody)

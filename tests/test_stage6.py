@@ -436,6 +436,24 @@ def test_bad_config_inputs_rejected():
                                              num_subjects=S, total_steps=0), "total_steps=0 accepted")
 
 
+# ------------------------------------------------------------------ Option-B seed stat (2026-11-25)
+
+def test_seed_priors_log_coeff_override():
+    """Option-B seed contract fix (2026-11-25): d_t^2 is measured on the MEAN-POOLED
+    (freq_bands,) response, so the caller passes log_coeff = the pooled dim; a
+    smaller B normalises less, raising every Delta — rho cannot shrink. Bad B raises."""
+    torch.manual_seed(3)
+    norms = {y: torch.rand(100, dtype=torch.float64) * 4 for y in range(C)}
+    a = _engine().seed_priors(norms)                          # config default (feature_dim)
+    b = _engine().seed_priors(norms, log_coeff=float(C))      # pooled-dim normalisation
+    assert all(b["rho"][y] >= a["rho"][y] - 1e-9 for y in range(C)), \
+        f"log_coeff={C} must not LOWER rho vs {D}: {a['rho']} vs {b['rho']}"
+    _expect(ValueError, lambda: _engine().seed_priors(norms, log_coeff=0.0), "log_coeff=0 accepted")
+    _expect(ValueError, lambda: _engine().seed_priors(norms,
+                                                      log_coeff=float("nan")),
+            "nan log_coeff accepted")
+
+
 # ------------------------------------------------------------------ M-step ticket (2026-11-25)
 
 def test_mstep_detach_raw_keys_and_step1_guards():

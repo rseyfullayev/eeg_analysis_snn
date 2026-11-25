@@ -6,7 +6,8 @@ Exit code 0 = all pass. (Plain asserts — the venv has no pytest.)
 Covers plan §5 Stage-7 checklist: strict lockpass load; certified per-bag
 R_b (Eq. 17) via two_step_baseline; zero-train nearest centroid == Eq. 18
 Bayes warm-start (decision-identical by Prop 10.4's algebra); CE+L2 finetune
-within the approved lambda_wd band; the TWO new Failure-Catalogue rows:
+via full-batch LBFGS off the warm start (2026-11-26) within the approved
+lambda_wd band; the TWO new Failure-Catalogue rows:
 dropping the 1/T_b normalization must add duration bias; dropping b_y must
 kill burst-rate discrimination. The lockpass is produced by a REAL
 SMCLossEngine run and its class-mean/subject-offset geometry is reused by the
@@ -161,8 +162,28 @@ def test_head_matches_centroid_and_finetunes():
     Rte = torch.randn(40, D).abs() + 0.1
     assert torch.equal(rd.head_predict(Rte), rd.centroid_predict(Rte)), \
         "Eq. 18 warm-start must be decision-identical to the centroid rule"
-    hist = rd.finetune(R, labels, epochs=3, lr=1e-3, lambda_wd=0.05)
-    assert len(hist) == 3 and hist[-1]["loss"] <= hist[0]["loss"] + 1e-6
+    hist = rd.finetune(R, labels, epochs=20, lambda_wd=0.05)      # LBFGS (2026-11-26)
+    assert hist and hist[-1]["loss"] <= hist[0]["loss"] + 1e-6, "LBFGS finetune failed to descend"
+    assert min(h["loss"] for h in hist) < hist[0]["loss"] - 1e-9, \
+        "LBFGS did not improve on the Eq. 18 warm start in 20 iterations"
+    # BAG-COUNT INVARIANCE (owner check 2026-11-26): the CE in the proximal objective
+    # is reduction='mean', so duplicating the bag set must NOT change the optimum —
+    # the invariant is the OBJECTIVE VALUE and the DECISIONS (sum-reduction would
+    # scale the displacement ~N and make the approved lambda_wd band
+    # dataset-size-dependent; parameter coordinates near a flat minimum carry
+    # measurable fp32 line-search noise, ~1e-4 here, and are NOT the invariant).
+    obj_single = min(h["loss"] for h in hist)
+    pred_single = rd.head_predict(R)
+    rd.init_bayes_head()
+    hist_dup = rd.finetune(torch.cat([R, R]), torch.cat([labels, labels]),
+                           epochs=20, lambda_wd=0.05)
+    obj_dup = min(h["loss"] for h in hist_dup)
+    assert abs(obj_dup - obj_single) < 1e-5 * max(1.0, obj_single), \
+        f"proximal objective not bag-count invariant ({obj_single} vs {obj_dup}) — CE reduction?"
+    assert torch.equal(rd.head_predict(R), pred_single), "duplication changed the decisions"
+    _expect(ValueError, lambda: rd.finetune(R, labels, epochs=1, lr=0.0),
+            "non-positive LBFGS lr accepted")
+    _expect(ValueError, lambda: rd.finetune(R, labels, epochs=0), "max_iter=0 accepted")
     _expect(ValueError, lambda: rd.finetune(R, labels, epochs=1, lambda_wd=1e-3),
             "lambda_wd below approved band accepted")
     _expect(ValueError, lambda: rd.finetune(R, labels, epochs=1, lambda_wd=0.5),
