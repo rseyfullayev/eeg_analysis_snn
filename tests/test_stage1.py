@@ -47,6 +47,34 @@ def _basis_z():
 
 # ------------------------------------------------------------------ geometry
 
+def test_max_rank_smoke_cap():
+    """2026-11-25 smoke lock: dynamic rank additionally capped at max_rank < S-1
+    (config loss.sm.max_rank). U width follows the cap; band-selected rank clamps."""
+    st = NullspaceState(feature_dim=D, num_subjects=S, warmup_epochs=0,
+                        rank_energy_band=BAND2, max_rank=1)
+    assert st.max_rank == 1 and st.U.shape == (D, 1)
+    for s, (a, b) in enumerate([(1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (2.0, 1.0)]):
+        mean = torch.zeros(D)
+        mean[0], mean[1] = a, b
+        z = F.normalize(mean.unsqueeze(0), dim=1)
+        st.update_batch(z, torch.full((1,), 0.5), torch.tensor([s], dtype=torch.long))
+    assert int(st.rank.item()) <= 1, f"rank breached the cap: {st.rank.item()}"
+    h = F.normalize(torch.randn(4, D), dim=1)
+    _, zt, hn = st.project(h)
+    assert torch.isfinite(zt).all() and (zt.norm(dim=1) <= 1.0 + 1e-6).all()
+    # cap beyond Remark 6.4 is refused (never silently widened to S-1)
+    for bad in (0, S, S + 1, -2):
+        _expect_cap(ValueError, bad)
+
+
+def _expect_cap(exc, max_rank):
+    try:
+        NullspaceState(feature_dim=D, num_subjects=S, max_rank=max_rank)
+    except exc:
+        return
+    raise AssertionError(f"max_rank={max_rank} accepted (must be in [1, S-1])")
+
+
 def test_projector_idempotent():
     st = _fit_state()
     assert int(st.rank.item()) == 2, f"expected band-exact rank 2, got {st.rank.item()}"

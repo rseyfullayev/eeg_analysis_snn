@@ -39,8 +39,8 @@ from ..memory.queue import (SupMoCoQueue, check_sizing, check_staleness, queue_c
 from .sparsity import (burst_delta_scores, option_b_seed, rho_mstep, sparsity_loss)
 from .estep import (alpha_1a, alpha_calibrated, cloud_log_p_matrix, log_baseline_gaussian,
                     solve_offset_bisection)
-from .sinkhorn import (burst_marginal, class_ot_term, dustbin_price, check_eps_admissible,
-                       eps_lower_bound)
+from .sinkhorn import (burst_marginal, class_ot_term, dustbin_price, eps_lower_bound,
+                       min_iters_for_tol)
 from .dcl import ProjectedAnchor
 from .gates import OTCoefficient, check_c_gate, grad_norm, readiness_gate
 
@@ -99,11 +99,12 @@ class SMCLossEngine(nn.Module):
         if self.tau_0 < 0.0 or self.kappa_cost <= 0.0:
             raise ValueError(f"SMCLossEngine: tau_0 must be >= 0 and kappa_cost > 0 (Eq. 11), "
                              f"got {self.tau_0}/{self.kappa_cost}")
-        # Rm 4.2 / Eq. 7-8 calibration: sigma_sq is the FLOOR sigma_min^2 of the EMA
-        # empirical nullspace variance (sigma_hat^2 = max(sigma_min^2, running estimate));
-        # the offset bisection uses bisection_steps (spec: 25) and EMA-smooths with
-        # calib_momentum.
-        self.sigma_sq = float(g("sigma_sq", 1.0))
+        # Rm 4.2 / Eq. 7-8 calibration (REVISED 2026-11-25): sigma_hat^2 is the TOTAL
+        # radial baseline spread — NO (d - m) per-dimension divisor (it shrank l_s by
+        # ~d and drowned l_y out ~50x, breaking the Prop 10.2 kappa_mu < 1 gate).
+        # sigma_sq is the floor sigma_min^2 (spec constant 0.05); the offset bisection
+        # uses bisection_steps (spec: 25) and EMA-smooths with calib_momentum.
+        self.sigma_sq = float(g("sigma_sq", 0.05))
         self.calib_steps = int(_get(cfg, "calib.bisection_steps", 25))
         self.calib_momentum = float(_get(cfg, "calib.ema_momentum", 0.9))
         if self.calib_steps < 1 or not (0.0 <= self.calib_momentum < 1.0):
@@ -145,6 +146,13 @@ class SMCLossEngine(nn.Module):
         self.sn_T_sc = int(g("sinkhorn.T_sc", 30))
         self.sn_iters = int(g("sinkhorn.n_iters", 5000))
         self.sn_solver_tol = float(g("sinkhorn.solver_tol", 1e-10))
+        # REVISED smoke contract: EMPIRICAL marginal-residual acceptance for short
+        # schedules (None = legacy tol-driven strictness). Config: sinkhorn.residual_cap.
+        _rcap = _get(cfg, "sinkhorn.residual_cap", None)
+        self.sn_residual_cap = None if _rcap is None else float(_rcap)
+        if self.sn_residual_cap is not None and not (self.sn_residual_cap > 0.0):
+            raise ValueError(f"SMCLossEngine: sinkhorn.residual_cap must be > 0 or null, "
+                             f"got {self.sn_residual_cap}")
         eps_max = float(g("eps_max", 1.0))  # Thm 12.2 upper end (blur budget); with the
         #  approved tol=1e-3/T_sc=30 defaults the lower bound is ~0.92, so a midpoint
         #  default of 0.5 would make the admissible interval EMPTY (caught at build).
@@ -159,7 +167,8 @@ class SMCLossEngine(nn.Module):
         self.space = NullspaceState(feature_dim=feature_dim, num_subjects=int(num_subjects),
                                     tau_norm=self.tau_norm, ema_momentum=self.space_momentum,
                                     rank_energy_band=self.rank_band,
-                                    warmup_epochs=self.warmup_epochs)
+                                    warmup_epochs=self.warmup_epochs,
+                                    max_rank=g("max_rank", None))
         self.queue = SupMoCoQueue(int(g("n_q", 4096)), feature_dim, num_classes=self.num_classes)
         self.anchor = ProjectedAnchor(tau_dcl=self.tau_dcl, anchor_on=self.anchor_on)
         self.coeff = OTCoefficient(momentum=float(g("gate_ema_momentum", 0.9)),
@@ -211,8 +220,29 @@ class SMCLossEngine(nn.Module):
         if self.eps is None:  # approved-default midpoint of the Thm 12.2 interval
             lb = max(eps_lower_bound(self.sn_tol, self.sn_T_sc, t) for t in taus)
             self.eps = float(0.5 * (lb + self._eps_max))
-        for y in range(self.num_classes):  # hard gate per class, per §12.2
-            check_eps_admissible(self.eps, self.sn_tol, self.sn_T_sc, taus[y])
+        # REVISED smoke contract: the worst-case Birkhoff (B2a/§12.2) start check is a
+        # WARNING, not a hard abort — a pinned small eps (e.g. 0.15) ships when the
+        # EMPIRICAL per-batch marginal residual (logged in every forward's
+        # diagnostics["ot_residual"], must stay < 1e-3) holds. sinkhorn_plan STILL
+        # raises on a batch whose residual breaches its floor: an under-solved
+        # coupling is never shipped, worst-case theory just no longer pre-convicts.
+        for y in range(self.num_classes):
+            lb = eps_lower_bound(self.sn_tol, self.sn_T_sc, taus[y])
+            if self.eps < lb - 1e-12:
+                try:
+                    worst_iters = f"{min_iters_for_tol(self.eps, self.sn_tol, taus[y])} iters"
+                except ValueError as e:
+                    # NOT a margin question: tanh(M~/2eps) == 1 in float64 means tol is
+                    # UNREACHABLE in finitely many iterations — a degenerate eps is still
+                    # a hard config error (the warning path covers finite-but-large only).
+                    raise ValueError(
+                        f"§12.2/B2a eps={self.eps:.6f} is below the worst-case floor "
+                        f"{lb:.4f} AND makes tol unreachable: {e}") from e
+                print(f"  [SMC §12.2 WARNING] eps={self.eps:.4f} < B2a worst-case floor "
+                      f"{lb:.4f} for class {y} (tau={taus[y]:.3f}): worst-case Birkhoff "
+                      f"needs {worst_iters} at tol={self.sn_tol}; running on the REVISED "
+                      "contract — empirical marginal residual is logged and enforced "
+                      "per batch (< 1e-3 expected, solver still raises on breach).")
         self.seeded.fill_(True)
         return {"rho": {y: float(rho[y]) for y in range(self.num_classes)},
                 "diags": diags, "eps": self.eps}
@@ -491,7 +521,7 @@ class SMCLossEngine(nn.Module):
         # ---- emotion term (Eq. 19): per-class debiased S_eps, nu-self cached
         cold_em = True
         L_em = zt_q.sum() * 0.0
-        d_norm, ess_used = {}, {}
+        d_norm, ess_used, ot_res = {}, {}, {}
         if clouds:
             cache_key = (int(self.queue.ptr.item()), int(self.queue.filled.item()))
             if self._nu_cache_key != cache_key:
@@ -510,10 +540,17 @@ class SMCLossEngine(nn.Module):
                 out = class_ot_term(zt_q[rows], a_y, cl["keys"], cl["weights"],
                                     eps, tau_y, self_nu_cache=self._nu_cache.get(y),
                                     n_iters=self.sn_iters, tol=self.sn_solver_tol,
+                                    residual_cap=self.sn_residual_cap,
                                     support=None if support is None else support[y][rows])
                 L_em = L_em + out["S"]
                 self._nu_cache[y] = out["self_nu_cache"]
                 d_norm[y] = out["diagnostics"]["D_norm_y"]
+                # REVISED smoke contract (2026-11-25): with eps pinned BELOW the B2a
+                # worst-case floor, the EMPIRICAL marginal residual
+                # max(|Pi row sums - a~|, |Pi col sums - b~|) is the live guarantee —
+                # logged per class (expected < 1e-3; the solver itself still raises on
+                # breach, so an under-solved coupling never ships silently).
+                ot_res[y] = out["diagnostics"]["cross_residual"]
                 cold_em = False
 
         # ---- gate + lambda_OT (Eq. 13, §8.3): both norms w.r.t. the SAME z~
@@ -544,11 +581,11 @@ class SMCLossEngine(nn.Module):
         # ---- M-step side effects (stop-grad material, Prop 8.4 / §6)
         with torch.no_grad():
             self.space.update_batch(z.detach(), alpha.detach(), subjects)
-            # Rm 4.2 / Eq. 7-8 EMA nullspace baseline variance:
+            # Rm 4.2 / Eq. 7-8 EMA nullspace baseline variance (REVISED: TOTAL radial
+            # spread, no (d - m) divisor — per-dim drowned l_y out by ~d and broke the
+            # Prop 10.2 contraction certificate):
             # sigma_hat^2 = max(sigma_min^2, EMA[ sum_t (1-a_t) ||h'_t - mu_hat'_s_t||^2
-            #                                     / ((d - m) sum_t (1-a_t)) ])
-            # with m = current nullspace rank removed by U (Rm 6.4) — per-DIMENSION
-            # variance, so sigma_hat^2 plugs straight into log_baseline_gaussian.
+            #                                      / sum_t (1-a_t) ])
             base_s = self._subject_baseline(subjects)
             w = 1.0 - alpha.detach()
             wsum = float(w.sum())
@@ -556,9 +593,7 @@ class SMCLossEngine(nn.Module):
                 raise RuntimeError("sigma_hat update: sum(1-alpha) ~ 0 — the batch is fully "
                                    "burst-flagged, no baseline mass to calibrate (Rm 4.2 "
                                    "interiority upstream, never a silent skip)")
-            m_rank = int(self.space.rank.item()) if not self.space.warmup_active else 0
-            d_dims = self.space.feature_dim - m_rank
-            est = float((w * (h_q - base_s).pow(2).sum(dim=1)).sum()) / (d_dims * wsum)
+            est = float((w * (h_q - base_s).pow(2).sum(dim=1)).sum()) / wsum
             sg = float(self.sigma_hat_sq)
             self.sigma_hat_sq.fill_(max(self.sigma_sq,
                                         self.calib_momentum * sg
@@ -584,6 +619,7 @@ class SMCLossEngine(nn.Module):
                 "u_bar": {int(k_): (None if not math.isfinite(float(v)) else float(v))
                           for k_, v in zip(range(self.num_classes), self.u_bar.tolist())},
                 "calib": calib_diag,
+                "ot_residual": ot_res,
                 "D_norm": d_norm, "queue": self.queue.summary(),
                 "space": self.space.summary(), "eps": self.eps,
                 "ess": {int(k_): v for k_, v in self.queue.ess_by_class().items()}}

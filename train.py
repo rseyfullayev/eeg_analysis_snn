@@ -972,7 +972,8 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
     accumulation_steps = config.training.get('accumulation_steps', 1)
     
     optimizer = create_optimizer(enc_class, loss_fn, config, low_encoder_lr=False)
-    scheduler = create_hybrid_scheduler(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+    scheduler = create_hybrid_scheduler(optimizer, T_max=epochs - warmup_epochs,
+                                        eta_min=float(config.training.get('lr_min', 1e-6)))
 
     # Load model weights FIRST (before building momentum encoder)
     best_train_loss = float('inf')

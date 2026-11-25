@@ -76,6 +76,50 @@ def test_dustbin_price():
         _expect(ValueError, bad, "bad price input accepted")
 
 
+def test_eps015_25iter_smoke_residual():
+    """2026-11-25 REVISED smoke contract: eps=0.15, 25 iterations, LOG domain. The B2a
+    worst-case floor (~0.9233 for tol 1e-3 / T_sc 30) is a START WARNING now; the live
+    guarantee is the EMPIRICAL marginal residual max(|P1-a|,|P'b|) < 1e-3 — measured
+    ~2e-7 here (worst-case theory is astronomically loose on realistic clouds). The
+    high-tau corner (rho 0.9 -> tau ~ 1.5, exp(-tau/eps) ~ 4e-5 must not underflow)
+    is included."""
+    torch.manual_seed(1)
+    n, m = 60, 256
+    z = _ball(n, seed=40)
+    keys = _ball(m, seed=41)
+    a = burst_marginal(0.02 + 0.9 * torch.rand(n, dtype=torch.float64))
+    b = burst_marginal(0.02 + 0.9 * torch.rand(m, dtype=torch.float64))
+    # seeded regime of the smoke run (rho 0.05..0.27 -> tau <= 0.5): 25 iters meet
+    # the 1e-3 budget in EXACT arithmetic, not just under fp32 noise.
+    for tau in (float(dustbin_price(0.1)), float(dustbin_price(0.25))):
+        res = class_ot_term(z.clone().requires_grad_(True), a, keys, b,
+                            eps=0.15, tau=tau, n_iters=25, tol=1e-10, residual_cap=1e-3)
+        d = res["diagnostics"]
+        assert d["cross_residual"] < 1e-3 and d["self_mu_residual"] < 1e-3, \
+            f"eps=0.15/25-iter residual breach at tau={tau:.3f}: {d}"
+        assert torch.isfinite(res["S"].detach())
+    # exact-arith corners: rho 0.5/0.9 -> tau 0.70/1.50, dustbin kernel as small as
+    # exp(-tau/eps) = 4.5e-5; fp64 shows 25 iters genuinely CANNOT carry the
+    # contraction (2.5e-3 / 8.7e-3). The cap RAISES instead of shipping — and the
+    # same solve meets < 1e-3 once given iterations (log-domain never underflows;
+    # the B2a worst-case 2.1M-iter estimate is astronomically loose: 1000 suffice).
+    for tau in (float(dustbin_price(0.5)), float(dustbin_price(0.9))):
+        _expect(RuntimeError, lambda tau=tau: class_ot_term(
+            z.clone().requires_grad_(True), a, keys, b, eps=0.15, tau=tau,
+            n_iters=25, tol=1e-10, residual_cap=1e-3),
+            f"breached solve shipped at tau={tau:.3f}")
+    res_hi = class_ot_term(z.clone().requires_grad_(True), a, keys, b, eps=0.15,
+                           tau=float(dustbin_price(0.9)), n_iters=1000, tol=1e-12,
+                           residual_cap=1e-3)
+    assert res_hi["diagnostics"]["cross_residual"] < 1e-3, res_hi["diagnostics"]
+    # the solver's own raise floor still guards a genuinely under-solved batch
+    _expect(RuntimeError, lambda: sinkhorn_plan(1.0 - z[:8] @ keys[:8].t(),
+                                                burst_marginal(torch.full((8,), 0.5)),
+                                                burst_marginal(torch.rand(8, dtype=torch.float64)),
+                                                eps=0.02, tau=0.5, n_iters=1, tol=1e-10),
+            "under-solved coupling shipped silently")
+
+
 def test_half_sq_ground_cost_interior_and_range():
     """Eq. 9 / Prop 8.1: C_ij = 0.5*||z_i - r_j||^2 on B^d — C(v, v) = 0 EVEN IN THE
     INTERIOR (||v|| < 1, where the old cosine cost gave 1 - ||v||^2 > 0), values stay

@@ -21,13 +21,18 @@ class NullspaceState(nn.Module):
     """State object owning (mu, U, m, tau_norm, EMA subject tables, epoch)."""
 
     def __init__(self, feature_dim=256, num_subjects=15, tau_norm=0.25,
-                 ema_momentum=0.9, rank_energy_band=0.85, warmup_epochs=2):
+                 ema_momentum=0.9, rank_energy_band=0.85, warmup_epochs=2, max_rank=None):
         super().__init__()
         if feature_dim < 2:
             raise ValueError(f"feature_dim must be >= 2, got {feature_dim}")
         if num_subjects < 2:
             raise ValueError(
                 f"num_subjects must be >= 2 (Remark 6.4: centered subject means span <= S-1), got {num_subjects}")
+        if max_rank is not None:
+            max_rank = int(max_rank)
+            if not 1 <= max_rank <= num_subjects - 1:
+                raise ValueError(
+                    f"max_rank must lie in [1, S-1]={num_subjects - 1} (Remark 6.4), got {max_rank}")
         if not 0.0 < tau_norm:
             raise ValueError(f"tau_norm must be > 0, got {tau_norm}")
         if not 0.0 <= ema_momentum < 1.0:
@@ -43,7 +48,9 @@ class NullspaceState(nn.Module):
         self.ema_momentum = ema_momentum
         self.rank_energy_band = rank_energy_band
         self.warmup_epochs = warmup_epochs
-        self.max_rank = num_subjects - 1
+        # smoke cap (2026-11-25): dynamic rank may be additionally capped below S-1
+        self.max_rank = min(num_subjects - 1, max_rank if max_rank is not None
+                            else num_subjects - 1)
 
         self.register_buffer("mu", torch.zeros(feature_dim))
         self.register_buffer("U", torch.zeros(feature_dim, self.max_rank))

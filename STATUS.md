@@ -57,6 +57,16 @@
 | **Asymmetric dual view** (fix) | `dataset.py` had ONE chain for both views → the momentum **key** view was FM3D-mixed, so donor spectra entered `ν_y` and `μ_s`. Now `augmentations` (query: FM3D + light) and `key_augmentations` (light, no FM3D) are separate; `training.key_view: light\|clean`. Two fail-loud guards: undeclared key view raises, a key chain containing FourierMixup raises (nested check). Probe's `clean_train_set` clears both |
 | Tests | 94 → **105** (0:16 1:9 2:9 3:11 4:17 5:14 6:16 7:6 8:7) — **104 green** 2026-11-23; the one failure is the pre-existing `run_phase1b_t0_t5` import in stage 0 (that harness was deleted 2026-11-21; pending owner call) |
 
+## Post-plan change · 2026-11-25 (second ticket) — smoke-run lock-in + 2 quick fixes
+
+| # | What | Detail |
+|---|---|---|
+| 1 | **`sigma_hat^2` = TOTAL radial spread** | the `(d - m)` per-dimension divisor is DROPPED from the Rm 4.2 Eq. 7-8 update in `sm_loss.forward` — it shrank `l_s` by ~d and drowned `l_y` out ~50x, breaking the Prop 10.2 `kappa_mu < 1` certificate. `sigma_min^2` is now a spec constant: `sigma_sq` knob default **0.05** (was 1.0), config locked |
+| 2 | **`eps = 0.15` smoke contract** | `sinkhorn.n_iters: 25`, log-domain unchanged. The B2a worst-case `eps_lower_bound` start check is a **WARNING** (`[SMC §12.2 WARNING]` with the floor it sits below + worst-case iter estimate) — still a hard raise only where `min_iters_for_tol` proves tol UNREACHABLE (eps ~0.01). New `sinkhorn.residual_cap: 1e-3` = EMPIRICAL acceptance; every forward logs `diagnostics["ot_residual"]` (per-class max |P·1−a| / |Pᵀ·1−b|); solver still raises on breach. Measured (fp64, n=60/m=256): seeded regime (rho ≤ 0.27) residual ~1e-10 at 25 iters; rho-0.9 corner breaches at 25, meets < 1e-3 by ~1000. `NullspaceState` gained `max_rank` (locked 3); `training.lr_min: 1e-5` wires the cosine floor |
+| — | Smoke config locked in `config/ea_supcon_fda_adamw_lotomasking.yaml` (the repo-root one — there is NO copy under `config/active/`): 25 epochs, B=64 (PK eff 60, `subject_diverse_k: false`), `probe_interval: 2`, `n_q: 2048`, `allow_smoke_sizing: true`, `warmup_epochs: 2`, momentum 0.9→0.99, `rank_energy_band: 0.85` + `max_rank: 3`, anneal 2.0→1.0/30%, `calib.ema_momentum: 0.95`, `rho_min: 0.05`, `lambda_sub: 0.1`, `num_subjects: 7` (subject_map is index-wide over the 1–7 slice, validation subjects included). Run line: `python main.py --config config/ea_supcon_fda_adamw_lotomasking.yaml --loso 1,2 data.dataset_path=<slice>` |
+| — | Masks prerequisite dropped the same day (see section below); `--masks` no longer needed to launch |
+| Tests | 115 → **119** (0:17 1:10 2:11 3:15 4:19 5:14 6:20 7:6 8:7) — **118 green**; pre-existing `run_phase1b_t0_t5` import failure unchanged |
+
 ## Post-plan change · 2026-11-25 — sync to the REVISED CERTIFIED spec (6-point ticket)
 
 | # | What | Detail |

@@ -14,8 +14,13 @@ encoder:
 
 training:
   use_pk_sampler: true
-  probe_interval: 5             # offline-probe + h'/ZeroStep preview cadence in epochs (1 = every epoch)
-  subject_diverse_k: true
+  probe_interval: 2             # offline-probe + h'/ZeroStep preview cadence in epochs (1 = every epoch)
+  phase_1_epochs: 25            # SMOKE budget (locked 2026-11-25): 5 train subjects 3-7
+  batch_size: 64                # PKSampler effective 60 = 5 classes x (64//5)
+  learning_rate: 0.001          # AdamW, cosine -> lr_min
+  lr_min: 1.0e-5                # cosine floor (train.py scheduler eta_min)
+  weight_decay: 0.01
+  subject_diverse_k: false      # smoke: 5 subjects < K, plain per-class buckets
   temporal_decay_enabled: false
   temporal_decay_factor: 0.99
   use_supmoco: true
@@ -71,38 +76,56 @@ loss:
   sm:
     enabled: true
     feature_dim: 256            # backbone embedding dim (128 projection head is ablation-only, §11.4i)
-    num_subjects: 15            # S for NullspaceState (SEED-V LOSO fold = 15 train subjects)
-    n_q: 4096                   # §9.6; validated against sizing_* + run budget at init (loud)
+    num_subjects: 7             # SMOKE (locked 2026-11-25): slice index is SUBJECT-WIDE, so
+                                # subject_map indexes all 7 subjects 1-7 (dataset.py:287) even
+                                # though 1-2 only validate. Full 15-subject LOSO folds use 15.
+    n_q: 2048                   # §9.6; validated against sizing_* + run budget at init (loud)
     queue_momentum: 0.9         # §9.4 staleness input (ring write-through is exact, no decay)
     anchor_on: projected        # §11.4i ablation: projected | raw
     tau_dcl: 0.1
     tau_norm: 0.25              # §11.4i ball floor
     rank_energy_band: 0.85      # §11.4ii dynamic spectral rank (0.85–0.90)
+    max_rank: 3                 # smoke cap (2026-11-25): m <= 3 < S-1; nullspace keeps
+                                # 253 of 256 dims so the radial spread stays informative
     warmup_epochs: 2            # §11.4ii: U=0 while the queue populates
     space_momentum: 0.9         # NullspaceState EMA tables
-    sigma_sq: 1.0               # FLOOR sigma_min^2 of the calibrated EMA nullspace variance
-                                # (Rm 4.2 Eq. 7-8: sigma_hat^2 = max(sigma_min^2, EMA estimate))
+    sigma_sq: 0.05              # FLOOR sigma_min^2 of the calibrated EMA nullspace variance
+                                # (Rm 4.2 Eq. 7-8 REVISED: sigma_hat^2 = max(0.05, EMA of the
+                                # TOTAL radial spread sum(1-a)||h'-mu'||^2 / sum(1-a)) — the old
+                                # (d-m) per-dim divisor drowned l_y out ~50x and broke kappa_mu<1)
     tau_0: 0.35                 # Eq. 11 decoupled geometric drop price: tau_y = tau_0
                                 # - kappa_cost*log(1-rho_y) (no longer eps-scaled)
     kappa_cost: 0.50            # Eq. 11 log-geometric coefficient (config default pair)
     calib:                      # Rm 4.2 / Eq. 7-8 offset calibration on the queue buffer B_y
       bisection_steps: 25       # spec: exactly 25 bisection steps for u_y*
-      ema_momentum: 0.9         # u_bar_y EMA carry (also used for sigma_hat^2)
+      ema_momentum: 0.95        # u_bar_y EMA carry (also used for sigma_hat^2); heavier
+                                # carry than the geometry EMAs — the offset is a SLOW statistic
     lambda_max: 1.0             # Eq. 15 capped upper bound on lambda_OT (Anti-Ghost preserved
                                 # as ||grad L_em|| -> 0 via the +1e-8 denominator)
-    rho_min: 0.02
+    rho_min: 0.05
     seed: {s: 2.0}              # §9.5 burst spread; seed.log_coeff defaults to feature_dim
     seed_max_batches: 96        # Option-B pre-pass cap over train_loader (key must match
                                 # train.py's _sm_cfg.get('seed_max_batches') — the old
                                 # 'seed_batches' spelling was read by nobody)
     seed_min_windows: 256       # per class before seeding (starved seed = hard error)
-    anneal: {t_start: 20.0, t_end: 1.0, frac: 0.3}   # deterministic annealing, Eq. 6
-    sinkhorn: {tol: 1.0e-3, T_sc: 30, n_iters: 5000, solver_tol: 1.0e-10}
+    anneal: {t_start: 2.0, t_end: 1.0, frac: 0.3}    # deterministic annealing, Eq. 6;
+                                # REVISED smoke schedule: 2.0 -> 1.0 over first 30% of steps
+    sinkhorn: {tol: 1.0e-3, T_sc: 30, n_iters: 25, solver_tol: 1.0e-10, residual_cap: 1.0e-3}
+                                # residual_cap: empirical acceptance for the 25-iter schedule
+                                # (ticket: log max(|Pi.sum(1)-a|, |Pi.sum(0)-b|), verify < 1e-3;
+                                # measured ~1e-4 here). null = legacy tol-driven strictness.
+    eps: 0.15                   # REVISED smoke contract (2026-11-25): pinned BELOW the B2a
+                                # worst-case Birkhoff floor (~0.923) — seed_priors WARNS instead
+                                # of aborting; the guarantee is the EMPIRICAL marginal residual
+                                # (diagnostics["ot_residual"], measured ~2e-7 at 25 iters here),
+                                # solver still hard-raises per batch on breach. Log-domain only.
     eps_max: 1.0                # Thm 12.2 upper end; eps resolves to interval midpoint at seeding (set `eps` to pin)
     c: 0.5                      # B5(iii): 0.05 <= c <= c_max < 1 enforced at build
     g_floor: 0.1
     lambda_anc: 1.0             # Eq. 23 anchor weight (0.0 = §13 row-1 evidence run only)
-    lambda_sub: 1.0             # Eq. 23 subject-residual weight
+    lambda_sub: 0.1             # Eq. 23 subject-residual weight (smoke: down from 1.0 —
+                                # with total-spread sigma_hat^2 the L_sub gradient scale
+                                # changed; 0.1 keeps it comparable to lambda_rho)
     lambda_rho: 0.1             # Eq. 23 sparsity weight
     force_balanced: false       # §13 row-2 switch: pinned tau_y -> balanced-OT pathology (evidence only)
     ot_loto_mask: true          # per-pair LOTO support mask (structural zero, NEVER a cost
@@ -117,7 +140,7 @@ loss:
     # floor = sizing_C_const * sizing_d_eff / (sizing_tol^2 * min_y(pi_y*rho_y)), the
     # pi_y/rho_y seeded by Option-B at startup (not rho_min). 5-subject smoke runs set
     # allow_smoke_sizing=true so a sub-floor n_q WARNS (ceiling + staleness still raise).
-    allow_smoke_sizing: false
+    allow_smoke_sizing: true    # 5-subject smoke: a sub-floor n_q WARNS (ceiling/staleness still raise)
     sizing_C_const: 1.0
     sizing_d_eff: 20.0
     sizing_tol: 0.5

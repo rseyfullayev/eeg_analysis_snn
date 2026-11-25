@@ -94,6 +94,53 @@ def test_seed_priors_interior_and_eps_admissible():
     assert eng.tau_0 == 0.35 and eng.kappa_cost == 0.50
 
 
+def test_pinned_eps_smoke_contract_warns_and_runs():
+    """REVISED smoke contract (2026-11-25): eps pinned at 0.15 (below the B2a
+    worst-case floor ~0.9233) WARNS at seeding instead of aborting, runs the full
+    forward, and logs the empirical marginal residual per class — which must stay
+    < 1e-3. The sigma_min^2 default moved with the total-spread formula (0.05)."""
+    import io
+    import contextlib
+    cfg = _cfg(eps=0.15, sinkhorn=dict(tol=1e-3, T_sc=30, n_iters=25, solver_tol=1e-10,
+                                       residual_cap=1e-3))
+    eng = SMCLossEngine(cfg, feature_dim=D, num_classes=C, num_subjects=S, total_steps=200)
+    default_eng = SMCLossEngine(dict(tau_norm=0.25), feature_dim=D, num_classes=C,
+                                num_subjects=S, total_steps=10)
+    assert default_eng.sigma_sq == 0.05, \
+        f"sigma_min^2 spec constant default is {default_eng.sigma_sq}, expected 0.05"
+    norms = {}
+    for y in range(C):
+        base = (D + math.sqrt(2.0 * D) * torch.randn(240, dtype=torch.float64)).clamp(min=1e-3)
+        burst = (3.0 * D + D * torch.rand(int((0.08 + 0.06 * y) * 240),
+                                          dtype=torch.float64)).clamp(min=1e-3)
+        norms[y] = torch.cat([base, burst])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        info = eng.seed_priors(norms)
+    out = buf.getvalue()
+    assert "WARNING" in out and "0.1500" in out, f"no loud eps warning at seeding:\n{out[:400]}"
+    assert "0.923" in out, "warning must quote the B2a floor it is below"
+    assert info["eps"] == 0.15 and eng.eps == 0.15
+    worst = 0.0
+    for t in range(6):
+        z, kz, lb_, sb, w, tr = _batch(eng, t)
+        r = eng.forward(z, kz, lb_, sb, w, tr)
+        res = r["diagnostics"]["ot_residual"]
+        assert torch.isfinite(r["total"])
+        if res:
+            worst = max(worst, max(res.values()))
+    assert 0.0 < worst < 1e-3, f"empirical marginal residual {worst:.3e} outside (0, 1e-3)"
+
+
+def test_eps_zero_degenerate_still_rejected():
+    """The downgrade covers finite worst-case MARGINS only: an eps so small that
+    min_iters_for_tol cannot even represent tanh(M~/2eps) < 1 (tol unreachable in
+    finitely many iterations) remains a hard config error."""
+    eng = _engine(eps=0.001)
+    norms = {y: (D + torch.rand(100, dtype=torch.float64)) for y in range(C)}
+    _expect(ValueError, lambda: eng.seed_priors(norms), "unreachable-eps accepted")
+
+
 def test_forward_requires_seed():
     eng = _engine()
     z, kz, lb, sb, w, tr = _batch(eng, 0)

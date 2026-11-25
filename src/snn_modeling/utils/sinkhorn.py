@@ -202,13 +202,21 @@ def _augment_support(support, n, m, device, name="support"):
     return aug
 
 
-def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10, support=None):
+def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10, support=None,
+                  residual_cap=None):
     """Balanced log-domain scaling on the augmented marginals (1,a) x (1,b).
     Fully no_grad: the plan is an M-step object; gradients reach the loss only
     through W_with_grad below (Prop 8.3/Danskin). Non-convergence RAISES
     (never a silently under-solved coupling).
 
-    `support` (optional): (n, m) bool, False = forbidden pair (structural zero)."""
+    `support` (optional): (n, m) bool, False = forbidden pair (structural zero).
+    `residual_cap` (optional): EMPIRICAL acceptance for the marginal residual —
+    the REVISED smoke contract (2026-11-25) for short-schedule solves (eps=0.15,
+    n_iters=25) where the worst-case Birkhoff tol is unreachable but the measured
+    residual sits far inside the 1e-3 budget. Acceptance becomes
+    max(residual_cap, float-noise floor); None keeps the legacy max(tol, noise).
+    The residual is always reported in out["residual"] and still raises on a
+    real breach — an under-solved coupling is never shipped either way."""
     _validate_cost(cost, "sinkhorn_plan cost")
     _validate_marginal(a, "sinkhorn_plan a")
     _validate_marginal(b, "sinkhorn_plan b")
@@ -248,10 +256,14 @@ def sinkhorn_plan(cost, a, b, eps, tau, n_iters=5000, tol=1e-10, support=None):
         row_res = float((plan.sum(dim=1) - r).abs().max().item())
         col_res = float((plan.sum(dim=0) - cvec).abs().max().item())
         residual = max(row_res, col_res)
-        if residual > max(tol, 1000.0 * torch.finfo(plan.dtype).eps):
+        noise = 1000.0 * torch.finfo(plan.dtype).eps
+        accept = max(tol, float(noise)) if residual_cap is None else \
+            max(float(residual_cap), float(noise))
+        if residual > accept:
             raise RuntimeError(
-                f"sinkhorn_plan: marginals not met to tol after {it} iterations "
-                f"(residual {residual:.3e} > {tol:.3e}; eps={eps}, M~=max(2,tau)={max(2.0, float(tau)):.3f}) — "
+                f"sinkhorn_plan: marginals not met after {it} iterations "
+                f"(residual {residual:.3e} > acceptance {accept:.3e}; eps={eps}, "
+                f"M~=max(2,tau)={max(2.0, float(tau)):.3f}, residual_cap={residual_cap}) — "
                 "apply the §11.5 ladder (raise eps first, then re-check the rho seed); "
                 "never ship an under-solved coupling")
         e_const = eps * float((plan * (plan.clamp(min=_finfo_tiny(plan.dtype)).log() - 1.0)).sum())
@@ -290,7 +302,7 @@ def solve_w(cost, a, b, eps, tau, **kw):
 # ------------------------------------------------------------------ per-class emotion term
 
 def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=5000, tol=1e-10,
-                  support=None):
+                  support=None, residual_cap=None):
     """S^y_eps(mu_y, nu_y) — Def. 5.4 debiased matching value for one class (Prop 5.5).
 
     z_tilde: (n, D) current-window ball features for class y, grad-carrying.
@@ -347,16 +359,18 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
 
     # Support restriction goes on the CROSS solve only (see docstring).
     cross = sinkhorn_plan(cost_cross, a, b, eps, tau, n_iters=n_iters, tol=tol,
-                          support=support)
+                          support=support, residual_cap=residual_cap)
     W_cross = W_with_grad(cost_cross, cross["plan"], tau, eps)
 
-    self_mu = sinkhorn_plan(cost_self_mu.detach(), a, a, eps, tau, n_iters=n_iters, tol=tol)
+    self_mu = sinkhorn_plan(cost_self_mu.detach(), a, a, eps, tau, n_iters=n_iters, tol=tol,
+                            residual_cap=residual_cap)
     W_self_mu = W_with_grad(cost_self_mu, self_mu["plan"], tau, eps)
 
     if self_nu_cache is None:
         cost_self_nu = half_sq_cost(keys, keys).detach()
         _validate_cost(cost_self_nu, "class_ot_term self-nu cost")
-        snu = sinkhorn_plan(cost_self_nu, b, b, eps, tau, n_iters=n_iters, tol=tol)
+        snu = sinkhorn_plan(cost_self_nu, b, b, eps, tau, n_iters=n_iters, tol=tol,
+                            residual_cap=residual_cap)
         W_self_nu = snu["W"]
         fresh_cache = {"schema": SELF_NU_SCHEMA, "W": W_self_nu, "plan": snu["plan"],
                        "m": int(keys.shape[0]), "eps": float(eps), "tau": float(tau)}

@@ -1,47 +1,50 @@
-### Copy-Paste Implementation Ticket for Coding Agent
+Here is a compact, copy-paste prompt for your coding agent:
 
-> Please sync the codebase to **`SWEEP-Net Specification Revised Certified.pdf`** with the following 6 targeted updates (keep all existing unit tests passing and add quick assertions for each):
-> **1. Half-Squared Euclidean Ground Cost on $\mathbb{B}^d$ (`sinkhorn.py`, `estep.py` — Eq. 9 & Prop 8.1):**
-> * Replace cosine cost `1 - z_i @ r_j` with **`C_ij = 0.5 * ||z_i - r_j||^2`** (`0.5 * torch.cdist(z, r, p=2).pow(2)` or `0.5 * (z.pow(2).sum(1, keepdim=True) + r.pow(2).sum(1) - 2 * z @ r.T).clamp(0.0, 2.0)`).
-> * Guarantees $C(v, v) = 0$ even in the interior $\Vert{}v\Vert{} < 1$, stays in $[0, 2]$, and preserves `-inf` log-kernel same-trial masking.
-> 
-> 
-> **2. Decoupled Geometric Drop Price & Log-Domain Sinkhorn (`sinkhorn.py` — Eq. 11 & Numerical Safety):**
-> * Replace `dustbin_price = -eps * log1p(-rho)` with **`tau_y = tau_0 - kappa_cost * log1p(-rho_y)`** (config defaults: `tau_0: 0.35`, `kappa_cost: 0.50`).
-> * Keep `sinkhorn.py` strictly in **log-domain** (log-sum-exp updates on $\log \tilde{K} = -\tilde{C}/\varepsilon$ with `-inf` support mask), since at $\rho_y \approx 0.9$, $\exp(-\tau_y/\varepsilon) \approx 10^{-7}$ can underflow in linear-domain scaling.
-> 
-> 
-> **3. Calibrated Nullspace E-Step, Queue Buffer $\mathcal{B}_y$, and `mil_readout.py` Hookup (`queue.py`, `estep.py`, `sm_loss.py`, `mil_readout.py` — Remark 4.2, Eq. 7–8, Prop 10.1):**
-> * Compute EMA empirical nullspace baseline variance per dimension:
-> 
-> $$\hat{\sigma}^2 = \max\!\left(\sigma_{\min}^2,\; \frac{\sum_t (1 - \alpha_t)\Vert{}h'_t - \hat{\mu}'_{s_t}\Vert{}^2}{(d - m)\sum_t (1 - \alpha_t)}\right)$$
-> 
-> 
-> 
-> and evaluate $\ell_s(h'_t) = -\Vert{}h'_t - \hat{\mu}'_s\Vert{}^2 / (2\hat{\sigma}^2)$ and $\ell_y(\tilde{z}_t) = \log\sum_{j\in Q_y} b_j \exp(-\Vert{}\tilde{z}_t - r_j\Vert{}^2 / (2\varepsilon))$.
-> * Store per-window raw scores **`s_{j, y_j} = l_y(z~_j) - l_s(h'_j)`** inside `queue.py` alongside keys, labels, $\beta_j$, and `window_uid`s to form the rolling class buffer $\mathcal{B}_y$.
-> * Solve $\frac{1}{\vert{}\mathcal{B}_y\vert{}}\sum_{t\in\mathcal{B}_y}\sigma((s_{t,y} + u)/T) = \rho_y$ via **25 steps of 1D bisection** to get $u_y^\star$, EMA-smooth into $\bar{u}_y$, compute $\alpha_t^{(1\text{A})} = \sigma((s_{t,y} + \bar{u}_y)/T)$, and recover **`c_y = u_bar_y - logit(rho_y)`**.
-> * Export **`{c_y}`** and **`sigma_hat^2`** inside `lock_fullpass()`, and wire `mil_readout.py` so Phase 1B computes $\alpha_t^{(1\text{B})}$ using **`l_y(z~_t) + c_y`** and **`-||h'_t - mu_hat'_b||^2 / (2 * sigma_hat^2)`** (Eq. 18) with the 2-step contraction $\hat{\mu}'_b = G^2(\bar{h}'_b)$.
-> 
-> 
-> **4. Capped Upper Bound for $\lambda_{\text{OT}}$ (`gates.py` — Eq. 15):**
-> * Change the unbounded equality `lambda_OT = c * g * ||grad L_anc|| / ||grad L_em||` to the **capped upper bound**:
-> 
-> $$\lambda_{\text{OT}} = \min\!\left(\lambda_{\max},\; c\, g\, \frac{\Vert{}\nabla_{\tilde{z}} \mathcal{L}_{\text{anc}}\Vert{}}{\Vert{}\nabla_{\tilde{z}} \mathcal{L}_{\text{em}}\Vert{} + 10^{-8}}\right)$$
-> 
-> 
-> 
-> with default `lambda_max: 1.0` (preserves Anti-Ghost when $\Vert{}\nabla_{\tilde{z}} \mathcal{L}_{\text{em}}\Vert{} \to 0$).
-> 
-> 
-> **5. Clamped Option-B Seeding Contraction (`sparsity.py` — Proposition 9.3):**
-> * In the Option-B $\rho_y$ fixed-point seeding loop, clamp $F(u)$ at every iteration to **`[logit(rho_min), logit(1 - rho_min)]`** so $\tilde{F}: I_{\text{clamp}} \to I_{\text{clamp}}$ is a guaranteed self-map contraction even when $\Delta_t$ scores are skewed.
-> 
-> 
-> **6. Asymmetric `FourierMixup3D` Dual Views (`dataset.py:371–372`, if not yet applied):**
-> * Split into `self.query_augmentations` (includes `FourierMixup3D` with `p=0.5`) and `self.key_augmentations` (omits `FourierMixup3D`, `p=0`) so momentum keys, queue clouds $\nu_y$, and subject means $\mu_s^\star$ remain uncontaminated by donor mixing.
-> 
-> 
-> After implementing, please run a quick synthetic forward/backward + `lock_fullpass()` $\to$ `mil_readout` smoke test confirming finite gradients, `C(v,v) == 0` for $\Vert{}v\Vert{} < 1$, calibrated `mean(alpha_y) ≈ rho_y`, and `lambda_OT <= lambda_max`.
+---
 
+> Apply these 2 quick fixes and lock in the smoke-run config (`Subjects 3–7` train $\to$ `1–2` val, all 3 sessions):
+> **Fixes:**
+> 1. **`estep.py` (drop `(d - m)` divisor in $\hat{\sigma}^2$):** Compute total radial baseline spread instead of per-dimension variance:
+> 
+> $$\hat{\sigma}^2 = \max\!\left(\sigma_{\min}^2,\; \frac{\sum_t (1 - \alpha_t)\Vert{}h'_t - \hat{\mu}'_{s_t}\Vert{}^2}{\sum_t (1 - \alpha_t)}\right), \qquad \sigma_{\min}^2 = 0.05.$$
+> 
+> 
+> 
+> *(Prevents $\ell_s$ from drowning out $\ell_y$ by $50\times$ and keeps Proposition 10.2's $\kappa_\mu < 1$.)*
+> 2. **`sinkhorn.py` / `sm_loss.py` (`eps = 0.15`, `sinkhorn_iters = 25`, log-domain):** Keep Sinkhorn in log-domain with `eps = 0.15` and `25` iterations. Downgrade the startup worst-case Birkhoff `eps_lower_bound` check to a warning (do not hard-abort on `eps = 0.15`) and log the empirical marginal residual `max(|Pi.sum(1)-a|, |Pi.sum(0)-b|)` (verify `< 1e-3`).
+> 
+> 
+> **Smoke-Run Hyperparameters (`ea_supcon_fda_adamw_lotomasking.yaml`):**
+> * **Split & Schedule:** `--loso 1,2` (train `3–7`, val `1–2`, all 3 sessions), `epochs: 25`, `batch_size: 64` (`PKSampler` eff `60`, `subject_diverse_k: false`), `probe_interval: 2`.
+> * **Optimizer & AMP:** `AdamW`, `lr: 1e-3` (cosine $\to$ `1e-5`), `weight_decay: 0.01`, `bf16` autocast on backbone + momentum (no `GradScaler`), `fp32` in `SMCLossEngine`.
+> * **Queue & Subspace:** `queue_size: 2048`, `allow_smoke_sizing: true`, MoCo momentum linear `0.90 -> 0.99` over `loss.sm.warmup_epochs: 2` (with `U = 0` during warmup), dynamic rank `0.85` trace capped at `m <= 3`, `tau_norm: 0.25`.
+> * **Loss & Gate:** `lambda_anc: 1.0` (`tau_DCL: 0.1`, `anchor_on: projected`), `eps: 0.15`, `sinkhorn_iters: 25`, `tau_0: 0.35`, `kappa_cost: 0.50`, `c: 0.5`, `g_floor: 0.1`, `lambda_max: 1.0`, `lambda_sub: 0.1`, `lambda_rho: 0.1`.
+> * **Calibrated E-Step:** `T: 2.0 -> 1.0` over first 30% of steps, `bisection_iters: 25`, `u_y` EMA `0.95`, `sigma_min^2: 0.05`, `rho_min: 0.05`.
+> * **Augmentations:** `FourierMixup3D` on `query` only (`p: 0.5`, `retention_ratio: 0.95`, `Beta(1,1)`); **`key` view `p: 0.0**`.
+> 
+> 
+> Confirm tests pass (including `marginal_residual < 1e-3` at `eps = 0.15`) so I can pull and launch on RunPod.
 
+---
+
+## Run commands (paths patched in, 2026-11-25)
+
+Pod paths: SEED-V raw + `coords.csv` at `/workspace/SEED-V`, preprocessed subject 1–7 slice (all 3 sessions) at `/workspace/SEED-V/preprocessed_eeg_ea_1_7`. The slice is already windowed (fp16), so no `--setup_data` and — since masks are optional now — no `--masks` step.
+
+```bash
+cd /workspace/eeg_analysis_snn
+
+python main.py --config config/ea_supcon_fda_adamw_lotomasking.yaml --loso 1,2 \
+  data.dataset_path=/workspace/SEED-V/preprocessed_eeg_ea_1_7
+```
+
+Everything else comes from the locked config (25 epochs, B=64 → PK eff 60, `n_q=2048`, eps 0.15 / 25 iters / residual_cap 1e-3, anneal 2.0→1.0 over 30%, `rho_min 0.05`, `max_rank 3`, warmup 2, `lr_min 1e-5`).
+
+Watch at startup: `[SMC §12.2 WARNING] eps=0.1500 < B2a worst-case floor 0.9233` (expected, it fires per class), then §9.6 sizing/staleness lines. If the §9.4 staleness gate raises, the queue is too long for the actual `steps_per_epoch` — halve `loss.sm.n_q` and relaunch (it hard-raises by design, never warns). During training `smc/ot_residual` must stay < 1e-3; a class whose rho drifts past ~0.5 can breach at 25 iters — the ladder answer is more `sinkhorn.n_iters`, not a bigger cap.
+
+## Done (applied 2026-11-25)
+
+- **Fix 1:** `sigma_hat^2` is now the total radial spread (no `(d−m)` divisor), floor `sigma_sq` default **0.05** (`sm_loss.py` + config + docs).
+- **Fix 2:** `eps: 0.15`, `sinkhorn.n_iters: 25`, start gate downgraded to warning (degenerate eps where tol is provably unreachable still hard-raises); empirical residual logged per step as `diagnostics["ot_residual"]`, accepted under new `sinkhorn.residual_cap: 1.0e-3`, breach still raises.
+- Smoke hyperparameters locked in `config/ea_supcon_fda_adamw_lotomasking.yaml` (+ new `loss.sm.max_rank: 3` → `NullspaceState`, `training.lr_min: 1e-5` → scheduler).
+- Tests: **119, 118 green** (only the pre-existing `run_phase1b_t0_t5` import fails). New pins: seeded-τ residual < 1e-3 at 25 iters in fp64, high-τ corners raise-and-resolve-at-1000, seed warns-but-runs at pinned 0.15, `min_iters_for_tol` degenerate raise kept, rank-cap test, `sigma_min² = 0.05` default.
