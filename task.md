@@ -44,9 +44,17 @@ Pod paths: SEED-V raw + `coords.csv` at `/workspace/SEED-V`, preprocessed subjec
 ```bash
 cd /workspace/eeg_analysis_snn
 
+# 0) PREFLIGHT FIRST (~1 min of pod time, replaces an hour of crash-looping):
+python tests/test_stage9.py
+
+# 1) THE RUN:
 python main.py --config config/ea_supcon_fda_adamw_lotomasking.yaml --loso 1,2 \
   data.dataset_path=/workspace/SEED-V/preprocessed_eeg_ea_1_7
 ```
+
+**Stage 9 = the pod-launch gate.** It runs the entire live path — real DataLoader batches through train.py's exact unpack lines, Option-B pre-pass + seeding, engine forward/backward with the rank-recompute/queue/OT/gate/M-step machinery, classification-only validation, `lock_fullpass` → `Phase1BReadout` → LBFGS finetune → evaluate — once on CPU and once on CUDA (identical seeded data; a cpu/cuda divergence is a device bug by construction). Every pod crash so far (argparse, list-slot collate, and this one's searchsorted device mismatch) is the class of bug it catches before billing starts. If it can't pass on the pod, the run can't work — fix or paste its output instead of launching.
+
+> **Third pod crash fixed (2026-11-26):** `RuntimeError: Expected all tensors to be on the same device ... searchsorted` in `space.py::_recompute_geometry` — the energy-band scalar was built with `torch.tensor(...)` (defaults CPU) while the engine is `.to(cuda)`. Now constructed on `cum.device`. This bug class (any CPU-created tensor meeting CUDA buffers) is what stage 9's cuda pass now covers.
 
 Everything else comes from the locked config (25 epochs, B=64 → PK eff 60, `n_q=2048`, eps 0.15 / 25 iters / residual_cap 1e-3, anneal 2.0→1.0 over 30%, `rho_min 0.05`, `max_rank 3`, warmup 2, `lr_min 1e-5`).
 

@@ -202,8 +202,12 @@ class NullspaceState(nn.Module):
             self.rank.zero_()
             return
         cum = torch.cumsum(energy, dim=0) / total
+        # band scalar MUST be built on cum's device: the engine is .to(cuda) in
+        # train.py and default-device torch.tensor() here died on the pod's first
+        # rank recompute (searchsorted device check, 2026-11-26).
         r = int(torch.searchsorted(cum.double(),
-                                   torch.tensor(self.rank_energy_band, dtype=torch.double)).item()) + 1
+                                   torch.tensor(self.rank_energy_band, dtype=torch.double,
+                                                device=cum.device)).item()) + 1
         r = max(0, min(r, self.max_rank, n_present - 1))  # Remark 6.4: rank <= S-1
         self.U[:, :r] = Uv[:, :r]
         self.rank.fill_(r)
