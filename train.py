@@ -1183,9 +1183,21 @@ def run_training(config, model, device, phase, resume, loso=None, subj=None, che
     writer = SummaryWriter(log_dir=log_dir)
     print(f"Initializing TensorBoard: {log_dir}")
 
-    masks = torch.load(os.path.join(config.data.dataset_path,'masks.pt')).to(device)
-    density = masks.sum() / masks.numel()
-    print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
+    # masks.pt is OPTIONAL since the 2026-11-25 spec sync: no SMC Phase-1A consumer
+    # reads the target maps (validation runs only_classification=True; the engine
+    # takes labels/subjects/uids, never batch[1]). Absent file => SWEEPDataset's own
+    # analytic prototypes (the documented pre-mask default) — announced, never silent.
+    mask_path = os.path.join(config.data.dataset_path, 'masks.pt')
+    if os.path.exists(mask_path):
+        masks = torch.load(mask_path, weights_only=True).to(device)
+        density = masks.sum() / masks.numel()
+        print(f"Global Density (Consider this for setting up target firing rate): {density:.4f}")
+    else:
+        masks = None
+        print(f"[masks] {mask_path} not found — training WITHOUT statistical masks "
+              "(SMC objective consumes no mask targets; legacy SupMoCo/IIC runs would "
+              "fall back to the dataset's analytic prototypes). Generate with main.py --masks "
+              "only if you plan to grade the segmentation/dice path.")
 
     # Create dataset first (without augmentations) so FourierMixup can scan it
     train_set = SWEEPDataset(

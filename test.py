@@ -336,7 +336,15 @@ def test(config, loso, subj, device, model):
     # ------------------
     # Data Loaders
     # ------------------
-    masks = torch.load(os.path.join(config.data.dataset_path, 'masks.pt'), weights_only=True).to(device)
+    # masks.pt is optional: this harness computes classification/probe metrics only, the
+    # target maps are unpacked and discarded. Absent => analytic prototypes, announced.
+    mask_path = os.path.join(config.data.dataset_path, 'masks.pt')
+    if os.path.exists(mask_path):
+        masks = torch.load(mask_path, weights_only=True).to(device)
+    else:
+        masks = None
+        print(f"[masks] {mask_path} not found — evaluation runs mask-free "
+              "(target maps are discarded by this harness anyway).")
 
     # 1. Validation Set (The held-out LOSO subject)
     val_set = SWEEPDataset(

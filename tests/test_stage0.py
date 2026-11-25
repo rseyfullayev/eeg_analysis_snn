@@ -208,6 +208,29 @@ def test_load_encoder_state_strict():
 
 # --------------------------------------------------------------------------- dataset fail-loud
 
+def test_dataset_trains_without_masks_pt():
+    """2026-11-25: masks.pt is OPTIONAL — no SMC Phase-1A consumer reads the target
+    maps. With prototypes=None the dataset keeps its documented analytic default and
+    the batch tuple/collate shape is unchanged (target_map slot still (grid,grid) long)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _fake_dataset_dir(tmp, n_subjects=1, n_bags_per=1, n_windows=2)
+        assert not os.path.exists(os.path.join(tmp, "masks.pt"))
+        ds = SWEEPDataset(_cfg(tmp), split='all', precomputed=False, prototypes=None)
+        item = ds[0]
+        tmap = item[1]
+        assert tuple(tmap.shape) == (ds.grid_size, ds.grid_size) and tmap.dtype == torch.long
+        assert int(tmap.max()) >= 1  # analytic prototypes still produce a foreground map
+        # a mask-built dataset with the SAME index must differ only in the map contents
+        m = torch.zeros(ds.num_classes, ds.grid_size, ds.grid_size)
+        m[0, 0, 0] = 1.0
+        ds_m = SWEEPDataset(_cfg(tmp), split='all', precomputed=False, prototypes=m)
+        assert int(ds_m[0][1].max()) in (0, 1)  # no crash when a class maps to nothing
+        # default-collate contract survives (train.py uses the stock collater)
+        from torch.utils.data import default_collate
+        b = default_collate([ds[0], ds[0]])
+        assert b[1].shape[1:] == (ds.grid_size, ds.grid_size) and b[1].dtype == torch.long
+
+
 def test_dataset_raises_on_missing_window_file():
     with tempfile.TemporaryDirectory() as tmp:
         _fake_dataset_dir(tmp, n_subjects=1, n_bags_per=1, n_windows=2,

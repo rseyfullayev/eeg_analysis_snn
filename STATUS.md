@@ -68,8 +68,9 @@
 | 5 | **Option-B self-map clamp** (Prop 9.3) | already in place since 8a7c25b (u clamped to [logit ρ_min, logit(1−ρ_min)] every iteration) — now pinned by `test_option_b_seed_is_self_map_on_clamped_box` |
 | 6 | **Asymmetric FourierMixup dual views** | already delivered 2026-11-23 (query FM3D p=0.5 + light chain; key chain FM3D-free, two fail-loud guards) — no change, covered by stage-0 guards |
 | Voids | every pre-sync checkpoint queue state (`scores` buffer → strict load refuses), every `smc-lockpass-v1` artifact, and any eps pinned against the old eps-coupled lb — full 1A rerun required (free: no lab numbers exist yet) |
+| **Masks no longer a train prerequisite** | `masks.pt` was loaded unconditionally in `train.py:1186` / `main.py:257` / `test.py:339` yet NO pipeline code writes that path (`generate_masks` saves `evidence/subjectX.pt`) and nothing consumes the target maps in the live path (validate is `only_classification=True`; the SMC engine takes labels/subjects/uids, never `batch[1]`). All three loads are now optional with a loud announce; absent → the dataset's documented analytic-prototype default. `--masks` only matters for grading the seg/dice path. Pinned by `test_dataset_trains_without_masks_pt` |
 | Smoke | `.qwen` scratch ticket-smoke (30 synthetic steps + lock → readout): finite grads; fp64 interior C(v,v)=0 exact (fp32 diagonal ≤ 6e−8); per-class mean α = ρ_y to 4 dp after Eq. 12; λ_OT cap binds at 1.0 as ‖∇L_em‖→0; R finite, centroid == Eq. 18 head |
-| Tests | 105 → **113** (0:16 1:9 2:11 3:15 4:18 5:14 6:18 7:6 8:7) — **112 green** 2026-11-25; the single failure remains the pre-existing stage-0 `run_phase1b_t0_t5` import (owner call) |
+| Tests | 105 → **114** (0:17 1:9 2:11 3:15 4:18 5:14 6:18 7:6 8:7) — **113 green** 2026-11-25; the single failure remains the pre-existing stage-0 `run_phase1b_t0_t5` import (owner call) |
 
 ## Final audit (10 checks, `AUDIT.md`) — 2026-11-23
 

@@ -254,7 +254,15 @@ def main():
         if not args.loso and not args.subj:
             parser.error("You MUST specify loso or subj for validation (either config or CLI).")
         
-        masks = torch.load(os.path.join(config.data.dataset_path,'masks.pt')).to(device)
+        # masks.pt is optional (--val grades classification only; the target maps never
+        # reach the metric). Absent => dataset analytic prototypes, announced.
+        mask_path = os.path.join(config.data.dataset_path, 'masks.pt')
+        if os.path.exists(mask_path):
+            masks = torch.load(mask_path, weights_only=True).to(device)
+        else:
+            masks = None
+            print(f"[masks] {mask_path} not found — validation runs mask-free "
+                  "(target maps are not consumed by the classification metric).")
         val_set = SWEEPDataset(
                                 config, 
                                 split='val',
