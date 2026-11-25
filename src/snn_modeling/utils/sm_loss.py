@@ -9,8 +9,11 @@ certificate C_K (Eq. 22, Thm 7.3), readiness gate + EMA lambda_OT (Eq. 13,
 §8.3), debiased dustbin-Sinkhorn emotion term (Eq. 19/Def. 5.4) and the
 sparsity prior (Eq. 21). Nothing is detached silently: the gradient routing
 is explicit (queue/cloud/coupling/rho/U/ema tables are stop-grad M-step
-material; gradients reach the encoder through z~ in L_anc, L_em, L_sub and
-through alpha in L_spr).
+material; gradients reach the encoder ONLY through z~ in L_anc, L_em and
+L_sub). The 2026-11-25 revision detached alpha EVERYWHERE in the M-step —
+L_spr no longer back-propagates through the responsibilities it regularizes,
+and the queue stores RAW momentum keys (S^(d-1)) that are projected with the
+CURRENT (mu, U) on every read, not frozen at enqueue geometry.
 
 Window-id plumbing (§9.4): the dataset gives per-trial local window ids
 (timestamps, with -1 pads). The engine composes globally-unique queue UIDs
@@ -420,8 +423,18 @@ class SMCLossEngine(nn.Module):
         with torch.no_grad():
             h_k, zt_k, _ = self.space.project(key_z.detach())  # stop-grad key path
 
+        # 2026-11-25 REVISED queue contract: the ring stores RAW momentum keys on
+        # S^(d-1); the (mu, U) projection is applied ON READ with the CURRENT
+        # geometry, so cloud costs, DCL negatives and scores live in today's
+        # nullspace — a key enqueued under a stale subspace can no longer bias
+        # the OT/E-step forever (the ring outlives the geometry, not the reverse).
         clouds = self.queue.read_class_clouds(exclude_window_ids=uids)
         neg_keys, _, _, neg_uids = self.queue.read_negatives(exclude_window_ids=uids)
+        with torch.no_grad():
+            for cl in clouds.values():
+                cl["keys"] = self.space.project(cl["keys"])[1]
+            if neg_keys.shape[0] > 0:
+                neg_keys = self.space.project(neg_keys)[1]
         # One support graph feeds BOTH the E-step density and the OT cross term (Rm 4.2:
         # alpha and S_eps must score the same transportable pairs, or the responsibilities
         # and the emotion term disagree about what evidence exists).
@@ -429,7 +442,18 @@ class SMCLossEngine(nn.Module):
         loto_cold_rows = 0
 
         # ---- anchor (Eq. 22) + bootstrap cold path (§11.4ii: defined zero, flagged)
+        # STEP-1 GUARD (2026-11-25): if the ring holds fewer than 2 distinct trials
+        # and they all lie INSIDE the current batch, a cross-trial negative CANNOT
+        # exist — every query losing all negatives is cold-start arithmetic, not the
+        # trial-derivation bug the dcl tripwire hunts (with >=2 queue trials outside
+        # the batch pattern, that raise still fires). Flagged, never silent.
         cold_anchor = neg_keys.shape[0] == 0
+        anchor_coldstart = False
+        if not cold_anchor:
+            q_tr = torch.unique(neg_uids // UID_SHIFT)
+            anchor_coldstart = bool(q_tr.numel() < 2 and torch.isin(q_tr, trial_ids).all())
+            if anchor_coldstart:
+                cold_anchor = True
         if cold_anchor:
             L_anc = zt_q.sum() * 0.0
             C_K, K = 0.0, 1
@@ -502,8 +526,12 @@ class SMCLossEngine(nn.Module):
         else:
             key_scores = None
 
-        # ---- sparsity prior (Eq. 21) with the CURRENT rho table, then Eq. 12 M-step
-        L_spr = sparsity_loss(alpha, labels, rho_vec)
+        # ---- sparsity prior (Eq. 21) with the CURRENT rho table, then Eq. 12 M-step.
+        # alpha is DETACHED here too (2026-11-25): Eq. 21 is an M-step quantity on the
+        # responsibilities — the old grad-through-alpha path let L_spr back-propagate
+        # into the encoder via the very E-step variable it is supposed to regularize.
+        # Encoder gradients come ONLY through z~ in L_anc / L_em / L_sub.
+        L_spr = sparsity_loss(alpha.detach(), labels, rho_vec)
         with torch.no_grad():
             self.rho.copy_(rho_mstep(alpha.detach(), labels, self.num_classes,
                                      self.rho_min, prev_rho=self.rho))
@@ -598,7 +626,10 @@ class SMCLossEngine(nn.Module):
             self.sigma_hat_sq.fill_(max(self.sigma_sq,
                                         self.calib_momentum * sg
                                         + (1.0 - self.calib_momentum) * est))
-            self.queue.enqueue(zt_k, labels, alpha.detach(), uids, step, scores=key_scores)
+            # RAW unit-norm momentum keys go into the ring (S^(d-1)); projection is
+            # applied on read with the current (mu, U) — see the read contract above.
+            self.queue.enqueue(key_z.detach(), labels, alpha.detach(), uids, step,
+                               scores=key_scores)
             self.step += 1
 
         diag = {"step": step, "T": T, "gate": g, "lambda_ot": lam,
@@ -606,6 +637,7 @@ class SMCLossEngine(nn.Module):
                 "anneal_complete": bool(step >= self.anneal_frac * self.total_steps),
                 "C_K": C_K, "K": K, "n_negatives": int(neg_keys.shape[0]),
                 "cold_anchor": cold_anchor, "cold_em": cold_em,
+                "anchor_coldstart": anchor_coldstart,
                 "cold_alpha_rows": cold_rows,
                 "loto_mask": bool(self.ot_loto_mask),
                 "loto_cold_rows": loto_cold_rows,
@@ -660,6 +692,12 @@ class SMCLossEngine(nn.Module):
             raise RuntimeError(f"lock_fullpass: sigma_hat^2 = {float(self.sigma_hat_sq)} is not "
                                "a positive finite calibrated variance")
         clouds = self.queue.read_class_clouds()
+        # payload keeps the historical CONTRACT: projected clouds. The ring now stores
+        # raw keys, so the lock projects once with the exact (mu, U) being locked —
+        # identical geometry for Phase 1B (mil_readout stays projection-agnostic).
+        with torch.no_grad():
+            for cl in clouds.values():
+                cl["keys"] = self.space.project(cl["keys"])[1]
         rho = self.rho.detach().cpu().clone().double()
         c = self.u_bar.detach().cpu().clone().double() - torch.log(rho / (1.0 - rho))
         payload = {

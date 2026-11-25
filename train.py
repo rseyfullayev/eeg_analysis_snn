@@ -822,6 +822,15 @@ def training_loop(phase,
                 f"Phase{phase}/SMC/QueueFill": last_smc_diag["queue"]["fill_ratio"],
                 f"Phase{phase}/SMC/NullspaceRank": last_smc_diag["space"].get("rank", 0),
                 f"Phase{phase}/SMC/ColdAlphaRows": last_smc_diag["cold_alpha_rows"],
+                # 2026-11-25 ticket "2 tiny log scalars": epochs 1-5 readability.
+                # SigmaHatSq = calibrated total radial spread (l_s scale after the
+                # detach + total-spread fix — must sit in a sane band, not ~1e-3).
+                # OTResidualMax = worst per-class EMPIRICAL marginal residual —
+                # the live replacement for the B2a worst-case gate at eps=0.15/25
+                # iters; < 1e-3 expected, solver raises before it can grow.
+                f"Phase{phase}/SMC/SigmaHatSq": float(last_smc_diag["sigma_hat_sq"]),
+                f"Phase{phase}/SMC/OTResidualMax": (max(last_smc_diag["ot_residual"].values())
+                                                    if last_smc_diag.get("ot_residual") else 0.0),
                 # Cloud LOTO support mask: DNorm_y can only be read as burst-drop if the
                 # structural share is known alongside it (SMC/LotoColdRows counts windows
                 # whose whole class cloud was same-trial and therefore fell back to rho).

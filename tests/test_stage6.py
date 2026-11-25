@@ -436,6 +436,59 @@ def test_bad_config_inputs_rejected():
                                              num_subjects=S, total_steps=0), "total_steps=0 accepted")
 
 
+# ------------------------------------------------------------------ M-step ticket (2026-11-25)
+
+def test_mstep_detach_raw_keys_and_step1_guards():
+    """Ticket pins: (i) L_spr sees DETACHED alpha (no grad through the E-step variable
+    it regularizes), lambda_OT is a plain float, and backward SURVIVES geometry
+    mutation (apply_projector snapshots U — no version-counter corruption from the
+    in-place SVD write); (ii) the queue stores RAW unit-norm keys and projects on
+    read with the current (mu, U); (iii) step-1 degenerate batches — a queue whose
+    only trial is the batch's (anchor cold-start guard + EXACT degenerate OT plan,
+    residual 0, never the -inf-block solver stall) and classes absent from the ring
+    (cold rows) — stay flagged and finite instead of exploding."""
+    eng, _ = _seeded_engine()
+    z, kz, lb, sb, w, tr = _batch(eng, 0)
+    tr = torch.zeros_like(tr)                       # the queue holds ONE trial
+    eng(z, kz, lb, sb, w, tr)
+    B = 16
+    lb1, sb1 = torch.arange(B) % C, torch.arange(B) % S
+    torch.manual_seed(5)
+    z1 = Fn.normalize(torch.randn(B, D), dim=1).requires_grad_(True)
+    kz1 = Fn.normalize(torch.randn(B, D), dim=1)
+    out1 = eng(z1, kz1, lb1, sb1, torch.arange(B) + 1000, torch.zeros(B, dtype=torch.long))
+    d1 = out1["diagnostics"]
+    assert d1["anchor_coldstart"] and d1["cold_anchor"], \
+        "single-trial queue vs single-trial batch must flag the cold-start anchor"
+    assert torch.allclose(out1["alpha"], eng.rho.detach()[lb1]), "fully-ghosted batch not all-cold"
+    assert d1["ot_residual"] and all(v == 0.0 for v in d1["ot_residual"].values()), \
+            f"degenerate OT must ship the exact plan (residual 0), got {d1['ot_residual']}"
+    assert not out1["L_spr"].requires_grad, "L_spr gained a grad path through alpha"
+    assert isinstance(d1["lambda_ot"], float)
+    out1["total"].backward()                        # two geometry rewrites already
+    assert torch.isfinite(z1.grad).all()            # happened between forward and here
+    filled = int(eng.queue.filled.item())
+    stored = eng.queue.keys[:filled]
+    assert torch.allclose(stored.norm(dim=1), torch.ones(filled), atol=1e-5), \
+        "queue must store RAW S^(d-1) keys, not projected z~"
+    assert torch.allclose(stored[:24], kz.detach()[:24], atol=1e-6), "stored rows != key_z rows"
+    # classes absent from the ring follow the cold path (Step-2 guard)
+    eng2, _ = _seeded_engine()
+    z2, kz2, lb2, sb2, w2, tr2 = _batch(eng2, 0)
+    eng2(z2, kz2, lb2 % 2, sb2, w2, tr2)            # ring sees classes {0,1} only
+    B3 = 12
+    lb3 = torch.arange(B3) % C
+    torch.manual_seed(6)
+    z3 = Fn.normalize(torch.randn(B3, D), dim=1).requires_grad_(True)
+    out3 = eng2(z3, Fn.normalize(torch.randn(B3, D), dim=1), lb3, torch.arange(B3) % S,
+                torch.arange(B3) + 500, torch.arange(B3) + 40)
+    m23 = lb3 >= 2
+    assert torch.allclose(out3["alpha"][m23], eng2.rho.detach()[lb3[m23]]), \
+        "absent-class rows must fall back to the seeded rho"
+    out3["total"].backward()
+    assert torch.isfinite(z3.grad).all()
+
+
 # ------------------------------------------------------------------ runner
 
 def main():

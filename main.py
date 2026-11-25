@@ -44,7 +44,9 @@ def main():
     parser.add_argument('--masks', action='store_true', help='Derive masks from Subject')
     parser.add_argument('--calibrate', action='store_true', help='Calibrate optimal ALIF parameters')
     parser.add_argument('--no_train', action='store_true', help='Skip training after setup tasks')
-    args = parser.parse_args()
+    # Extra tokens are Hydra config overrides (key=value, optional leading --);
+    # collected below and validated loudly — a typo'd flag must not vanish.
+    args, extra = parser.parse_known_args()
     config_path = args.config
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,8 +79,14 @@ def main():
     # We now use true Hydra resolution so we can combine folders (dataset/, model/) dynamically!
     import sys
     from hydra import initialize_config_dir, compose
-    
-    cli_args = [arg for arg in sys.argv[1:] if '=' in arg]
+
+    cli_args = []
+    for tok in extra:
+        key = tok[2:] if tok.startswith('--') else tok
+        if '=' not in key:
+            parser.error(f"Unrecognized argument {tok!r} — extra CLI args must be Hydra "
+                         f"overrides in key=value form (e.g. data.dataset_path=/path/to/slice)")
+        cli_args.append(key)
     config_dir = os.path.abspath(os.path.dirname(config_path))
     config_name = os.path.basename(config_path).replace('.yaml', '')
     

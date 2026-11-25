@@ -4,12 +4,15 @@ One ring buffer, TWO readouts (Rm 9.2):
   * beta-weighted per-class clouds -> unbalanced OT reference nu_y (Stage 4)
   * uniform whole-queue negatives  -> projected DCL anchor (Stage 5)
 
-Each entry stores: the norm-floored nullspace key r_j in B^d, its class y_j,
+Each entry stores: the RAW momentum key k_j on S^(d-1) (contract revised
+2026-11-25: the ring NEVER stores projected z~ — NullspaceState.project is
+applied by the READER with the current (mu, U), so a key can not go stale in
+the subspace that outlived it), its class y_j,
 its burst weight beta_j = alpha^(1A)_j (detached), its window_id (§9.4 leakage
 guard: same-window keys are masked at READ time on BOTH readouts), the
 enqueue step (staleness accounting, §9.4), and — Rm 4.2 / Eq. 7-8 — the RAW
 calibration score s_{j,y_j} = l_y(z~_j) - l_s(h'_j) of the window AT ENQUEUE
-TIME (key view, detached). The class slice of the score ring IS the rolling
+TIME (key view, detached, computed under the enqueue-time geometry by design). The class slice of the score ring IS the rolling
 class buffer B_y the E-step offset calibration solves against; entries stored
 without scores carry NaN and any calibration read over them raises (never a
 silent zero offset). Queue-vs-queue use is forbidden (Prop 9.1): every readout
@@ -90,6 +93,11 @@ class SupMoCoQueue(nn.Module):
         self.register_buffer("steps", torch.full((self.queue_size,), -1, dtype=torch.long))
         # Rm 4.2 / Eq. 7-8 rolling class buffer B_y material: s_{j,y_j} at enqueue.
         self.register_buffer("scores", torch.full((self.queue_size,), float("nan")))
+        # Storage contract marker: 1 = RAW unit-norm keys projected on READ
+        # (2026-11-25). A pre-contract checkpoint LACKS this key, so the strict
+        # load refuses it — its ring holds enqueue-time projected z~ and would
+        # otherwise be silently double-projected by the new read path.
+        self.register_buffer("key_contract", torch.ones(1, dtype=torch.long))
         self.register_buffer("ptr", torch.zeros(1, dtype=torch.long))
         self.register_buffer("filled", torch.zeros(1, dtype=torch.long))
 
@@ -97,9 +105,10 @@ class SupMoCoQueue(nn.Module):
 
     @torch.no_grad()
     def enqueue(self, keys, labels, betas, window_ids, step, scores=None):
-        """Append current-window entries. keys must ALREADY be projected
-        z-tilde (NullspaceState.project) and detached (they are stop-grad
-        references; Prop 8.4/§9.1).
+        """Append current-window entries. keys are the RAW unit-norm momentum
+        embeddings on S^(d-1) (2026-11-25 contract: store raw, project on read
+        with NullspaceState.project; the ring validates the ball, not the
+        subspace) and must be detached (stop-grad references; Prop 8.4/§9.1).
 
         scores: optional (n,) RAW calibration scores s_{j,y_j} = l_y - l_s of the
         KEY view (Rm 4.2 / Eq. 7-8 buffer B_y). Omitting them stores NaN — the

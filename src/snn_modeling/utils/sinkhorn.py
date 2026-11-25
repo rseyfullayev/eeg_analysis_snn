@@ -358,9 +358,32 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
         _validate_cost(C, f"class_ot_term {name} cost")
 
     # Support restriction goes on the CROSS solve only (see docstring).
-    cross = sinkhorn_plan(cost_cross, a, b, eps, tau, n_iters=n_iters, tol=tol,
-                          support=support, residual_cap=residual_cap)
-    W_cross = W_with_grad(cost_cross, cross["plan"], tau, eps)
+    # STEP-1 GUARD (2026-11-25): if EVERY cross pair is forbidden the augmented
+    # optimum is KNOWN EXACTLY — d_i = a_i into the open dustbin column (capacity 1
+    # = sum a, saturated), u_j = b_j from the dustbin row, real block and P[0,0]
+    # zero, value 2*tau + eps*[H-like term]. Feeding an all-inf-real-block logK to
+    # the iteration just fights -inf rows and trips the residual raise (measured
+    # 6.2e-3 stall at 800 iters), so the solver is skipped and the closed-form
+    # plan ships. Danskin: forbidden cells carry zero plan mass, so dW/dC == 0
+    # there — the constant W_cross with no grad path IS the correct derivative.
+    degenerate = support is not None and not bool(support.any())
+    if degenerate:
+        ad, bd = a.detach(), b.detach()
+        e_const = eps * float(((ad * (ad.log() - 1.0)).sum()
+                               + (bd * (bd.log() - 1.0)).sum()).item())
+        plan = torch.zeros(ad.shape[0] + 1, bd.shape[0] + 1, dtype=ad.dtype,
+                           device=ad.device)
+        plan[1:, 0] = ad
+        plan[0, 1:] = bd
+        cross = {"plan": plan, "di": ad.clone(), "uj": bd.clone(), "residual": 0.0,
+                 "iters": 0, "rows_fully_masked": int(ad.shape[0]),
+                 "cols_fully_masked": int(bd.shape[0]), "forbidden_mass": 0.0}
+        W_cross = torch.as_tensor(2.0 * tau + e_const, dtype=cost_cross.dtype,
+                                  device=cost_cross.device)
+    else:
+        cross = sinkhorn_plan(cost_cross, a, b, eps, tau, n_iters=n_iters, tol=tol,
+                              support=support, residual_cap=residual_cap)
+        W_cross = W_with_grad(cost_cross, cross["plan"], tau, eps)
 
     self_mu = sinkhorn_plan(cost_self_mu.detach(), a, a, eps, tau, n_iters=n_iters, tol=tol,
                             residual_cap=residual_cap)
@@ -394,6 +417,7 @@ def class_ot_term(z_tilde, a, keys, b, eps, tau, self_nu_cache=None, n_iters=500
         # A forbidden pair carries no mass and no gradient; an all-forbidden row drops
         # entirely (d_i = a_i) through the open dustbin. Reported so D_norm_y can be
         # read as burst-drop vs. structural-drop instead of guessed at.
+        diag["degenerate_support"] = bool(degenerate)
         diag["mask_rows_fully_forbidden"] = int(cross["rows_fully_masked"])
         diag["mask_cols_fully_forbidden"] = int(cross["cols_fully_masked"])
         diag["mask_forbidden_mass"] = float(cross["forbidden_mass"])

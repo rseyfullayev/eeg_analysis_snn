@@ -87,7 +87,13 @@ class NullspaceState(nn.Module):
         r = int(self.rank.item())
         if self.warmup_active or r == 0:
             return h
-        V = self.U[:, :r]
+        # CLONE, not a view (2026-11-25 "detach SVD" ticket): _recompute_geometry
+        # zeroes/overwrites U IN-PLACE on every M-step and a view shares the
+        # version counter the autograd graph checks — any backward after the next
+        # geometry update died with "modified by an inplace operation". The
+        # geometry is an M-step constant: hand the graph a frozen snapshot
+        # (D x r <= 256x3 copy), so gradients see this step's projector only.
+        V = self.U[:, :r].clone()
         return h - (h @ V) @ V.t()
 
     def project(self, z: torch.Tensor):
@@ -186,7 +192,10 @@ class NullspaceState(nn.Module):
             return
         Vs = self.ema_mean[present] - mu                 # (S_p, D) centered means
         M = (Vs * (N / N.sum()).sqrt().unsqueeze(1)).t()  # (D, S_p): M M^T == S_between
-        Uv, Sv, _ = torch.linalg.svd(M, full_matrices=False)
+        # Explicit detach (2026-11-25 ticket): the method runs @torch.no_grad() and the
+        # tables are buffers, so this is belt-and-braces — the SVD must never gain a
+        # grad path even if a caller attaches the mean tables in the future.
+        Uv, Sv, _ = torch.linalg.svd(M.detach(), full_matrices=False)
         energy = Sv ** 2
         total = float(energy.sum().item())
         if total <= 0.0:
