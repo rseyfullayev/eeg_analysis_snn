@@ -52,6 +52,8 @@ Everything else comes from the locked config (25 epochs, B=64 → PK eff 60, `n_
 
 > **Parser fix (2026-11-25, pull before launching):** the `data.dataset_path=...` override used to die with `main.py: error: unrecognized arguments` — argparse ran strict (`parse_args`) before the Hydra-forwarding block could see it. `main.py` now uses `parse_known_args()`: trailing `key=value` (or `--key=value`) tokens become Hydra overrides; anything else still errors with a usage hint. Verified: the override reaches the composed config, and the `--no_train` dry exit works.
 
+> **Batch-unpack fix (2026-11-26, second pod crash — pull again):** `AttributeError: 'list' object has no attribute 'to'` at `train.py:391 timestamps = timestamps.to(device)`. Cause: `dataset.__getitem__` returned slot 7 (window_ids) as a Python list and PyTorch's default collate turns a batch of equal-size lists into a list of per-position tensors. Fix: dataset now returns `torch.tensor(window_ids, dtype=torch.long)` in both tuple paths; the loop's existing `timestamps.dim()/[:,0]` consumers are unchanged. Verified locally through the exact train.py unpack lines; pinned in stage 0.
+
 Watch at startup: `[SMC §12.2 WARNING] eps=0.1500 < B2a worst-case floor 0.9233` (expected, it fires per class), then §9.6 sizing/staleness lines. If the §9.4 staleness gate raises, the queue is too long for the actual `steps_per_epoch` — halve `loss.sm.n_q` and relaunch (it hard-raises by design, never warns). During training `smc/ot_residual` must stay < 1e-3; a class whose rho drifts past ~0.5 can breach at 25 iters — the ladder answer is more `sinkhorn.n_iters`, not a bigger cap.
 
 ## M-step ticket (2026-11-25, third) — APPLIED

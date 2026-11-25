@@ -389,6 +389,13 @@ class SWEEPDataset(Dataset):
         
         # When augmentations happen, they need to handle the batched/bag 5D size 
         # or we iteratively apply it. Assuming it's applied correctly later.
+        # SLOT 7 CONTRACT (pod crash 2026-11-26): window_ids must be returned as a
+        # LONG TENSOR, not a Python list. default_collate turns a batch of equal-size
+        # int-lists into a LIST of per-position tensors (never a stacked tensor), and
+        # train.py's `timestamps.to(device)` / `.dim()` / `[:, 0]` consumers assume a
+        # tensor. Non-bagging yields (B,1), padded bags (B, bag_size_limit) with -1
+        # pad slots — both are tensors the loop already handles.
+        wid = torch.tensor(window_ids, dtype=torch.long)
         if self.augmentations is not None and self.split == 'train':
             if self.key_augmentations is SWEEPDataset.KEY_VIEW_UNSET:
                 raise RuntimeError(
@@ -406,9 +413,9 @@ class SWEEPDataset(Dataset):
             video1 = self.augmentations(bag_video)
             video2 = (self.key_augmentations(bag_video) if self.key_augmentations is not None
                       else bag_video.clone())   # clean key view (explicit None)
-            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, window_ids
+            return video1, video2, target_map, label_idx, subject_idx, bag_id, video_id, wid
 
-        return bag_video, target_map, label_idx, bag_id, video_id, window_ids
+        return bag_video, target_map, label_idx, bag_id, video_id, wid
 
 def collate_precomputed(batch):
     """

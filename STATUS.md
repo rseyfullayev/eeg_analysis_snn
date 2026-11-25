@@ -72,6 +72,8 @@
 
 | — | **Phase-1B head: LBFGS (2026-11-26):** `finetune` is now a full-batch `torch.optim.LBFGS` fit (strong_wolfe, history 10, `epochs`→max_iter, `lr`=step-scale default 1.0) — convex problem, frozen features, ~1.3k params, warm start from Eq. 18: converges to the exact minimizer in ~3 evals here (the old 30×AdamW@1e-3 loop barely moved: decoupled decay ~1−1.5e-3 total). The regularizer switched to **PROXIMAL** `λ‖(W,b)−(W₀,b₀)‖²` around the Bayes init (stored by `init_bayes_head`): a zero-centred ridge would shrink the 1/σ_R² Bayes scale while b stays — measured pure-CE blow-up 0.0017→1.02 on separable data, i.e. it breaks the decision-equivalence structure. `run_phase_1b` lr default → None. A/B + pins in stage7 (`epochs=0`/`lr=0` now raise) |
 
+| — | **Pod batch-unpack crash fix (2026-11-26):** `timestamps.to(device)` AttributeError at train.py:391 — `__getitem__` returned slot 7 (window_ids) as a PYTHON LIST and `default_collate` turns a batch of equal-size lists into a *list of per-position tensors*, never a stacked tensor. Latent all along: the stage suites never pushed an 8-tuple batch through a real DataLoader. Fixed at the root (`dataset.py`: returns `torch.tensor(window_ids, dtype=torch.long)` in both 6-/8-tuple returns; padded bags (B,K), non-bagging (B,1) — the loop's existing `.dim()/[:,0]` consumers already handle both). Precomputed path untouched (`collate_precomputed` owns it). Pinned in stage0 + local E2E through the exact train.py consumer lines |
+
 ## Post-plan change · 2026-11-25 — sync to the REVISED CERTIFIED spec (6-point ticket)
 
 | # | What | Detail |

@@ -229,6 +229,11 @@ def test_dataset_trains_without_masks_pt():
         from torch.utils.data import default_collate
         b = default_collate([ds[0], ds[0]])
         assert b[1].shape[1:] == (ds.grid_size, ds.grid_size) and b[1].dtype == torch.long
+        # window_ids slot must be a LONG TENSOR (pod crash 2026-11-26): default_collate
+        # turns per-sample Python LISTS into a list of per-position tensors (never a
+        # stacked tensor), which killed train.py's `timestamps.to(device)`.
+        assert isinstance(item[5], torch.Tensor) and item[5].dtype == torch.long
+        assert isinstance(b[5], torch.Tensor) and b[5].dtype == torch.long
 
 
 def test_dataset_raises_on_missing_window_file():
