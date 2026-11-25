@@ -12,6 +12,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.metrics.pairwise import cosine_similarity
 
+# Bound unconditionally: get_svm/get_logistic_regression/make_umap reference these by
+# name, and a module-level `from X import Y as Z` inside a try/except only binds Z when
+# the import succeeds — so on a cuML-less box the names simply do not exist. Unreachable
+# today behind _USE_CUML, but it is an undefined-global on the live probe path.
+cuUMAP = cuLogisticRegression = cuSVC = None
 try:
     from cuml.manifold import UMAP as cuUMAP
     from cuml.linear_model import LogisticRegression as cuLogisticRegression
@@ -239,6 +244,10 @@ def _linear_probe_loto(emb, labels, groups, tag, suffix, num_classes=5):
     fig_cm.tight_layout()
     
     cm_path = f"evidence/cm_loto_{tag.lower()}_{suffix}.png"
+    # evidence/ is created by --masks and by test(), but the Phase-1A probe branch calls
+    # this from inside the training loop, where nothing has made the directory yet —
+    # savefig then killed the run at probe cadence (stage-10 gate, 2026-11-26).
+    os.makedirs("evidence", exist_ok=True)
     fig_cm.savefig(cm_path)
     plt.close(fig_cm)
     print(f"  {tag} Confusion Matrix saved to {cm_path}")

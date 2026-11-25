@@ -310,6 +310,8 @@ def training_loop(phase,
                   scheduler,
                   writer,
                   checkpoint_dir,
+                  *,
+                  config,
                   use_supmoco=False,
                   moco_momentum=0.999,
                   momentum_model=None,
@@ -344,6 +346,15 @@ def training_loop(phase,
 
     device_info = str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "CPU"
     live_tracker.training_started(phase, epochs, device_info=device_info)
+
+    # validate() is classification-only for every live caller, so it needs a criterion
+    # callable as (logits, labels). Only the SMC path hands one down (phase_one_a swaps
+    # loss_fn to CrossEntropyLoss when loss.sm is on); the legacy SupMoCoLoss raises
+    # TypeError and the legacy ContrastiveLoss silently grades logits contrastively.
+    val_criterion = loss_fn if isinstance(loss_fn, nn.CrossEntropyLoss) else nn.CrossEntropyLoss()
+    if val_criterion is not loss_fn:
+        print(f"  [val] classification-only validation uses CrossEntropyLoss instead of the "
+              f"training criterion {type(loss_fn).__name__} (not callable as (logits, labels)).")
 
     # B3(iii) early-stop series (§11.5 / certification.alpha_identity_escape):
     # per-epoch intra-trial Stdt(alpha) + anneal-floor flags (SMC runs only).
@@ -449,6 +460,11 @@ def training_loop(phase,
                 outputs = outputs.float()
                 key_features = F.normalize(key_features.float(), dim=1, eps=1e-6)
 
+                # One window id per row: the engine and the SupMoCo queue both index a
+                # (B,) long vector, while the batch carries (B,1) non-bagging or (B,K)
+                # padded-bag timestamps.
+                wins = timestamps.reshape(-1) if timestamps.dim() == 1 else timestamps[:, 0]
+
                 # Monitor: check activations after forward
                 nan_monitor.check_activations(epoch=epoch, batch_idx=batch_idx,
                                               backbone_feats=backbone_feats, outputs=outputs)
@@ -458,7 +474,6 @@ def training_loop(phase,
                     # queue reads, E-step, anchor/OT/gate/lambda and all M-step side
                     # effects (rho, geometry, enqueue) live inside SMCLossEngine.forward().
                     z_q = F.normalize(backbone_feats.float(), p=2, dim=1, eps=1e-6)
-                    wins = timestamps.reshape(-1) if timestamps.dim() == 1 else timestamps[:, 0]
                     smc_out = smc_engine(z_q, key_features, targets_c, subject_labels,
                                          wins, video_ids)
                     loss = smc_out['total']
@@ -467,7 +482,7 @@ def training_loop(phase,
                     queue_features, queue_labels, queue_subject_labels, queue_ages, q_video_ids, q_timestamps = supmoco_state.get_queue()
                     loss = loss_fn(outputs, key_features, targets_c, subject_labels,
                                    queue_features, queue_labels, queue_subject_labels, queue_ages,
-                                   query_video_ids=video_ids, query_timestamps=timestamps,
+                                   query_video_ids=video_ids, query_timestamps=wins,
                                    queue_video_ids=q_video_ids, queue_timestamps=q_timestamps)
 
                 # Monitor: check loss
@@ -537,7 +552,7 @@ def training_loop(phase,
             if use_supmoco and smc_engine is None:
                 with torch.no_grad():
                     supmoco_state.enqueue(key_features, targets_c, subject_labels,
-                                          video_ids=video_ids, timestamps=timestamps)
+                                          video_ids=video_ids, timestamps=wins)
 
             train_loss += loss.item()
             train_loop.set_postfix(loss=loss.item())
@@ -564,7 +579,7 @@ def training_loop(phase,
         avg_train_loss = train_loss / len(train_loader)
 
         val_loss, val_acc, val_bal_acc, val_dice, val_iou, val_pre, val_rec = validate(
-            model, val_loader, loss_fn, device, only_classification=True)
+            model, val_loader, val_criterion, device, only_classification=True)
             
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -1233,6 +1248,7 @@ def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpo
         scheduler,
         writer,
         checkpoint_dir,
+        config=config,
         use_supmoco=use_supmoco,
         moco_momentum=moco_start,
         moco_momentum_end=moco_end,
