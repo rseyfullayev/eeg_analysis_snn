@@ -53,7 +53,13 @@ def get_logistic_regression(**kwargs):
     if _USE_CUML:
         return cuLogisticRegression(max_iter=1000)
     else:
-        return LogisticRegression(max_iter=1000, solver='lbfgs', multi_class='multinomial', C=1.0)
+        # multi_class='multinomial' was REMOVED in scikit-learn 1.7 (the pinned
+        # version): passing it raised TypeError and silently zeroed every LOTO
+        # probe row (pod run 2026-11-26 printed 0.0000 everywhere). lbfgs in
+        # 1.7+ is multinomial-only, and on older sklearn the default 'auto'
+        # resolved to exactly the same thing — dropping the kwarg is identical
+        # behavior on both sides of the removal.
+        return LogisticRegression(max_iter=1000, solver='lbfgs', C=1.0)
 
 def make_umap(**kwargs):
     """Factory that returns a UMAP reducer using cuML (GPU) if available, else CPU umap-learn."""
@@ -156,28 +162,39 @@ def _linear_probe_accuracy(emb_train, labels_train, emb_val, labels_val):
 
 
 def _linear_probe_loto(emb, labels, groups, tag, suffix, num_classes=5):
-    """Leave-One-Trial-Out linear probe evaluation.
-    
-    Reports Mean ± Std accuracy per trial, macro F1, and saves a normalized confusion matrix.
-    """
+    """Trial-GROUPED 5-fold linear probe (was literal LeaveOneGroupOut).
+
+    2026-11-26 pod finding: LeaveOneGroupOut fit one LogisticRegression PER TRIAL —
+    225 fits per probe, per side, every 2 epochs. StratifiedGroupKFold(5) over the
+    SAME trial groups keeps the no-leakage guarantee (every window of a trial lands
+    in exactly one fold, so no test fold ever trains on its own trial's windows),
+    preserves per-class balance, and runs 5 fits. Mean/Std are now over Folds (not
+    trials); the confusion matrix still pools every held-out prediction. Falls back
+    to LeaveOneGroupOut, announced, when fewer than 5 trial groups exist."""
     if _features_are_degenerate(emb):
         print(f"  [{tag} LOTO] Skipped — degenerate features (NaN/Inf/zero-var)")
         return {}
-        
-    logo = LeaveOneGroupOut()
-    
+
+    n_groups = len(np.unique(groups))
+    if n_groups >= 5:
+        splitter = StratifiedGroupKFold(n_splits=5, shuffle=True,
+                                        random_state=42).split(emb, labels, groups=groups)
+    else:
+        print(f"  [{tag} LOTO] {n_groups} trial groups (<5) — LeaveOneGroupOut fallback")
+        splitter = LeaveOneGroupOut().split(emb, labels, groups=groups)
+
     trial_accs = []
     preds_all = []
     labels_all = []
-    
-    for train_idx, test_idx in logo.split(emb, labels, groups=groups):
+
+    for train_idx, test_idx in splitter:
         try:
             clf = get_logistic_regression()
             clf.fit(emb[train_idx], labels[train_idx])
-            
+
             preds = clf.predict(emb[test_idx])
             acc = accuracy_score(labels[test_idx], preds)
-            
+
             trial_accs.append(acc)
             preds_all.append(preds)
             labels_all.append(labels[test_idx])

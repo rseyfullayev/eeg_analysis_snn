@@ -15,6 +15,9 @@ encoder:
 training:
   use_pk_sampler: true
   probe_interval: 2             # offline-probe + h'/ZeroStep preview cadence in epochs (1 = every epoch)
+  probe_max_windows: 4096       # sklearn LOTO/SVM probe cost cap (2026-11-26, pod): fixed-seed
+                                # subsample per split — liblinear on the full 36k-window train
+                                # set ran 15+ min per probe with every core pinned
   phase_1_epochs: 25            # SMOKE budget (locked 2026-11-25): 5 train subjects 3-7
   batch_size: 64                # PKSampler effective 60 = 5 classes x (64//5)
   learning_rate: 0.001          # AdamW, cosine -> lr_min

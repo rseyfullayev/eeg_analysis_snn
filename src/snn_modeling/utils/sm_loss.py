@@ -644,6 +644,12 @@ class SMCLossEngine(nn.Module):
             self.step += 1
 
         diag = {"step": step, "T": T, "gate": g, "lambda_ot": lam,
+                # RAW per-term loss values (BEFORE their Eq. 23 weights): the owner
+                # watch-set of 2026-11-26 — each term must be seen moving on its own;
+                # Train/Loss is the weighted engine total while Val/Loss is plain CE,
+                # the two are NOT comparable curves.
+                "L_anc": float(L_anc.detach()), "L_em": float(L_em.detach()),
+                "L_sub": float(L_sub.detach()), "L_spr": float(L_spr.detach()),
                 "stdt_intra": stdt_intra, "energy_ratio": energy_ratio,
                 "anneal_complete": bool(step >= self.anneal_frac * self.total_steps),
                 "C_K": C_K, "K": K, "n_negatives": int(neg_keys.shape[0]),

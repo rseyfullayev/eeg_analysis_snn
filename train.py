@@ -623,7 +623,8 @@ def training_loop(phase,
         train_linear_acc = 0.0
         subj_cross_acc = 0.0
         if phase == '1a' and (epoch % probe_interval == 0 or epoch == epochs - 1):
-            from test import _linear_probe_loto, _linear_probe_accuracy, _svm_probe_accuracy
+            from test import (_linear_probe_loto, _linear_probe_accuracy,
+                              _svm_probe_accuracy, _svm_probe_cv)
             
             # Temporary inline extractor
             def _extract_feats(loader, want_maps=False):
@@ -684,57 +685,102 @@ def training_loop(phase,
                 except Exception:
                     bs = 16
             
-            clean_train_loader = DataLoader(clean_train_set, batch_size=bs, shuffle=False, num_workers=0)
-            
+            clean_train_loader = DataLoader(clean_train_set, batch_size=bs, shuffle=False,
+                                            num_workers=int(config.data.get('num_workers', 0) or 0))
+
             emb_t, lbl_t, grps_t = _extract_feats(clean_train_loader)
             emb_v, lbl_v, grps_v, maps_v = _extract_feats(val_loader, want_maps=True)
-            
+
             subj_t = np.array([tr_b2s.get(str(g), -1) for g in grps_t])
             subj_v = np.array([vl_b2s.get(str(g), -1) for g in grps_v])
-            
+
             suffix = os.path.basename(checkpoint_dir)
             num_classes = clean_train_set.config.model.get('num_classes', 5)
-            
+
+            # PROBE COST CAP (pod, 2026-11-26): liblinear LinearSVC fits on the FULL
+            # 36k-window train set ran 15+ min per probe (all cores pinned) — twice per
+            # probe (z- and h'-space Proxy-A). Table-1 probe accuracies need thousands
+            # of windows, not tens of thousands. The subset is FIXED (rng seed 0, same
+            # N every probe) so epoch-to-epoch trends stay comparable. The ZeroStep bag
+            # preview below keeps the FULL set (its cost is per-bag-linear, not per-
+            # window-squared), and so do the maps for the burst diagnostic.
+            pcap = int(config.training.get('probe_max_windows', 4096))
+
+            def _cap_probe_set(emb, lbl, grps, subj):
+                if emb.shape[0] <= pcap:
+                    return emb, lbl, grps, subj
+                sel = np.sort(np.random.default_rng(0).choice(emb.shape[0], pcap,
+                                                              replace=False))
+                return emb[sel], lbl[sel], grps[sel], subj[sel]
+
+            emb_tp, lbl_tp, grps_tp, subj_tp = _cap_probe_set(emb_t, lbl_t, grps_t, subj_t)
+            emb_vp, lbl_vp, grps_vp, subj_vp = _cap_probe_set(emb_v, lbl_v, grps_v, subj_v)
+
             loto_train_results = _linear_probe_loto(
-                emb_t, lbl_t, grps_t, tag="Train", suffix=suffix, num_classes=num_classes
+                emb_tp, lbl_tp, grps_tp, tag="Train", suffix=suffix, num_classes=num_classes
             )
             loto_val_results = _linear_probe_loto(
-                emb_v, lbl_v, grps_v, tag="Val", suffix=suffix, num_classes=num_classes
+                emb_vp, lbl_vp, grps_vp, tag="Val", suffix=suffix, num_classes=num_classes
             )
             
             train_linear_acc = loto_train_results.get("Eval/LOTO_Train_MeanAcc", 0.0)
             val_linear_acc = loto_val_results.get("Eval/LOTO_Val_MeanAcc", 0.0)
-            lp_train_val = _linear_probe_accuracy(emb_t, lbl_t, emb_v, lbl_v)
+            lp_train_val = _linear_probe_accuracy(emb_tp, lbl_tp, emb_vp, lbl_vp)
             
             log_loto_metrics = {**loto_train_results, **loto_val_results}
-            
+
+            # CHANCE IS DATA, NOT A CONSTANT (2026-11-26 owner fix): the erasure
+            # verdict must be read against 1/S of the set ACTUALLY probed — the
+            # TRAIN cv spans S_tr subjects (smoke: 5 -> chance 0.20) and proves
+            # I-UU^T erased the TRAINING skulls; the VAL transfer spans S_va
+            # (smoke: 2 subjects -> chance 0.50) and only tests generalization.
+            # Hardcoding <0.20 graded the 2-subject val probe as failure even at
+            # PERFECT erasure (0.50 = chance = maximum erasure).
+            subj_arr_tr, subj_arr_va = subj_tp[subj_tp >= 0], subj_vp[subj_vp >= 0]
+            s_tr = int(len(np.unique(subj_arr_tr))) if subj_arr_tr.size else 0
+            s_va = int(len(np.unique(subj_arr_va))) if subj_arr_va.size else 0
+            chance_tr = 1.0 / s_tr if s_tr else 0.0
+            chance_va = 1.0 / s_va if s_va else 0.0
+
             # Proxy-A
             subj_cross_acc = 0.0
+            subj_z_train = None
             if not np.all(subj_t == -1):
-                subj_cross_acc = _svm_probe_accuracy(emb_t, subj_t, emb_v, subj_v)
-            
+                subj_cross_acc = _svm_probe_accuracy(emb_tp, subj_tp, emb_vp, subj_vp)
+                subj_z_train = _svm_probe_cv(emb_tp, subj_tp, grps_tp)  # intra-train 5-fold
+
             print(f"  Offline Probes — Emotion Train LOTO Mean Acc: {train_linear_acc:.4f} | Val LOTO Mean Acc: {val_linear_acc:.4f} | Train->Val Acc: {lp_train_val:.4f}")
             if not np.all(subj_t == -1):
-                print(f"  Proxy-A Probes — Subject Val Cross Acc (SVM, z-space): {subj_cross_acc:.4f}")
+                print(f"  Proxy-A — VAL transfer (S={s_va}, chance {chance_va:.3f}) z-space: {subj_cross_acc:.4f} | "
+                      f"TRAIN cv (S={s_tr}, chance {chance_tr:.3f}) z-space: {subj_z_train:.4f}")
 
             # --- SMC live diagnostics (Table 1 #1/#2). Under the nullspace design a
             # HIGH z-space probe is by construction (L_sub parks identity in span(U));
             # it is the h'-space accuracy that must collapse toward 1/S.
             subj_hp_acc = None
+            subj_hp_train = None
             zs_acc = zs_unw = None
             if smc_engine is not None and not np.all(subj_t == -1):
                 with torch.no_grad():
                     def _hprime(emb):
-                        t = torch.from_numpy(np.ascontiguousarray(emb, dtype=np.float32))
+                        # project() runs on the ENGINE's device (mu/U live on cuda:0);
+                        # the probe embeddings arrive as CPU numpy — feeding them
+                        # straight in was pod crash #4 (space.py:113 device mismatch).
+                        dev = smc_engine.space.mu.device
+                        t = torch.from_numpy(np.ascontiguousarray(emb, dtype=np.float32)).to(dev)
                         rows = []
                         for i in range(0, t.shape[0], 4096):
                             h, _zt, _hn = smc_engine.space.project(t[i:i + 4096])
-                            rows.append(h)
+                            rows.append(h.cpu())
                         return torch.cat(rows, dim=0).numpy()
-                    subj_hp_acc = float(_svm_probe_accuracy(_hprime(emb_t), subj_t,
-                                                            _hprime(emb_v), subj_v))
-                print(f"  Subject probes — z-space: {subj_cross_acc:.4f} | h'-space: {subj_hp_acc:.4f} "
-                      "(Table 1: h' must drop < 0.20; z staying high is BY DESIGN)")
+                    subj_hp_acc = float(_svm_probe_accuracy(_hprime(emb_tp), subj_tp,
+                                                            _hprime(emb_vp), subj_vp))
+                    subj_hp_train = float(_svm_probe_cv(_hprime(emb_tp), subj_tp, grps_tp))
+                print(f"  Subject probes — TRAIN cv (chance 1/{s_tr}={chance_tr:.3f}): z {subj_z_train:.4f} "
+                      f"| h' {subj_hp_train:.4f}; VAL transfer (chance 1/{s_va}={chance_va:.3f}): "
+                      f"z {subj_cross_acc:.4f} | h' {subj_hp_acc:.4f} "
+                      "(erasure claim: TRAIN h' -> 1/S_tr, i.e. I-UU^T erased the training skulls; "
+                      "VAL h' near its own chance tests zero-shot generalization)")
 
             if smc_engine is not None:
                 try:
@@ -861,6 +907,13 @@ def training_loop(phase,
                 f"Phase{phase}/SMC/SigmaHatSq": float(last_smc_diag["sigma_hat_sq"]),
                 f"Phase{phase}/SMC/OTResidualMax": (max(last_smc_diag["ot_residual"].values())
                                                     if last_smc_diag.get("ot_residual") else 0.0),
+                # Raw (pre-weight) Eq. 23 terms (2026-11-26 owner request): watch each
+                # term move independently of lambda_OT*g. Train/Loss (weighted engine
+                # total) and Val/Loss (plain CE) use different criteria — do NOT compare.
+                f"Phase{phase}/SMC/LAnc": float(last_smc_diag["L_anc"]),
+                f"Phase{phase}/SMC/Lem": float(last_smc_diag["L_em"]),
+                f"Phase{phase}/SMC/Lsub": float(last_smc_diag["L_sub"]),
+                f"Phase{phase}/SMC/LSpr": float(last_smc_diag["L_spr"]),
                 # Cloud LOTO support mask: DNorm_y can only be read as burst-drop if the
                 # structural share is known alongside it (SMC/LotoColdRows counts windows
                 # whose whole class cloud was same-trial and therefore fell back to rho).
@@ -890,6 +943,12 @@ def training_loop(phase,
             log_dict[f"Phase{phase}/Val/Emotion_LOTO_Mean_Acc"] = val_linear_acc
             log_dict[f"Phase{phase}/Val/Emotion_Probe_Val_Acc"] = lp_train_val
             log_dict[f"Phase{phase}/Val/Subject_Probe_Val_Acc"] = subj_cross_acc
+            log_dict[f"Phase{phase}/Val/Subject_Probe_Chance"] = chance_va
+            if subj_z_train is not None:
+                log_dict[f"Phase{phase}/Train/Subject_Probe_z_Acc"] = float(subj_z_train)
+                log_dict[f"Phase{phase}/Train/Subject_Probe_Chance"] = chance_tr
+            if subj_hp_train is not None:
+                log_dict[f"Phase{phase}/Train/Subject_Probe_hprime_Acc"] = float(subj_hp_train)
             if subj_hp_acc is not None:
                 log_dict[f"Phase{phase}/Val/Subject_Probe_hprime_Acc"] = float(subj_hp_acc)
             if zs_acc is not None:

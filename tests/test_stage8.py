@@ -40,8 +40,9 @@ def _expect(exc, fn, msg):
 
 
 def _healthy_table1():
-    return dict(probe_z=0.80, probe_h=0.12, zero_step_acc=0.40, energy_ratio=0.50,
-                stdt_alpha=0.30, gate_g=0.60, dnorm={0: 0.20, 1: 0.35, 2: 0.28},
+    return dict(probe_z=0.80, probe_h=0.12, probe_h_chance=0.20, zero_step_acc=0.40,
+                energy_ratio=0.50, stdt_alpha=0.30, gate_g=0.60,
+                dnorm={0: 0.20, 1: 0.35, 2: 0.28},
                 rho=[0.1, 0.3, 0.5], rho_order_pairs=[(1, 2)])
 
 
@@ -103,12 +104,22 @@ def test_evaluate_table1_bands():
     rec = _healthy_table1(); rec["rho"] = [0.2, 0.5, 0.1]
     rep = evaluate_table1(rec)
     assert any("sparsity" in s for s in rep["issues"]), "rho ordering violation missed"
+    # CHANCE-RELATIVE BAND (2026-11-26 owner fix): 0.50 on a 2-subject val set is
+    # PERFECT erasure (chance = 1/2) — the old absolute 0.20/0.45 band graded it
+    # "rank m too small", a false failure. Same value at S=5 (chance 0.20) must
+    # still be the Table-1 row-1 failure.
+    rec = _healthy_table1(); rec["probe_h_chance"] = 0.50; rec["probe_h"] = 0.50
+    rep = evaluate_table1(rec)
+    assert rep["status"] == "ok", f"chance-level val probe graded as erasure failure: {rep}"
+    rec = _healthy_table1(); rec.pop("probe_h_chance")
+    _expect(KeyError, lambda: evaluate_table1(rec), "absolute-band fallback accepted")
     rec = _healthy_table1(); rec.pop("probe_z")
     _expect(KeyError, lambda: evaluate_table1(rec), "missing diagnostic graded silently")
 
 
 def test_evaluate_smoke():
-    good = dict(probe_z=0.85, probe_h=0.18, stdt_alpha=0.30, unseen_bag_acc=0.40)
+    good = dict(probe_z=0.85, probe_h=0.18, probe_h_chance=0.20,
+                stdt_alpha=0.30, unseen_bag_acc=0.40)
     ok, rep = evaluate_smoke(good)
     assert ok and all(rep.values()), rep
     for key, bad, flag in (("probe_z", 0.75, "probe_z_kept"),
@@ -119,8 +130,17 @@ def test_evaluate_smoke():
         ok, rep = evaluate_smoke(rec)
         assert not ok and rep[flag] is False and sum(rep.values()) == 3, \
             f"{key}={bad} did not trip exactly its own criterion: {rep}"
+    # 2-subject smoke (chance 0.50): h'=0.55 rides chance+slack -> passes; h'=0.75 trips
+    rec = dict(good); rec.update(probe_h=0.55, probe_h_chance=0.50)
+    ok, rep = evaluate_smoke(rec)
+    assert ok, f"chance-relative smoke band rejected a 2-subject val set: {rep}"
+    rec.update(probe_h=0.75)
+    ok, rep = evaluate_smoke(rec)
+    assert not ok and rep["probe_h_dropped"] is False
     rec = dict(good); rec.pop("stdt_alpha")
     _expect(KeyError, lambda: evaluate_smoke(rec), "missing criterion accepted")
+    rec = dict(good); rec.pop("probe_h_chance")
+    _expect(KeyError, lambda: evaluate_smoke(rec), "assumed chance accepted")
 
 
 # ------------------------------------------------------------------ registry + switches

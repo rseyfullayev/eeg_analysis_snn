@@ -374,6 +374,25 @@ def test_harness_scripts_import_clean():
     importlib.import_module('precompute_features')
 
 
+def test_sklearn_probe_factories_fit():
+    """The Table-1 probes had NO local coverage until 2026-11-26: get_logistic_regression
+    passed multi_class='multinomial', REMOVED in the pinned scikit-learn 1.7.2, every
+    fold raised TypeError, and the pod printed 0.0000 for all LOTO rows. These factories
+    must construct, fit and predict on THIS interpreter's sklearn (same pinned version
+    as the pod image install)."""
+    import numpy as np
+    from test import get_logistic_regression, get_svm
+    rng = np.random.default_rng(0)
+    X = np.concatenate([rng.normal(m, 1.0, (150, 8)) for m in range(3)])
+    y = np.repeat([0, 1, 2], 150)
+    lr = get_logistic_regression()
+    lr.fit(X, y)
+    assert (lr.predict(X) == y).mean() > 0.8, "LogReg probe stopped discriminating"
+    svc = get_svm()
+    svc.fit(X, y)
+    assert (svc.predict(X) == y).mean() > 0.8, "LinearSVC probe stopped discriminating"
+
+
 # --------------------------------------------------------------------------- runner
 
 def main():

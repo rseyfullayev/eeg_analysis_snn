@@ -20,8 +20,12 @@ import math
 # ---------------------------------------------------------------- Table 1 (§11.5)
 
 PROBE_Z_BAND = (0.70, 0.90)      # linear subject probe on z_t (sanity: content exists)
-PROBE_H_TARGET_MAX = 0.20        # probe on h'_t: < 15-20% (near 1/S chance)
-PROBE_H_FAILURE = 0.45           # >45% => rank m too small or U stale (Table 1 row 1)
+PROBE_H_CHANCE_SLACK = 0.10      # PASS band is chance-RELATIVE (2026-11-26 owner fix):
+                                 # probe_h <= 1/S_probed + slack. The old absolute 0.20
+                                 # target failed a 2-subject val set (chance 0.50) at
+                                 # PERFECT erasure; at S=5 it reads 0.30 like before.
+PROBE_H_FAIL_SLACK = 0.25        # failure trigger = max(PROBE_H_FAILURE, chance+0.25)
+PROBE_H_FAILURE = 0.45           # absolute floor of the failure trigger (Table 1 row 1)
 ZERO_STEP_ACC_MIN = 0.38         # nearest-centroid bag acc once the gate opens
 ZERO_STEP_FLAT_MAX = 0.25        # flat at 20-25% => no emotion clustering in span(U)^perp
 ENERGY_BAND = (0.35, 0.75)       # E||h'||^2 / E||z-mu||^2
@@ -35,7 +39,8 @@ DNORM_BAND = (0.1, 0.5)          # D_norm_y > 0.5 persistent triggers the ladder
 
 SMOKE = dict(
     probe_z_min=0.80,            # subject probe on z_t must start > 80%
-    probe_h_max=0.30,            # and drop < 30% on h'_t (chance = 1/S ~ 20%)
+    probe_h_slack=0.10,          # h' probe must sit within chance + slack (chance is
+                                 # REQUIRED input probe_h_chance, not an assumed 1/S)
     stdt_min=0.15,               # intra-trial Stdt(alpha_t) > 0.15
     unseen_bag_acc_min=0.35,     # unseen-subject bag acc crosses 35-40%+
 )
@@ -59,20 +64,27 @@ def evaluate_table1(record):
     Returns {"status": "ok"|"fail", "issues": [str, ...]}. Missing keys RAISE —
     a diagnostic that was never computed must not grade as silent agreement.
     """
-    for k in ("probe_z", "probe_h", "zero_step_acc", "energy_ratio",
+    for k in ("probe_z", "probe_h", "probe_h_chance", "zero_step_acc", "energy_ratio",
               "stdt_alpha", "gate_g", "dnorm", "rho"):
         if k not in record:
             raise KeyError(f"evaluate_table1: missing diagnostic {k!r} — Table 1 "
                            "is graded only on metrics that were actually measured")
     issues = []
+    chance = record["probe_h_chance"]
+    if not (0.0 < chance <= 1.0) or not math.isfinite(chance):
+        raise ValueError(f"evaluate_table1: probe_h_chance must lie in (0,1] finite, "
+                         f"got {chance} — the h' band is chance-RELATIVE, never assumed")
     if not (PROBE_Z_BAND[0] <= record["probe_z"] <= PROBE_Z_BAND[1]):
         issues.append(f"probe_z={record['probe_z']:.3f} outside {PROBE_Z_BAND} (no subject "
                       "content to erase, or pathology)")
-    if record["probe_h"] > PROBE_H_FAILURE:
-        issues.append(f"probe_h={record['probe_h']:.3f} > {PROBE_H_FAILURE}: rank m too "
-                      "small or U stale (Table 1 row 1 failure mode)")
-    elif record["probe_h"] > PROBE_H_TARGET_MAX:
-        issues.append(f"probe_h={record['probe_h']:.3f} above the 15-20% target band")
+    fail_thr = max(PROBE_H_FAILURE, chance + PROBE_H_FAIL_SLACK)
+    if record["probe_h"] > fail_thr:
+        issues.append(f"probe_h={record['probe_h']:.3f} > {fail_thr:.3f} "
+                      f"(=max({PROBE_H_FAILURE}, chance {chance:.3f}+{PROBE_H_FAIL_SLACK})): "
+                      "rank m too small or U stale (Table 1 row 1 failure mode)")
+    elif record["probe_h"] > chance + PROBE_H_CHANCE_SLACK:
+        issues.append(f"probe_h={record['probe_h']:.3f} above chance {chance:.3f} + "
+                      f"{PROBE_H_CHANCE_SLACK}: erasure incomplete for this probe set")
     if record["zero_step_acc"] < ZERO_STEP_FLAT_MAX:
         issues.append(f"zero_step_acc={record['zero_step_acc']:.3f} flat at chance: no "
                       "emotion clustering in span(U)^perp")
@@ -108,12 +120,15 @@ def evaluate_table1(record):
 def evaluate_smoke(record):
     """Remark 11.2 pass criteria; record keys: probe_z, probe_h, stdt_alpha,
     unseen_bag_acc. Returns (passed, report) with a per-criterion verdict."""
-    for k in ("probe_z", "probe_h", "stdt_alpha", "unseen_bag_acc"):
+    for k in ("probe_z", "probe_h", "probe_h_chance", "stdt_alpha", "unseen_bag_acc"):
         if k not in record:
             raise KeyError(f"evaluate_smoke: missing criterion input {k!r}")
+    chance = record["probe_h_chance"]
+    if not (0.0 < chance <= 1.0):
+        raise ValueError(f"evaluate_smoke: probe_h_chance must lie in (0,1], got {chance}")
     report = {
         "probe_z_kept":   record["probe_z"] >= SMOKE["probe_z_min"],
-        "probe_h_dropped": record["probe_h"] < SMOKE["probe_h_max"],
+        "probe_h_dropped": record["probe_h"] <= chance + SMOKE["probe_h_slack"],
         "stdt_informative": record["stdt_alpha"] > SMOKE["stdt_min"],
         "unseen_bag_acc": record["unseen_bag_acc"] >= SMOKE["unseen_bag_acc_min"],
     }
