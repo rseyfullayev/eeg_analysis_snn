@@ -27,6 +27,10 @@ Run from repo root:  venv\\Scripts\\python.exe tests\\test_stage10.py
                    (pod: python tests/test_stage10.py)
                    Optional args filter by test-name substring, e.g.
                    python tests/test_stage10.py undefined_globals
+                   --time  =  per-epoch segment breakdown (engine vs probes vs 1B vs val)
+                   Output streams live (nothing is buffered), so a slow epoch is visible
+                   while it happens. Set PYTHONIOENCODING=utf-8 if you redirect the run to
+                   a file on Windows — the code prints sigma/section signs and cp1252 dies.
 Exit code 0 = all pass. CPU runs are mandatory; CUDA runs execute when
 torch.cuda.is_available() and are announced, never silently skipped.
 Measured on this box (RTX A2000): 8/8 in ~75 s.
@@ -51,7 +55,6 @@ BUGS THIS GATE FOUND ON ITS FIRST RUN (2026-11-26, all fixed):
 import dis
 import importlib
 import inspect
-import io
 import os
 import random
 import sys
@@ -476,37 +479,118 @@ def test_offline_evaluation_entry_runs_end_to_end():
         assert figures, f"evaluation produced no figures under {root}"
 
 
+# ======================================================== optional: --time segment breakdown
+
+def _install_segment_timers():
+    """`--time`: wrap the epoch-loop cost centres and report seconds+calls per epoch.
+
+    The owner's standing rule is that the epoch loop stays cheap (no CPU clustering, no
+    full-N pairwise work), so the gate should say WHERE an epoch goes, not only that it
+    finished — and on the pod the first epoch is legitimately the cheapest one: an empty
+    ring makes `cold_anchor` skip L_anc and `if clouds:` skip all five per-class Sinkhorn
+    solves, and `warmup_epochs` keeps project() the identity. When wall time jumps between
+    epochs, this table is what tells you whether it is the engine (queue went live), the
+    probes (sklearn/h'/ZeroStep) or the forward pass.
+    Returns (restore_fn, report_fn)."""
+    import functools
+    import train
+    import test as eval_module
+    from src.snn_modeling.utils.sm_loss import SMCLossEngine
+    from src.snn_modeling.adapters.mil_readout import Phase1BReadout
+
+    acc, epoch = {}, {"n": -1}
+    originals = []
+
+    def wrap(owner, name, label):
+        orig = getattr(owner, name)
+        originals.append((owner, name, orig))
+
+        @functools.wraps(orig)
+        def inner(*a, **k):
+            t = time.perf_counter()
+            try:
+                return orig(*a, **k)
+            finally:
+                row = acc.setdefault((epoch["n"], label), [0.0, 0])
+                row[0] += time.perf_counter() - t
+                row[1] += 1
+        setattr(owner, name, inner)
+
+    real_validate = train.validate
+    wrap(train, "validate", "validate()")
+
+    def counted_validate(*a, **k):
+        epoch["n"] += 1                       # validate() runs once per epoch, after the loop
+        return real_validate(*a, **k)
+    train.validate = counted_validate
+
+    for name, label in (("_linear_probe_loto", "probe: linear LOTO"),
+                        ("_linear_probe_accuracy", "probe: logreg tr->va"),
+                        ("_svm_probe_accuracy", "probe: svm cross"),
+                        ("_svm_probe_cv", "probe: svm cv")):
+        wrap(eval_module, name, label)
+    wrap(SMCLossEngine, "forward", "SMC engine fwd+bwd")
+    wrap(SMCLossEngine, "lock_fullpass", "lock_fullpass")
+    wrap(Phase1BReadout, "encode_bags", "1B encode_bags")
+    wrap(Phase1BReadout, "finetune", "1B LBFGS finetune")
+
+    def restore():
+        for owner, name, orig in originals:
+            setattr(owner, name, orig)
+
+    def report(total):
+        print("\n=== epoch segment breakdown ===")
+        print(f"{'epoch':>5} {'segment':>22} {'seconds':>9} {'calls':>6}")
+        for (ep, label), (sec, n) in sorted(acc.items(), key=lambda kv: (kv[0][0], -kv[1][0])):
+            print(f"{ep:>5} {label:>22} {sec:>9.2f} {n:>6}")
+        print(f"TOTAL {total:.1f}s  (epoch index -1 = the epoch that ran before the first "
+              "validate() call, i.e. epoch 0's engine steps)")
+    return restore, report
+
+
 # ==================================================================== runner
 
 def main():
     os.chdir(REPO)
+    # train.py/augmentations print σ and § signs; a redirected Windows stdout defaults to
+    # cp1252 and raises UnicodeEncodeError mid-run (seen while timing this gate).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    argv = [a for a in sys.argv[1:] if a.startswith("-")]
     filters = [a for a in sys.argv[1:] if not a.startswith("-")]
+    timed = "--time" in argv
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)
              and (not filters or any(f in k for f in filters))]
     if not tests:
         print(f"no test matched {filters}")
         return 1
+    if timed:
+        # one live run, fully attributed, instead of the whole suite
+        tests = [t for t in tests if "smc_cpu" in t.__name__] or tests[:1]
     failed = 0
     for t in tests:
         t0 = time.time()
-        buf = io.StringIO()
+        restore = None
+        if timed:
+            restore, report = _install_segment_timers()
         try:
-            real = sys.stdout
-            sys.stdout = buf
-            try:
-                t()
-            finally:
-                sys.stdout = real
+            t()
             print(f"PASS  {t.__name__}  ({time.time() - t0:.1f}s)")
-        except Exception as e:
+        except Exception:
             failed += 1
-            real = sys.stdout
-            sys.stdout = real
-            print(buf.getvalue()[-4000:])
             import traceback
-            print(f"FAIL  {t.__name__}: {type(e).__name__}: {e}")
+            print(f"FAIL  {t.__name__}  ({time.time() - t0:.1f}s)")
             traceback.print_exc()
+        finally:
+            if timed:
+                try:
+                    report(time.time() - t0)
+                finally:
+                    restore()
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 

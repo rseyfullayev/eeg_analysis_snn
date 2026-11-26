@@ -114,9 +114,16 @@ def _build(tmp):
 
 def run_pipeline(dev: str):
     import random
+    import numpy as np
     random.seed(0)                              # PKSampler/dataset use Python random too —
     torch.manual_seed(0)                        # IDENTICAL data+order per device: a pass/
-    device = torch.device(dev)                  # fail difference here IS a device bug
+    np.random.seed(0)                           # fail difference here IS a device bug.
+    device = torch.device(dev)                  # The numpy seed is NOT optional:
+    # PKSampler.__iter__ draws its class mix with np.random.choice and refills buckets
+    # with np.random.shuffle, so without it the two device runs consume DIFFERENT
+    # batches and the cpu/cuda parity claim above is a coin flip (measured 2026-11-26 on
+    # one commit: cpu FAIL / cuda PASS on the borderline toy OT residual, and 2/2 on the
+    # two runs before it).
     with tempfile.TemporaryDirectory() as tmp:
         cfg, ld_tr, ld_va = _build(tmp)
         enc = nn.Flatten()

@@ -1,9 +1,24 @@
 import argparse
+import sys
 from omegaconf import OmegaConf
 import os
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import wandb
+
+# POD FD FIX (2026-11-26, "Too many open files" + epochs that drift 2x slower):
+# Linux's default sharing strategy is 'file_descriptor' — every shared-memory tensor a
+# worker hands to the parent costs the parent one file descriptor, held until that
+# storage is freed. Training already keeps two persistent pools open, and the Phase 1A
+# probe scan adds a third while it pulls the whole split through, so the parent creeps
+# up to `ulimit -n`. Before it raises, the worker->parent socket silently drops the
+# descriptors and the parent stalls in MP_STATUS_CHECK_INTERVAL (5 s) timeout slices —
+# which is what makes an epoch twice as slow, not the GPU. 'file_system' passes shm by
+# path instead, so no per-batch FDs. Side effect: a SIGKILLed run leaves /tmp/torch_*
+# files behind; clean them with `rm -f /tmp/torch_*`.
+if sys.platform.startswith("linux"):
+    mp.set_sharing_strategy("file_system")
 
 from generate_dataset import run_data_setup
 from train import run_training, validate

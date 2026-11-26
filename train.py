@@ -18,6 +18,7 @@ from src.snn_modeling.utils.certification import alpha_identity_escape
 import os
 import math
 import gc
+import time
 from datetime import datetime
 from sklearn.metrics import balanced_accuracy_score
 import segmentation_models_pytorch as smp
@@ -366,6 +367,12 @@ def training_loop(phase,
 
 
     for epoch in range(start_epoch, epochs):
+        # POD TIME LEDGER: split each epoch into train / val / probe / log so a slow
+        # epoch says WHICH part moved. 2026-11-26: pod epoch went 3.10 -> 7.38 min and
+        # the only code-level difference between those two epochs was the probe block
+        # that had just run for the first time — without the split, that is a guess.
+        t_ep = time.perf_counter()
+        t_probe = 0.0
         model.train()
         loss_fn.current_epoch = epoch
         loss_fn.step_count = 0
@@ -569,6 +576,7 @@ def training_loop(phase,
                 del outputs
 
         # Periodic memory cleanup after each epoch
+        t_train = time.perf_counter() - t_ep
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -583,6 +591,8 @@ def training_loop(phase,
             
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
+        t_val = time.perf_counter() - t_ep - t_train
+        t_probe_start = time.perf_counter()
 
         # --- Live Tracker: epoch summary ---
         epoch_metrics = {
@@ -703,8 +713,21 @@ def training_loop(phase,
             clean_train_loader = DataLoader(clean_train_set, batch_size=bs, shuffle=False,
                                             num_workers=int(config.data.get('num_workers', 0) or 0))
 
-            emb_t, lbl_t, grps_t = _extract_feats(clean_train_loader)
-            emb_v, lbl_v, grps_v, maps_v = _extract_feats(val_loader, want_maps=True)
+            try:
+                emb_t, lbl_t, grps_t = _extract_feats(clean_train_loader)
+                emb_v, lbl_v, grps_v, maps_v = _extract_feats(val_loader, want_maps=True)
+            finally:
+                # INSURANCE, NOT A PROVEN FIX. Measured on Windows (torch 2.9.1): an
+                # exhausted non-persistent loader leaves 0 child processes behind, with or
+                # without del+gc, so this is NOT what the pod's "Too many open files"
+                # (2026-11-26) is caused by. What it does guarantee is that the scan
+                # loader's resources are released before the ~4096-row sklearn fits and the
+                # h'/ZeroStep previews allocate, i.e. the FD + shared-memory peak of
+                # 8 persistent workers + 4 scan workers happens once, not concurrently
+                # with the probe's own buffers. The real FD headroom levers are
+                # data.num_workers, `ulimit -n` and torch's sharing strategy.
+                del clean_train_loader
+                gc.collect()
 
             subj_t = np.array([tr_b2s.get(str(g), -1) for g in grps_t])
             subj_v = np.array([vl_b2s.get(str(g), -1) for g in grps_v])
@@ -873,6 +896,20 @@ def training_loop(phase,
                 _probe_payload["zerostep_bag_acc_unweighted"] = zs_unw
             live_tracker.probe_results(phase, epoch, _probe_payload)
 
+            # The epoch's empty_cache()/gc.collect() ran at the TOP of this post-loop
+            # section, i.e. BEFORE the probe block — so everything the probes allocated
+            # (the full-split scan, the (N,C,H,W) map stack, the 4096-row h' chunks moved
+            # to the engine device) is still sitting in the caching allocator when the
+            # NEXT epoch's batch loop starts. Free it here instead; numerically a no-op,
+            # and it is the one thing in this branch that can explain a slower epoch
+            # right after a probe epoch.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            del emb_t, lbl_t, grps_t, emb_v, lbl_v, grps_v, maps_v
+            gc.collect()
+
+        t_probe = time.perf_counter() - t_probe_start   # WeightWatcher + probes + 1B preview
+
         log_dict = {
             f"Phase{phase}/Train/Loss": avg_train_loss,
             f"Phase{phase}/Val/Loss": val_loss,
@@ -880,6 +917,13 @@ def training_loop(phase,
             f"Phase{phase}/Val/Balanced_Accuracy": val_bal_acc,
             "LR": current_lr
         }
+        # Time ledger (seconds). Time/Probes is the only term that is zero on a
+        # non-probe epoch, so a saw-tooth wall-time curve is immediately attributable.
+        log_dict.update({
+            f"Phase{phase}/Time/Train": t_train,
+            f"Phase{phase}/Time/Val": t_val,
+            f"Phase{phase}/Time/Probes": t_probe,
+        })
 
         # --- Checkpoint: checkpoint_last.pt (every epoch, atomic write) ---
         save_checkpoint(model, optimizer, scheduler, epoch, val_acc, 0.0,
@@ -1020,6 +1064,11 @@ def training_loop(phase,
 
         # Live Tracker: epoch summary (after all metrics computed)
         live_tracker.epoch_summary(phase, epoch, epochs, epoch_metrics)
+
+        t_total = time.perf_counter() - t_ep
+        print(f"  [time] epoch {epoch + 1}: train {t_train:.1f}s + val {t_val:.1f}s + "
+              f"probes {t_probe:.1f}s + ckpt/log {t_total - t_train - t_val - t_probe:.1f}s "
+              f"= {t_total / 60:.2f} min")
 
 
 def phase_one_a(config, model, device, train_loader, val_loader, writer, checkpoint_dir, resume, checkpoint=None):
